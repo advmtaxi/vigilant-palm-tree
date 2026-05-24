@@ -305,6 +305,23 @@ function cleanString(value, fallback = "") {
   return text || fallback;
 }
 
+function normalizeSearchText(value) {
+  return cleanString(value)
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function channelMatchesQuery(channel, query) {
+  const tokens = normalizeSearchText(query).split(" ").filter(Boolean);
+  if (tokens.length === 0) return true;
+  const haystack = normalizeSearchText(`${channel?.name || ""} ${channel?.category || ""} ${channel?.key || ""}`);
+  return tokens.every((token) => haystack.includes(token));
+}
+
 function randomCredential(length = 14) {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
   const bytes = new Uint8Array(length);
@@ -896,6 +913,7 @@ async function doRefreshChannels(env) {
   const nextStreamIndex = new Map();
   const seenKeys = new Set();
   let successCount = 0;
+  let playlistOkCount = 0;
   let lastStatus = null;
 
   const sourceResults = await Promise.all(playlistSources.map(async (playlistSource) => {
@@ -914,6 +932,7 @@ async function doRefreshChannels(env) {
 
     if (response && response.ok) {
       successCount += 1;
+      playlistOkCount += 1;
       await parseM3uChannels(response, async (channel) => {
         if (seenKeys.has(channel.key)) return;
         const xtreamItem = channel.streamId ? liveCatalog?.itemsById?.get(channel.streamId) : null;
@@ -947,6 +966,13 @@ async function doRefreshChannels(env) {
   if (successCount === 0) {
     if (channelCache.channels.length > 0) return channelCache.channels; // serve stale
     throw new HttpError(502, `All IPTV playlist sources failed${lastStatus ? ` (last status: ${lastStatus})` : ""}.`);
+  }
+
+  // If we only managed to build channels via the smaller Xtream fallback, do not replace an existing
+  // full playlist cache (this is what causes the 34k -> 9k swings).
+  if (playlistOkCount === 0 && channelCache.channels.length > 0) {
+    console.warn(`[cache] channels refresh used Xtream fallback only (${channels.length}); keeping existing cache (${channelCache.channels.length}).`);
+    return channelCache.channels;
   }
 
   streamIndex.clear();
@@ -1149,11 +1175,11 @@ async function channelRecord(channel, request, env) {
 
 async function channelsPayload(request, env, force = false) {
   const url = new URL(request.url);
-  const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+  const q = cleanString(url.searchParams.get("q"));
 
   let channels = await loadChannels(env, force);
   if (q) {
-    channels = channels.filter((ch) => String(ch?.name || "").toLowerCase().includes(q));
+    channels = channels.filter((ch) => channelMatchesQuery(ch, q));
   }
   const hit = !force && channelCache.channels.length > 0 && Date.now() - channelCache.at < envInt(env, "CHANNEL_CACHE_SECONDS", 120) * 1000;
   const records = [];
@@ -1883,26 +1909,23 @@ async function generatedM3uResponse(request, env, waitUntil = (promise) => promi
 // Fetch helpers
 
 async function fetchProviderPlaylist(env, url) {
-  const timeoutMs = envInt(env, "PLAYLIST_FETCH_TIMEOUT_MS", 4200);
+  const timeoutMs = envInt(env, "PLAYLIST_FETCH_TIMEOUT_MS", 12000);
   const headers = {
     "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
     accept: "application/x-mpegURL, application/vnd.apple.mpegurl, text/plain, */*",
   };
-  const attempts = await Promise.allSettled(upstreamUrlCandidates(url, env).map(async (candidateUrl) => {
-    const response = await fetchWithTimeout(candidateUrl, {
-      headers,
-      redirect: "follow",
-    }, timeoutMs);
-    if (!response.ok) throw response;
-    return response;
-  }));
 
-  for (const attempt of attempts) {
-    if (attempt.status === "fulfilled") return attempt.value;
+  let firstBadResponse = null;
+  for (const candidateUrl of upstreamUrlCandidates(url, env)) {
+    try {
+      const response = await fetchWithTimeout(candidateUrl, { headers, redirect: "follow" }, timeoutMs);
+      if (response.ok) return response;
+      if (!firstBadResponse) firstBadResponse = response;
+    } catch {
+      // try next candidate
+    }
   }
-  for (const attempt of attempts) {
-    if (attempt.status === "rejected" && attempt.reason instanceof Response) return attempt.reason;
-  }
+  if (firstBadResponse) return firstBadResponse;
   throw new Error("Provider playlist fetch failed.");
 }
 
