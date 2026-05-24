@@ -931,18 +931,23 @@ async function doRefreshChannels(env) {
         if (!response && !liveCatalog) { lastStatus = "network error"; continue; }
 
         if (response && response.ok) {
-            successCount += 1;
-            playlistOkCount += 1;
-            await parseM3uChannels(response, async (channel) => {
-                if (seenKeys.has(channel.key)) return;
-                const xtreamItem = channel.streamId ? liveCatalog?.itemsById?.get(channel.streamId) : null;
-                const name = cleanString(xtreamItem?.name, channel.name);
-                const logo = mediaLogo(xtreamItem) || channel.logo;
-                const category = (xtreamItem ? catalogCategory(liveCatalog, xtreamItem) : "") || channel.category;
-                seenKeys.add(channel.key);
-                nextStreamIndex.set(channel.key, channel.sourceUrl);
-                channels.push({ key: channel.key, name: withSourceSuffix(name, playlistSource.label), logo, category });
-            });
+            try {
+                await parseM3uChannels(response, async (channel) => {
+                    if (seenKeys.has(channel.key)) return;
+                    const xtreamItem = channel.streamId ? liveCatalog?.itemsById?.get(channel.streamId) : null;
+                    const name = cleanString(xtreamItem?.name, channel.name);
+                    const logo = mediaLogo(xtreamItem) || channel.logo;
+                    const category = (xtreamItem ? catalogCategory(liveCatalog, xtreamItem) : "") || channel.category;
+                    seenKeys.add(channel.key);
+                    nextStreamIndex.set(channel.key, channel.sourceUrl);
+                    channels.push({ key: channel.key, name: withSourceSuffix(name, playlistSource.label), logo, category });
+                });
+                successCount += 1;
+                playlistOkCount += 1;
+            } catch (err) {
+                console.warn(`[cache] failed to parse M3U channels from source ${playlistSource.label}:`, err?.message || err);
+                lastStatus = "parse error";
+            }
             continue;
         }
 
@@ -2808,9 +2813,13 @@ app.use(async (req, res) => {
                           error?.message?.includes("other side closed") ||
                           error?.message?.includes("ECONNRESET");
         if (isAborted) {
-            console.warn(`Request closed or failed due to network: ${error.message}`);
+            if (res.headersSent) {
+                console.log(`[server] Connection closed by client during streaming: ${req.method} ${req.originalUrl}`);
+            } else {
+                console.log(`[server] Client disconnected before stream started: ${req.method} ${req.originalUrl}`);
+            }
         } else {
-            console.error("Request failed:", error);
+            console.error(`Request failed: ${req.method} ${req.originalUrl}`, error);
         }
         if (!res.headersSent) {
             res.status(status).json({ error: message });
