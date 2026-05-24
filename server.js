@@ -1148,7 +1148,13 @@ async function channelRecord(channel, request, env) {
 }
 
 async function channelsPayload(request, env, force = false) {
-  const channels = await loadChannels(env, force);
+  const url = new URL(request.url);
+  const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+
+  let channels = await loadChannels(env, force);
+  if (q) {
+    channels = channels.filter((ch) => String(ch?.name || "").toLowerCase().includes(q));
+  }
   const hit = !force && channelCache.channels.length > 0 && Date.now() - channelCache.at < envInt(env, "CHANNEL_CACHE_SECONDS", 120) * 1000;
   const records = [];
   for (const channel of channels) records.push(await channelRecord(channel, request, env));
