@@ -8,10 +8,10 @@ import express from "express";
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
 globalThis.atob = (b64) =>
-  Buffer.from(b64, "base64").toString("binary");
+    Buffer.from(b64, "base64").toString("binary");
 
 globalThis.btoa = (str) =>
-  Buffer.from(str, "binary").toString("base64");
+    Buffer.from(str, "binary").toString("base64");
 
 // Constants
 
@@ -32,21 +32,21 @@ const HARDCODED_URL_TOKEN_SECRET = "please-set-URL_TOKEN_SECRET-in-env";
 const HARDCODED_EXTRA_PLAYLIST_SOURCES = [];
 
 const XTREAM_CATALOGS = {
-  live: {
-    categoriesAction: "get_live_categories",
-    itemsAction: "get_live_streams",
-    idField: "stream_id",
-  },
-  movies: {
-    categoriesAction: "get_vod_categories",
-    itemsAction: "get_vod_streams",
-    idField: "stream_id",
-  },
-  series: {
-    categoriesAction: "get_series_categories",
-    itemsAction: "get_series",
-    idField: "series_id",
-  },
+    live: {
+        categoriesAction: "get_live_categories",
+        itemsAction: "get_live_streams",
+        idField: "stream_id",
+    },
+    movies: {
+        categoriesAction: "get_vod_categories",
+        itemsAction: "get_vod_streams",
+        idField: "stream_id",
+    },
+    series: {
+        categoriesAction: "get_series_categories",
+        itemsAction: "get_series",
+        idField: "series_id",
+    },
 };
 
 // In-memory caches (survive across requests, reset on restart)
@@ -75,47 +75,47 @@ const MAX_XTREAM_CATALOG_CACHE_ENTRIES = 100;
 const MAX_GENERATED_PLAYLIST_CACHE_ENTRIES = 200;
 
 const ACCESS_DURATION_MONTHS = {
-  "1m": 1,
-  "3m": 3,
-  "12m": 12,
-  infinite: null,
+    "1m": 1,
+    "3m": 3,
+    "12m": 12,
+    infinite: null,
 };
 
 // Errors
 
 class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
+    constructor(status, message) {
+        super(message);
+        this.status = status;
+    }
 }
 
 // Env helpers (reads from process.env)
 
 function envString(env, key, fallback = "") {
-  return String((env && env[key]) ?? fallback).trim();
+    return String((env && env[key]) ?? fallback).trim();
 }
 
 function envInt(env, key, fallback) {
-  const value = Number.parseInt(envString(env, key), 10);
-  return Number.isFinite(value) ? value : fallback;
+    const value = Number.parseInt(envString(env, key), 10);
+    return Number.isFinite(value) ? value : fallback;
 }
 
 function envBool(env, key, fallback) {
-  const value = envString(env, key);
-  if (!value) return fallback;
-  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
+    const value = envString(env, key);
+    if (!value) return fallback;
+    return ["1", "true", "yes", "on"].includes(value.toLowerCase());
 }
 
 // Public base URL
 
 function publicBase(request, env) {
-  const requestOrigin = new URL(request.url).origin;
-  const configuredBase = envString(env, "WORKER_PUBLIC_BASE");
-  if (envBool(env, "FORCE_WORKER_PUBLIC_BASE", false) && configuredBase) {
-    return configuredBase.replace(/\/+$/, "");
-  }
-  return (requestOrigin || configuredBase).replace(/\/+$/, "");
+    const requestOrigin = new URL(request.url).origin;
+    const configuredBase = envString(env, "WORKER_PUBLIC_BASE");
+    if (envBool(env, "FORCE_WORKER_PUBLIC_BASE", false) && configuredBase) {
+        return configuredBase.replace(/\/+$/, "");
+    }
+    return (requestOrigin || configuredBase).replace(/\/+$/, "");
 }
 
 // CDN-aware base for HLS segment / live-stream URLs.
@@ -123,1006 +123,1006 @@ function publicBase(request, env) {
 // live m3u8 URLs through your CDN instead of hitting the origin directly.
 // API calls (player_api.php, /api/*, /get.php) always use the origin.
 function streamBase(request, env) {
-  const cdn = envString(env, "CDN_BASE_URL", "").replace(/\/+$/, "");
-  return cdn || publicBase(request, env);
+    const cdn = envString(env, "CDN_BASE_URL", "").replace(/\/+$/, "");
+    return cdn || publicBase(request, env);
 }
 
 // Response helpers
 
 function withCors(response) {
-  const headers = new Headers(response.headers);
-  headers.set("access-control-allow-origin", "*");
-  headers.set("access-control-allow-methods", "GET,HEAD,OPTIONS");
-  headers.set("access-control-allow-headers", "*");
-  headers.set("access-control-expose-headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
-  headers.set("x-content-type-options", "nosniff");
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
+    const headers = new Headers(response.headers);
+    headers.set("access-control-allow-origin", "*");
+    headers.set("access-control-allow-methods", "GET,HEAD,OPTIONS");
+    headers.set("access-control-allow-headers", "*");
+    headers.set("access-control-expose-headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
+    headers.set("x-content-type-options", "nosniff");
+    return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+    });
 }
 
 function json(payload, status = 200) {
-  return withCors(
-    new Response(JSON.stringify(payload, null, 2), {
-      status,
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "cache-control": "no-store, max-age=0",
-      },
-    }),
-  );
+    return withCors(
+        new Response(JSON.stringify(payload, null, 2), {
+            status,
+            headers: {
+                "content-type": "application/json; charset=utf-8",
+                "cache-control": "no-store, max-age=0",
+            },
+        }),
+    );
 }
 
 function playlistResponse(body) {
-  return withCors(
-    new Response(body, {
-      headers: {
-        "content-type": "application/x-mpegURL; charset=utf-8",
-        "cache-control": "no-store, no-cache, max-age=0, must-revalidate",
-        pragma: "no-cache",
-        expires: "0",
-        "content-disposition": "inline",
-      },
-    }),
-  );
+    return withCors(
+        new Response(body, {
+            headers: {
+                "content-type": "application/x-mpegURL; charset=utf-8",
+                "cache-control": "no-store, no-cache, max-age=0, must-revalidate",
+                pragma: "no-cache",
+                expires: "0",
+                "content-disposition": "inline",
+            },
+        }),
+    );
 }
 
 function htmlResponse(body, status = 200, headers = {}) {
-  return new Response(body, {
-    status,
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": "no-store, max-age=0",
-      ...headers,
-    },
-  });
+    return new Response(body, {
+        status,
+        headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store, max-age=0",
+            ...headers,
+        },
+    });
 }
 
 function textResponse(body, status = 200, headers = {}) {
-  return withCors(
-    new Response(body, {
-      status,
-      headers: {
-        "content-type": "text/plain; charset=utf-8",
-        "cache-control": "no-store, max-age=0",
-        ...headers,
-      },
-    }),
-  );
+    return withCors(
+        new Response(body, {
+            status,
+            headers: {
+                "content-type": "text/plain; charset=utf-8",
+                "cache-control": "no-store, max-age=0",
+                ...headers,
+            },
+        }),
+    );
 }
 
 // Crypto helpers
 
 async function sha1Hex(value) {
-  const bytes = new TextEncoder().encode(value);
-  const digest = await crypto.subtle.digest("SHA-1", bytes);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const bytes = new TextEncoder().encode(value);
+    const digest = await crypto.subtle.digest("SHA-1", bytes);
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 async function streamKey(sourceUrl) {
-  return (await sha1Hex(sourceUrl)).slice(0, 20);
+    return (await sha1Hex(sourceUrl)).slice(0, 20);
 }
 
 function b64urlEncodeBytes(bytes) {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
 function b64urlDecodeBytes(value) {
-  const mod = value.length % 4;
-  const padded = value + (mod ? "=".repeat(4 - mod) : "");
-  const binary = atob(padded.replace(/-/g, "+").replace(/_/g, "/"));
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
+    const mod = value.length % 4;
+    const padded = value + (mod ? "=".repeat(4 - mod) : "");
+    const binary = atob(padded.replace(/-/g, "+").replace(/_/g, "/"));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
 }
 
 function b64urlEncodeJson(payload) {
-  return b64urlEncodeBytes(new TextEncoder().encode(JSON.stringify(payload)));
+    return b64urlEncodeBytes(new TextEncoder().encode(JSON.stringify(payload)));
 }
 
 function b64urlDecodeText(value) {
-  return new TextDecoder().decode(b64urlDecodeBytes(value));
+    return new TextDecoder().decode(b64urlDecodeBytes(value));
 }
 
 function getTokenSecret(env) {
-  return envString(env, "URL_TOKEN_SECRET") || envString(env, "IPTV_PASSWORD") || HARDCODED_URL_TOKEN_SECRET;
+    return envString(env, "URL_TOKEN_SECRET") || envString(env, "IPTV_PASSWORD") || HARDCODED_URL_TOKEN_SECRET;
 }
 
 async function importHmacKey(secret) {
-  let keyPromise = hmacKeyCache.get(secret);
-  if (!keyPromise) {
-    keyPromise = crypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode(secret),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"],
-    );
-    hmacKeyCache.set(secret, keyPromise);
-  }
-  return keyPromise;
+    let keyPromise = hmacKeyCache.get(secret);
+    if (!keyPromise) {
+        keyPromise = crypto.subtle.importKey(
+            "raw",
+            new TextEncoder().encode(secret),
+            { name: "HMAC", hash: "SHA-256" },
+            false,
+            ["sign"],
+        );
+        hmacKeyCache.set(secret, keyPromise);
+    }
+    return keyPromise;
 }
 
 async function signTokenPayload(secret, payloadB64) {
-  const key = await importHmacKey(secret);
-  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payloadB64));
-  return b64urlEncodeBytes(new Uint8Array(signature).slice(0, 16));
+    const key = await importHmacKey(secret);
+    const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payloadB64));
+    return b64urlEncodeBytes(new Uint8Array(signature).slice(0, 16));
 }
 
 async function makeUrlToken(payload, env) {
-  const body = b64urlEncodeJson(payload);
-  if (!envBool(env, "SIGN_URL_TOKENS", false)) return body;
-  const signature = await signTokenPayload(getTokenSecret(env), body);
-  return `${signature}.${body}`;
+    const body = b64urlEncodeJson(payload);
+    if (!envBool(env, "SIGN_URL_TOKENS", false)) return body;
+    const signature = await signTokenPayload(getTokenSecret(env), body);
+    return `${signature}.${body}`;
 }
 
 function decodeUnsignedUrlToken(token) {
-  try {
-    const payload = JSON.parse(b64urlDecodeText(token));
-    if (!payload || !payload.u) throw new Error("Missing URL.");
-    return payload;
-  } catch {
-    throw new HttpError(404, "Upstream URL token expired or invalid.");
-  }
+    try {
+        const payload = JSON.parse(b64urlDecodeText(token));
+        if (!payload || !payload.u) throw new Error("Missing URL.");
+        return payload;
+    } catch {
+        throw new HttpError(404, "Upstream URL token expired or invalid.");
+    }
 }
 
 async function readUrlToken(token, env) {
-  if (!envBool(env, "SIGN_URL_TOKENS", false)) return decodeUnsignedUrlToken(token);
-  if (!token.includes(".") && !token.includes("_")) return decodeUnsignedUrlToken(token);
+    if (!envBool(env, "SIGN_URL_TOKENS", false)) return decodeUnsignedUrlToken(token);
+    if (!token.includes(".") && !token.includes("_")) return decodeUnsignedUrlToken(token);
 
-  const separator = token.includes(".") ? "." : "_";
-  const parts = token.split(separator);
-  const signatureText = parts[0];
-  const payloadText = parts.slice(1).join(separator);
-  if (!signatureText || !payloadText) throw new HttpError(404, "Upstream URL token expired or invalid.");
+    const separator = token.includes(".") ? "." : "_";
+    const parts = token.split(separator);
+    const signatureText = parts[0];
+    const payloadText = parts.slice(1).join(separator);
+    if (!signatureText || !payloadText) throw new HttpError(404, "Upstream URL token expired or invalid.");
 
-  const expected = await signTokenPayload(getTokenSecret(env), payloadText);
-  if (signatureText !== expected) throw new HttpError(404, "Upstream URL token expired or invalid.");
+    const expected = await signTokenPayload(getTokenSecret(env), payloadText);
+    if (signatureText !== expected) throw new HttpError(404, "Upstream URL token expired or invalid.");
 
-  try {
-    const payload = JSON.parse(b64urlDecodeText(payloadText));
-    if (!payload || !payload.u) throw new Error("Missing URL.");
-    return payload;
-  } catch {
-    throw new HttpError(404, "Upstream URL token expired or invalid.");
-  }
+    try {
+        const payload = JSON.parse(b64urlDecodeText(payloadText));
+        if (!payload || !payload.u) throw new Error("Missing URL.");
+        return payload;
+    } catch {
+        throw new HttpError(404, "Upstream URL token expired or invalid.");
+    }
 }
 
 // Validation
 
 function validateKey(key) {
-  if (!KEY_RE.test(key)) throw new HttpError(404, "Unknown stream.");
+    if (!KEY_RE.test(key)) throw new HttpError(404, "Unknown stream.");
 }
 
 // Generic helpers
 
 function cleanString(value, fallback = "") {
-  const text = String(value ?? "").trim();
-  return text || fallback;
+    const text = String(value ?? "").trim();
+    return text || fallback;
 }
 
 function normalizeSearchText(value) {
-  return cleanString(value)
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim()
-    .replace(/\s+/g, " ");
+    return cleanString(value)
+        .toLowerCase()
+        .normalize("NFKD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim()
+        .replace(/\s+/g, " ");
 }
 
 function channelMatchesQuery(channel, query) {
-  const tokens = normalizeSearchText(query).split(" ").filter(Boolean);
-  if (tokens.length === 0) return true;
-  const haystack = normalizeSearchText(`${channel?.name || ""} ${channel?.category || ""} ${channel?.key || ""}`);
-  return tokens.every((token) => haystack.includes(token));
+    const tokens = normalizeSearchText(query).split(" ").filter(Boolean);
+    if (tokens.length === 0) return true;
+    const haystack = normalizeSearchText(`${channel?.name || ""} ${channel?.category || ""} ${channel?.key || ""}`);
+    return tokens.every((token) => haystack.includes(token));
 }
 
 function randomCredential(length = 14) {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-  const bytes = new Uint8Array(length);
-  crypto.getRandomValues(bytes);
-  let output = "";
-  for (const byte of bytes) output += alphabet[byte % alphabet.length];
-  return output;
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    const bytes = new Uint8Array(length);
+    crypto.getRandomValues(bytes);
+    let output = "";
+    for (const byte of bytes) output += alphabet[byte % alphabet.length];
+    return output;
 }
 
 function parseRequestBool(value, fallback = false) {
-  if (value === undefined || value === null || value === "") return fallback;
-  if (typeof value === "boolean") return value;
-  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+    if (value === undefined || value === null || value === "") return fallback;
+    if (typeof value === "boolean") return value;
+    return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }
 
 function stripExtension(value) {
-  const text = cleanString(value);
-  const dot = text.lastIndexOf(".");
-  return dot > 0 ? text.slice(0, dot) : text;
+    const text = cleanString(value);
+    const dot = text.lastIndexOf(".");
+    return dot > 0 ? text.slice(0, dot) : text;
 }
 
 function encodePathSegment(value) {
-  return encodeURIComponent(String(value));
+    return encodeURIComponent(String(value));
 }
 
 function normalizeSourceLabel(value) {
-  return cleanString(value).toUpperCase();
+    return cleanString(value).toUpperCase();
 }
 
 function categoryName(category) {
-  return cleanString(category?.category_name ?? category?.name ?? category?.title);
+    return cleanString(category?.category_name ?? category?.name ?? category?.title);
 }
 
 function itemId(item, catalogKind) {
-  const setup = XTREAM_CATALOGS[catalogKind];
-  return cleanString(item?.[setup.idField] ?? item?.stream_id ?? item?.series_id ?? item?.id);
+    const setup = XTREAM_CATALOGS[catalogKind];
+    return cleanString(item?.[setup.idField] ?? item?.stream_id ?? item?.series_id ?? item?.id);
 }
 
 function mediaLogo(item) {
-  return cleanString(item?.stream_icon ?? item?.cover ?? item?.movie_image ?? item?.icon);
+    return cleanString(item?.stream_icon ?? item?.cover ?? item?.movie_image ?? item?.icon);
 }
 
 function mediaRating(item) {
-  const value = item?.rating_5based ?? item?.rating;
-  return value === undefined || value === null || value === "" ? null : value;
+    const value = item?.rating_5based ?? item?.rating;
+    return value === undefined || value === null || value === "" ? null : value;
 }
 
 // M3U parsing
 
 function parseExtinf(line) {
-  const nameMatch = line.match(/,(.+)$/);
-  const logoMatch = line.match(/tvg-logo="(.*?)"/);
-  const categoryMatch = line.match(/group-title="(.*?)"/);
-  return {
-    name: (nameMatch && nameMatch[1] && nameMatch[1].trim()) || "Unknown",
-    logo: (logoMatch && logoMatch[1] && logoMatch[1].trim()) || "",
-    category: (categoryMatch && categoryMatch[1] && categoryMatch[1].trim()) || "",
-  };
+    const nameMatch = line.match(/,(.+)$/);
+    const logoMatch = line.match(/tvg-logo="(.*?)"/);
+    const categoryMatch = line.match(/group-title="(.*?)"/);
+    return {
+        name: (nameMatch && nameMatch[1] && nameMatch[1].trim()) || "Unknown",
+        logo: (logoMatch && logoMatch[1] && logoMatch[1].trim()) || "",
+        category: (categoryMatch && categoryMatch[1] && categoryMatch[1].trim()) || "",
+    };
 }
 
 async function* readResponseLines(response) {
-  if (!response.body) {
-    const text = await response.text();
-    for (const line of text.split(/\r?\n/)) yield line;
-    return;
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split(/\r?\n/);
-    buffer = parts.pop() || "";
-    for (const part of parts) yield part;
-  }
-  buffer += decoder.decode();
-  if (buffer) yield buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
+    if (!response.body) {
+        const text = await response.text();
+        for (const line of text.split(/\r?\n/)) yield line;
+        return;
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split(/\r?\n/);
+        buffer = parts.pop() || "";
+        for (const part of parts) yield part;
+    }
+    buffer += decoder.decode();
+    if (buffer) yield buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
 }
 
 function parseXtreamMediaUrl(rawUrl) {
-  try {
-    const parsed = new URL(rawUrl);
-    const parts = parsed.pathname.split("/").filter(Boolean);
-    if (parts.length >= 4 && ["live", "movie", "series"].includes(parts[0].toLowerCase())) {
-      return { kind: parts[0].toLowerCase(), id: stripExtension(parts[3]) };
+    try {
+        const parsed = new URL(rawUrl);
+        const parts = parsed.pathname.split("/").filter(Boolean);
+        if (parts.length >= 4 && ["live", "movie", "series"].includes(parts[0].toLowerCase())) {
+            return { kind: parts[0].toLowerCase(), id: stripExtension(parts[3]) };
+        }
+        if (parts.length >= 3) {
+            return { kind: "live", id: stripExtension(parts[2]) };
+        }
+    } catch {
+        return null;
     }
-    if (parts.length >= 3) {
-      return { kind: "live", id: stripExtension(parts[2]) };
-    }
-  } catch {
     return null;
-  }
-  return null;
 }
 
 function inferPlaylistEntryKind(url) {
-  const lower = url.toLowerCase();
-  if (lower.includes("/series/")) return "series";
-  if (lower.includes("/movie/") || [".mp4", ".mkv", ".avi", ".mov"].some((ext) => lower.includes(ext))) return "movie";
-  return "live";
+    const lower = url.toLowerCase();
+    if (lower.includes("/series/")) return "series";
+    if (lower.includes("/movie/") || [".mp4", ".mkv", ".avi", ".mov"].some((ext) => lower.includes(ext))) return "movie";
+    return "live";
 }
 
 async function parseM3uEntries(response, onEntry) {
-  let currentMeta = { name: "Unknown", logo: "", category: "" };
-  for await (const rawLine of readResponseLines(response)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    if (line.startsWith("#EXTINF")) {
-      currentMeta = parseExtinf(line);
-      continue;
-    }
-    if (line.startsWith("#")) continue;
+    let currentMeta = { name: "Unknown", logo: "", category: "" };
+    for await (const rawLine of readResponseLines(response)) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        if (line.startsWith("#EXTINF")) {
+            currentMeta = parseExtinf(line);
+            continue;
+        }
+        if (line.startsWith("#")) continue;
 
-    const xtreamParts = parseXtreamMediaUrl(line);
-    const kind = xtreamParts?.kind || inferPlaylistEntryKind(line);
-    const key = await streamKey(line);
-    const result = await onEntry({
-      key,
-      kind,
-      streamId: xtreamParts?.id || "",
-      name: currentMeta.name,
-      logo: currentMeta.logo,
-      category: currentMeta.category,
-      sourceUrl: line,
-    });
-    currentMeta = { name: "Unknown", logo: "", category: "" };
-    if (result === false) return;
-  }
+        const xtreamParts = parseXtreamMediaUrl(line);
+        const kind = xtreamParts?.kind || inferPlaylistEntryKind(line);
+        const key = await streamKey(line);
+        const result = await onEntry({
+            key,
+            kind,
+            streamId: xtreamParts?.id || "",
+            name: currentMeta.name,
+            logo: currentMeta.logo,
+            category: currentMeta.category,
+            sourceUrl: line,
+        });
+        currentMeta = { name: "Unknown", logo: "", category: "" };
+        if (result === false) return;
+    }
 }
 
 async function parseM3uChannels(response, onChannel) {
-  await parseM3uEntries(response, async (entry) => {
-    if (entry.kind !== "live") return;
-    return onChannel(entry);
-  });
+    await parseM3uEntries(response, async (entry) => {
+        if (entry.kind !== "live") return;
+        return onChannel(entry);
+    });
 }
 
 // Source list helpers
 
 function splitSourceList(raw) {
-  return String(raw || "").split(/\r?\n|,/).map((v) => v.trim()).filter(Boolean);
+    return String(raw || "").split(/\r?\n|,/).map((v) => v.trim()).filter(Boolean);
 }
 
 function withSourceSuffix(name, label) {
-  return `${String(name || "Unknown").trim() || "Unknown"} (${label})`;
+    return `${String(name || "Unknown").trim() || "Unknown"} (${label})`;
 }
 
 function buildProviderPlaylistSources(env) {
-  const sources = [];
-  const username = envString(env, "PROVIDER_USERNAME") || envString(env, "IPTV_USERNAME") || HARDCODED_PROVIDER_USERNAME;
-  const password = envString(env, "PROVIDER_PASSWORD") || envString(env, "IPTV_PASSWORD") || HARDCODED_PROVIDER_PASSWORD;
-  if (username && password) {
-    const baseUrl = (
-      envString(env, "PROVIDER_BASE_URL") ||
-      envString(env, "IPTV_BASE_URL") ||
-      DEFAULT_PROVIDER_BASE_URL
-    ).replace(/\/+$/, "");
-    if (baseUrl) {
-      const playlistUrl = new URL("/get.php", `${baseUrl}/`);
-      playlistUrl.searchParams.set("username", username);
-      playlistUrl.searchParams.set("password", password);
-      playlistUrl.searchParams.set("type", "m3u_plus");
-      sources.push({ url: playlistUrl.toString(), label: "APIPRIMARY" });
+    const sources = [];
+    const username = envString(env, "PROVIDER_USERNAME") || envString(env, "IPTV_USERNAME") || HARDCODED_PROVIDER_USERNAME;
+    const password = envString(env, "PROVIDER_PASSWORD") || envString(env, "IPTV_PASSWORD") || HARDCODED_PROVIDER_PASSWORD;
+    if (username && password) {
+        const baseUrl = (
+            envString(env, "PROVIDER_BASE_URL") ||
+            envString(env, "IPTV_BASE_URL") ||
+            DEFAULT_PROVIDER_BASE_URL
+        ).replace(/\/+$/, "");
+        if (baseUrl) {
+            const playlistUrl = new URL("/get.php", `${baseUrl}/`);
+            playlistUrl.searchParams.set("username", username);
+            playlistUrl.searchParams.set("password", password);
+            playlistUrl.searchParams.set("type", "m3u_plus");
+            sources.push({ url: playlistUrl.toString(), label: "APIPRIMARY" });
+        }
     }
-  }
-  for (const source of HARDCODED_EXTRA_PLAYLIST_SOURCES) {
-    if (!sources.some((e) => e.url === source.url)) sources.push(source);
-  }
-  for (const extraUrl of splitSourceList(envString(env, "EXTRA_PLAYLIST_SOURCES"))) {
-    if (!sources.some((e) => e.url === extraUrl)) sources.push({ url: extraUrl, label: "APIEXTRA" });
-  }
-  return sources;
+    for (const source of HARDCODED_EXTRA_PLAYLIST_SOURCES) {
+        if (!sources.some((e) => e.url === source.url)) sources.push(source);
+    }
+    for (const extraUrl of splitSourceList(envString(env, "EXTRA_PLAYLIST_SOURCES"))) {
+        if (!sources.some((e) => e.url === extraUrl)) sources.push({ url: extraUrl, label: "APIEXTRA" });
+    }
+    return sources;
 }
 
 function selectedPlaylistSources(env, sourceFilter) {
-  const sources = buildProviderPlaylistSources(env);
-  const wanted = normalizeSourceLabel(sourceFilter);
-  if (!wanted) return sources;
-  return sources.filter((source) => normalizeSourceLabel(source.label) === wanted);
+    const sources = buildProviderPlaylistSources(env);
+    const wanted = normalizeSourceLabel(sourceFilter);
+    if (!wanted) return sources;
+    return sources.filter((source) => normalizeSourceLabel(source.label) === wanted);
 }
 
 // Xtream API helpers
 
 function xtreamConfigFromPlaylistUrl(sourceUrl) {
-  try {
-    const parsed = new URL(sourceUrl);
-    const username = cleanString(parsed.searchParams.get("username"));
-    const password = cleanString(parsed.searchParams.get("password"));
-    if (!username || !password) return null;
-    return {
-      baseUrl: parsed.origin.replace(/\/+$/, ""),
-      username,
-      password,
-    };
-  } catch {
-    return null;
-  }
+    try {
+        const parsed = new URL(sourceUrl);
+        const username = cleanString(parsed.searchParams.get("username"));
+        const password = cleanString(parsed.searchParams.get("password"));
+        if (!username || !password) return null;
+        return {
+            baseUrl: parsed.origin.replace(/\/+$/, ""),
+            username,
+            password,
+        };
+    } catch {
+        return null;
+    }
 }
 
 function xtreamCacheKey(config) {
-  return `${config.baseUrl}|${config.username}|${config.password}`;
+    return `${config.baseUrl}|${config.username}|${config.password}`;
 }
 
 function xtreamApiUrl(config, action, extraParams = {}) {
-  const apiUrl = new URL("/player_api.php", `${config.baseUrl}/`);
-  apiUrl.searchParams.set("username", config.username);
-  apiUrl.searchParams.set("password", config.password);
-  if (action) apiUrl.searchParams.set("action", action);
-  for (const [key, value] of Object.entries(extraParams)) {
-    if (value !== undefined && value !== null && value !== "") apiUrl.searchParams.set(key, String(value));
-  }
-  return apiUrl;
+    const apiUrl = new URL("/player_api.php", `${config.baseUrl}/`);
+    apiUrl.searchParams.set("username", config.username);
+    apiUrl.searchParams.set("password", config.password);
+    if (action) apiUrl.searchParams.set("action", action);
+    for (const [key, value] of Object.entries(extraParams)) {
+        if (value !== undefined && value !== null && value !== "") apiUrl.searchParams.set(key, String(value));
+    }
+    return apiUrl;
 }
 
 async function fetchXtreamApi(env, config, action, extraParams = {}) {
-  const timeoutMs = envInt(env, "XTREAM_API_TIMEOUT_MS", 4000);
-  const headers = {
-    "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
-    accept: "application/json, text/plain, */*",
-  };
-  const urls = upstreamUrlCandidates(xtreamApiUrl(config, action, extraParams).toString(), env);
-  const attempts = await Promise.allSettled(urls.map(async (url) => {
-    const response = await fetchWithTimeout(url, { headers, redirect: "follow" }, timeoutMs);
-    if (!response.ok) throw response;
-    return JSON.parse(await response.text());
-  }));
+    const timeoutMs = envInt(env, "XTREAM_API_TIMEOUT_MS", 4000);
+    const headers = {
+        "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
+        accept: "application/json, text/plain, */*",
+    };
+    const urls = upstreamUrlCandidates(xtreamApiUrl(config, action, extraParams).toString(), env);
+    const attempts = await Promise.allSettled(urls.map(async (url) => {
+        const response = await fetchWithTimeout(url, { headers, redirect: "follow" }, timeoutMs);
+        if (!response.ok) throw response;
+        return JSON.parse(await response.text());
+    }));
 
-  for (const attempt of attempts) {
-    if (attempt.status === "fulfilled") return attempt.value;
-  }
-  return null;
+    for (const attempt of attempts) {
+        if (attempt.status === "fulfilled") return attempt.value;
+    }
+    return null;
 }
 
 function indexCategories(categories) {
-  const categoriesById = new Map();
-  if (!Array.isArray(categories)) return categoriesById;
-  for (const category of categories) {
-    const id = cleanString(category?.category_id ?? category?.id);
-    const name = categoryName(category);
-    if (id && name) categoriesById.set(id, name);
-  }
-  return categoriesById;
+    const categoriesById = new Map();
+    if (!Array.isArray(categories)) return categoriesById;
+    for (const category of categories) {
+        const id = cleanString(category?.category_id ?? category?.id);
+        const name = categoryName(category);
+        if (id && name) categoriesById.set(id, name);
+    }
+    return categoriesById;
 }
 
 function catalogCategory(catalog, item) {
-  const categoryId = cleanString(item?.category_id ?? item?.category);
-  return (
-    (categoryId && catalog?.categoriesById?.get(categoryId)) ||
-    cleanString(item?.category_name ?? item?.category)
-  );
+    const categoryId = cleanString(item?.category_id ?? item?.category);
+    return (
+        (categoryId && catalog?.categoriesById?.get(categoryId)) ||
+        cleanString(item?.category_name ?? item?.category)
+    );
 }
 
 async function loadXtreamCatalog(env, playlistSource, catalogKind, force = false) {
-  const config = xtreamConfigFromPlaylistUrl(playlistSource.url);
-  const setup = XTREAM_CATALOGS[catalogKind];
-  if (!config || !setup) return null;
+    const config = xtreamConfigFromPlaylistUrl(playlistSource.url);
+    const setup = XTREAM_CATALOGS[catalogKind];
+    if (!config || !setup) return null;
 
-  const cacheKey = `catalog:${catalogKind}:${xtreamCacheKey(config)}`;
-  const ttlMs = envInt(env, "XTREAM_METADATA_CACHE_SECONDS", 300) * 1000;
-  const cached = xtreamCatalogCache.get(cacheKey);
-  if (!force && cached && Date.now() - cached.at < ttlMs) return cached;
+    const cacheKey = `catalog:${catalogKind}:${xtreamCacheKey(config)}`;
+    const ttlMs = envInt(env, "XTREAM_METADATA_CACHE_SECONDS", 300) * 1000;
+    const cached = xtreamCatalogCache.get(cacheKey);
+    if (!force && cached && Date.now() - cached.at < ttlMs) return cached;
 
-  return withInflight(xtreamCatalogInflight, cacheKey, async () => {
-    const [categories, items] = await Promise.all([
-      fetchXtreamApi(env, config, setup.categoriesAction),
-      fetchXtreamApi(env, config, setup.itemsAction),
-    ]);
+    return withInflight(xtreamCatalogInflight, cacheKey, async () => {
+        const [categories, items] = await Promise.all([
+            fetchXtreamApi(env, config, setup.categoriesAction),
+            fetchXtreamApi(env, config, setup.itemsAction),
+        ]);
 
-    const categoriesById = indexCategories(categories);
-    const catalogItems = Array.isArray(items) ? items : [];
-    const itemsById = new Map();
-    for (const item of catalogItems) {
-      const id = itemId(item, catalogKind);
-      if (id) itemsById.set(id, item);
-    }
+        const categoriesById = indexCategories(categories);
+        const catalogItems = Array.isArray(items) ? items : [];
+        const itemsById = new Map();
+        for (const item of catalogItems) {
+            const id = itemId(item, catalogKind);
+            if (id) itemsById.set(id, item);
+        }
 
-    const catalog = {
-      at: Date.now(),
-      kind: catalogKind,
-      config,
-      categoriesById,
-      items: catalogItems,
-      itemsById,
-    };
-    rememberMapEntry(xtreamCatalogCache, cacheKey, catalog, MAX_XTREAM_CATALOG_CACHE_ENTRIES);
-    return catalog;
-  });
+        const catalog = {
+            at: Date.now(),
+            kind: catalogKind,
+            config,
+            categoriesById,
+            items: catalogItems,
+            itemsById,
+        };
+        rememberMapEntry(xtreamCatalogCache, cacheKey, catalog, MAX_XTREAM_CATALOG_CACHE_ENTRIES);
+        return catalog;
+    });
 }
 
 async function loadXtreamSeriesInfo(env, playlistSource, seriesId, force = false) {
-  const config = xtreamConfigFromPlaylistUrl(playlistSource.url);
-  if (!config) return null;
+    const config = xtreamConfigFromPlaylistUrl(playlistSource.url);
+    if (!config) return null;
 
-  const cacheKey = `series-info:${xtreamCacheKey(config)}:${seriesId}`;
-  const ttlMs = envInt(env, "XTREAM_METADATA_CACHE_SECONDS", 300) * 1000;
-  const cached = xtreamCatalogCache.get(cacheKey);
-  if (!force && cached && Date.now() - cached.at < ttlMs) return cached;
+    const cacheKey = `series-info:${xtreamCacheKey(config)}:${seriesId}`;
+    const ttlMs = envInt(env, "XTREAM_METADATA_CACHE_SECONDS", 300) * 1000;
+    const cached = xtreamCatalogCache.get(cacheKey);
+    if (!force && cached && Date.now() - cached.at < ttlMs) return cached;
 
-  return withInflight(xtreamCatalogInflight, cacheKey, async () => {
-    const payload = await fetchXtreamApi(env, config, "get_series_info", { series_id: seriesId });
-    const entry = {
-      at: Date.now(),
-      config,
-      payload,
-    };
-    rememberMapEntry(xtreamCatalogCache, cacheKey, entry, MAX_XTREAM_CATALOG_CACHE_ENTRIES);
-    return entry;
-  });
+    return withInflight(xtreamCatalogInflight, cacheKey, async () => {
+        const payload = await fetchXtreamApi(env, config, "get_series_info", { series_id: seriesId });
+        const entry = {
+            at: Date.now(),
+            config,
+            payload,
+        };
+        rememberMapEntry(xtreamCatalogCache, cacheKey, entry, MAX_XTREAM_CATALOG_CACHE_ENTRIES);
+        return entry;
+    });
 }
 
 function xtreamMediaUrl(config, kind, id, extension) {
-  const cleanExtension = cleanString(extension).replace(/^\./, "");
-  const suffix = cleanExtension ? `.${cleanExtension}` : "";
-  return `${config.baseUrl}/${kind}/${encodePathSegment(config.username)}/${encodePathSegment(config.password)}/${encodePathSegment(id)}${suffix}`;
+    const cleanExtension = cleanString(extension).replace(/^\./, "");
+    const suffix = cleanExtension ? `.${cleanExtension}` : "";
+    return `${config.baseUrl}/${kind}/${encodePathSegment(config.username)}/${encodePathSegment(config.password)}/${encodePathSegment(id)}${suffix}`;
 }
 
 function sourceApiUrl(request, env, path, params = {}) {
-  const apiUrl = new URL(path, publicBase(request, env));
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== null && value !== "") apiUrl.searchParams.set(key, String(value));
-  }
-  return apiUrl.toString();
+    const apiUrl = new URL(path, publicBase(request, env));
+    for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null && value !== "") apiUrl.searchParams.set(key, String(value));
+    }
+    return apiUrl.toString();
 }
 
 async function channelsFromXtreamCatalog(playlistSource, liveCatalog) {
-  if (!liveCatalog || !Array.isArray(liveCatalog.items) || liveCatalog.items.length === 0) return [];
-  const channels = [];
-  for (const item of liveCatalog.items) {
-    const streamId = itemId(item, "live");
-    if (!streamId) continue;
-    const extension = cleanString(item.container_extension, "ts");
-    const sourceUrl = xtreamMediaUrl(liveCatalog.config, "live", streamId, extension);
-    channels.push({
-      key: await streamKey(sourceUrl),
-      name: withSourceSuffix(cleanString(item.name, "Unknown"), playlistSource.label),
-      logo: mediaLogo(item),
-      category: catalogCategory(liveCatalog, item),
-      sourceUrl,
-    });
-  }
-  return channels;
+    if (!liveCatalog || !Array.isArray(liveCatalog.items) || liveCatalog.items.length === 0) return [];
+    const channels = [];
+    for (const item of liveCatalog.items) {
+        const streamId = itemId(item, "live");
+        if (!streamId) continue;
+        const extension = cleanString(item.container_extension, "ts");
+        const sourceUrl = xtreamMediaUrl(liveCatalog.config, "live", streamId, extension);
+        channels.push({
+            key: await streamKey(sourceUrl),
+            name: withSourceSuffix(cleanString(item.name, "Unknown"), playlistSource.label),
+            logo: mediaLogo(item),
+            category: catalogCategory(liveCatalog, item),
+            sourceUrl,
+        });
+    }
+    return channels;
 }
 
 // Dashboard account storage
 
 function accessUsersFile(env) {
-  return envString(env, "ACCESS_USERS_FILE", "access-users.json") || "access-users.json";
+    return envString(env, "ACCESS_USERS_FILE", "access-users.json") || "access-users.json";
 }
 
 function normalizeAccessUsersPayload(payload) {
-  const rawUsers = Array.isArray(payload) ? payload : payload?.users;
-  if (!Array.isArray(rawUsers)) return [];
-  return rawUsers
-    .map((user) => ({
-      username: cleanString(user?.username),
-      password: cleanString(user?.password),
-      createdAt: cleanString(user?.createdAt) || new Date().toISOString(),
-      expiresAt: user?.expiresAt ? cleanString(user.expiresAt) : null,
-      disabled: Boolean(user?.disabled),
-      includeLive: user?.includeLive === undefined ? true : Boolean(user.includeLive),
-      includeMovies: Boolean(user?.includeMovies),
-      includeSeries: Boolean(user?.includeSeries),
-    }))
-    .filter((user) => user.username && user.password);
+    const rawUsers = Array.isArray(payload) ? payload : payload?.users;
+    if (!Array.isArray(rawUsers)) return [];
+    return rawUsers
+        .map((user) => ({
+            username: cleanString(user?.username),
+            password: cleanString(user?.password),
+            createdAt: cleanString(user?.createdAt) || new Date().toISOString(),
+            expiresAt: user?.expiresAt ? cleanString(user.expiresAt) : null,
+            disabled: Boolean(user?.disabled),
+            includeLive: user?.includeLive === undefined ? true : Boolean(user.includeLive),
+            includeMovies: Boolean(user?.includeMovies),
+            includeSeries: Boolean(user?.includeSeries),
+        }))
+        .filter((user) => user.username && user.password);
 }
 
 async function loadAccessUsers(env) {
-  try {
-    const text = await fs.readFile(accessUsersFile(env), "utf8");
-    return normalizeAccessUsersPayload(JSON.parse(text));
-  } catch (error) {
-    if (error && error.code === "ENOENT") return [];
-    throw error;
-  }
+    try {
+        const text = await fs.readFile(accessUsersFile(env), "utf8");
+        return normalizeAccessUsersPayload(JSON.parse(text));
+    } catch (error) {
+        if (error && error.code === "ENOENT") return [];
+        throw error;
+    }
 }
 
 async function saveAccessUsers(env, users) {
-  const payload = {
-    updatedAt: new Date().toISOString(),
-    users,
-  };
-  await fs.writeFile(accessUsersFile(env), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    const payload = {
+        updatedAt: new Date().toISOString(),
+        users,
+    };
+    await fs.writeFile(accessUsersFile(env), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
 function expiryForDuration(duration) {
-  if (duration === "infinite") return null;
-  const months = ACCESS_DURATION_MONTHS[duration] ?? ACCESS_DURATION_MONTHS["1m"];
-  const expires = new Date();
-  expires.setMonth(expires.getMonth() + months);
-  return expires.toISOString();
+    if (duration === "infinite") return null;
+    const months = ACCESS_DURATION_MONTHS[duration] ?? ACCESS_DURATION_MONTHS["1m"];
+    const expires = new Date();
+    expires.setMonth(expires.getMonth() + months);
+    return expires.toISOString();
 }
 
 function isAccessUserExpired(user) {
-  if (!user?.expiresAt) return false;
-  const expiresMs = Date.parse(user.expiresAt);
-  return Number.isFinite(expiresMs) && expiresMs <= Date.now();
+    if (!user?.expiresAt) return false;
+    const expiresMs = Date.parse(user.expiresAt);
+    return Number.isFinite(expiresMs) && expiresMs <= Date.now();
 }
 
 function m3uLinkForUser(user, request, env) {
-  const url = new URL("/get.php", publicBase(request, env));
-  url.searchParams.set("username", user.username);
-  url.searchParams.set("password", user.password);
-  url.searchParams.set("type", "m3u_plus");
-  return url.toString();
+    const url = new URL("/get.php", publicBase(request, env));
+    url.searchParams.set("username", user.username);
+    url.searchParams.set("password", user.password);
+    url.searchParams.set("type", "m3u_plus");
+    return url.toString();
 }
 
 function playlistIncludeFlags(request, account) {
-  const url = new URL(request.url);
-  return {
-    includeLive: account.includeLive !== false,
-    includeMovies: account.includeMovies && parseRequestBool(url.searchParams.get("include_movies"), false),
-    includeSeries: account.includeSeries && parseRequestBool(url.searchParams.get("include_series"), false),
-  };
+    const url = new URL(request.url);
+    return {
+        includeLive: account.includeLive !== false,
+        includeMovies: account.includeMovies && parseRequestBool(url.searchParams.get("include_movies"), false),
+        includeSeries: account.includeSeries && parseRequestBool(url.searchParams.get("include_series"), false),
+    };
 }
 
 function serializeAccessUser(user, request, env) {
-  return {
-    username: user.username,
-    created_at: user.createdAt,
-    expires_at: user.expiresAt,
-    expired: isAccessUserExpired(user),
-    disabled: Boolean(user.disabled),
-    include_live: user.includeLive !== false,
-    include_movies: Boolean(user.includeMovies),
-    include_series: Boolean(user.includeSeries),
-    m3u_url: m3uLinkForUser(user, request, env),
-  };
+    return {
+        username: user.username,
+        created_at: user.createdAt,
+        expires_at: user.expiresAt,
+        expired: isAccessUserExpired(user),
+        disabled: Boolean(user.disabled),
+        include_live: user.includeLive !== false,
+        include_movies: Boolean(user.includeMovies),
+        include_series: Boolean(user.includeSeries),
+        m3u_url: m3uLinkForUser(user, request, env),
+    };
 }
 
 function basicAuthCredentials(request) {
-  const header = request.headers.get("authorization") || "";
-  const match = header.match(/^Basic\s+(.+)$/i);
-  if (!match) return null;
-  try {
-    const decoded = atob(match[1]);
-    const separator = decoded.indexOf(":");
-    if (separator < 0) return null;
-    return {
-      username: decoded.slice(0, separator),
-      password: decoded.slice(separator + 1),
-    };
-  } catch {
-    return null;
-  }
+    const header = request.headers.get("authorization") || "";
+    const match = header.match(/^Basic\s+(.+)$/i);
+    if (!match) return null;
+    try {
+        const decoded = atob(match[1]);
+        const separator = decoded.indexOf(":");
+        if (separator < 0) return null;
+        return {
+            username: decoded.slice(0, separator),
+            password: decoded.slice(separator + 1),
+        };
+    } catch {
+        return null;
+    }
 }
 
 function dashboardAuthorized(request, env) {
-  const adminPassword = envString(env, "ADMIN_PASSWORD");
-  if (!adminPassword) return true;
-  const adminUsername = envString(env, "ADMIN_USERNAME", "admin") || "admin";
-  const credentials = basicAuthCredentials(request);
-  return credentials?.username === adminUsername && credentials?.password === adminPassword;
+    const adminPassword = envString(env, "ADMIN_PASSWORD");
+    if (!adminPassword) return true;
+    const adminUsername = envString(env, "ADMIN_USERNAME", "admin") || "admin";
+    const credentials = basicAuthCredentials(request);
+    return credentials?.username === adminUsername && credentials?.password === adminPassword;
 }
 
 function dashboardAuthResponse() {
-  return textResponse("Authentication required.", 401, {
-    "www-authenticate": 'Basic realm="IPTV Dashboard"',
-  });
+    return textResponse("Authentication required.", 401, {
+        "www-authenticate": 'Basic realm="IPTV Dashboard"',
+    });
 }
 
 async function readRequestData(request) {
-  const text = await request.text();
-  if (!text.trim()) return {};
-  const contentType = request.headers.get("content-type") || "";
-  if (contentType.includes("application/json")) return JSON.parse(text);
-  const params = new URLSearchParams(text);
-  return Object.fromEntries(params.entries());
+    const text = await request.text();
+    if (!text.trim()) return {};
+    const contentType = request.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) return JSON.parse(text);
+    const params = new URLSearchParams(text);
+    return Object.fromEntries(params.entries());
 }
 
 async function accessUsersPayload(request, env) {
-  if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
-  const users = await loadAccessUsers(env);
-  return json({
-    status: "ok",
-    count: users.length,
-    worker_url: publicBase(request, env),
-    auth_enabled: Boolean(envString(env, "ADMIN_PASSWORD")),
-    users: users.map((user) => serializeAccessUser(user, request, env)),
-  });
+    if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+    const users = await loadAccessUsers(env);
+    return json({
+        status: "ok",
+        count: users.length,
+        worker_url: publicBase(request, env),
+        auth_enabled: Boolean(envString(env, "ADMIN_PASSWORD")),
+        users: users.map((user) => serializeAccessUser(user, request, env)),
+    });
 }
 
 async function createAccessUser(request, env) {
-  if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
-  const data = await readRequestData(request);
-  const username = cleanString(data.username);
-  const password = cleanString(data.password) || randomCredential(14);
-  if (!username) throw new HttpError(400, "Username is required.");
-  if (!/^[A-Za-z0-9_.@-]{2,64}$/.test(username)) throw new HttpError(400, "Username may contain letters, numbers, dot, underscore, dash, or @.");
-  if (!/^[A-Za-z0-9_.@#$%+-]{4,96}$/.test(password)) throw new HttpError(400, "Password contains unsupported characters or is too short.");
+    if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+    const data = await readRequestData(request);
+    const username = cleanString(data.username);
+    const password = cleanString(data.password) || randomCredential(14);
+    if (!username) throw new HttpError(400, "Username is required.");
+    if (!/^[A-Za-z0-9_.@-]{2,64}$/.test(username)) throw new HttpError(400, "Username may contain letters, numbers, dot, underscore, dash, or @.");
+    if (!/^[A-Za-z0-9_.@#$%+-]{4,96}$/.test(password)) throw new HttpError(400, "Password contains unsupported characters or is too short.");
 
-  const duration = cleanString(data.duration, "1m");
-  const expiresAt = data.expires_at ? cleanString(data.expires_at) : expiryForDuration(duration);
-  const users = await loadAccessUsers(env);
-  const now = new Date().toISOString();
-  const existingIndex = users.findIndex((user) => user.username.toLowerCase() === username.toLowerCase());
-  const user = {
-    username,
-    password,
-    createdAt: existingIndex >= 0 ? users[existingIndex].createdAt : now,
-    expiresAt,
-    disabled: false,
-    includeLive: parseRequestBool(data.include_live, true),
-    includeMovies: parseRequestBool(data.include_movies, false),
-    includeSeries: parseRequestBool(data.include_series, false),
-  };
+    const duration = cleanString(data.duration, "1m");
+    const expiresAt = data.expires_at ? cleanString(data.expires_at) : expiryForDuration(duration);
+    const users = await loadAccessUsers(env);
+    const now = new Date().toISOString();
+    const existingIndex = users.findIndex((user) => user.username.toLowerCase() === username.toLowerCase());
+    const user = {
+        username,
+        password,
+        createdAt: existingIndex >= 0 ? users[existingIndex].createdAt : now,
+        expiresAt,
+        disabled: false,
+        includeLive: parseRequestBool(data.include_live, true),
+        includeMovies: parseRequestBool(data.include_movies, false),
+        includeSeries: parseRequestBool(data.include_series, false),
+    };
 
-  if (existingIndex >= 0) users[existingIndex] = user;
-  else users.push(user);
-  await saveAccessUsers(env, users);
-  void loadPlaylistChannels(env, false).catch(() => null);
+    if (existingIndex >= 0) users[existingIndex] = user;
+    else users.push(user);
+    await saveAccessUsers(env, users);
+    void loadPlaylistChannels(env, false).catch(() => null);
 
-  return json({
-    status: "ok",
-    user: serializeAccessUser(user, request, env),
-  }, existingIndex >= 0 ? 200 : 201);
+    return json({
+        status: "ok",
+        user: serializeAccessUser(user, request, env),
+    }, existingIndex >= 0 ? 200 : 201);
 }
 
 async function deleteAccessUser(request, env) {
-  if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
-  const data = await readRequestData(request);
-  const username = cleanString(data.username);
-  if (!username) throw new HttpError(400, "Username is required.");
-  const users = await loadAccessUsers(env);
-  const kept = users.filter((user) => user.username.toLowerCase() !== username.toLowerCase());
-  await saveAccessUsers(env, kept);
-  return json({ status: "ok", deleted: users.length - kept.length });
+    if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+    const data = await readRequestData(request);
+    const username = cleanString(data.username);
+    if (!username) throw new HttpError(400, "Username is required.");
+    const users = await loadAccessUsers(env);
+    const kept = users.filter((user) => user.username.toLowerCase() !== username.toLowerCase());
+    await saveAccessUsers(env, kept);
+    return json({ status: "ok", deleted: users.length - kept.length });
 }
 
 async function getPlaylistAccessUser(request, env) {
-  const url = new URL(request.url);
-  const username = cleanString(url.searchParams.get("username"));
-  const password = cleanString(url.searchParams.get("password"));
-  if (!username || !password) throw new HttpError(401, "Missing username or password.");
-  const users = await loadAccessUsers(env);
-  const user = users.find((entry) => entry.username === username && entry.password === password);
-  if (!user || user.disabled) throw new HttpError(403, "Invalid playlist credentials.");
-  if (isAccessUserExpired(user)) throw new HttpError(403, "Playlist credentials expired.");
-  return user;
+    const url = new URL(request.url);
+    const username = cleanString(url.searchParams.get("username"));
+    const password = cleanString(url.searchParams.get("password"));
+    if (!username || !password) throw new HttpError(401, "Missing username or password.");
+    const users = await loadAccessUsers(env);
+    const user = users.find((entry) => entry.username === username && entry.password === password);
+    if (!user || user.disabled) throw new HttpError(403, "Invalid playlist credentials.");
+    if (isAccessUserExpired(user)) throw new HttpError(403, "Playlist credentials expired.");
+    return user;
 }
 
 // Map/cache helpers
 
 function rememberMapEntry(map, key, value, maxEntries) {
-  if (map.has(key)) map.delete(key);
-  map.set(key, value);
-  while (map.size > maxEntries) map.delete(map.keys().next().value);
+    if (map.has(key)) map.delete(key);
+    map.set(key, value);
+    while (map.size > maxEntries) map.delete(map.keys().next().value);
 }
 
 async function withInflight(map, key, loader) {
-  const existing = map.get(key);
-  if (existing) return existing;
-  const promise = loader();
-  map.set(key, promise);
-  try {
-    return await promise;
-  } finally {
-    if (map.get(key) === promise) map.delete(key);
-  }
+    const existing = map.get(key);
+    if (existing) return existing;
+    const promise = loader();
+    map.set(key, promise);
+    try {
+        return await promise;
+    } finally {
+        if (map.get(key) === promise) map.delete(key);
+    }
 }
 
 // ─── Disk cache helpers ───────────────────────────────────────────────────────
 
 async function saveDiskCache(file, data) {
-  try {
-    await fs.writeFile(file, JSON.stringify(data), "utf8");
-  } catch (err) {
-    console.warn("[cache] Could not save disk cache", file, err?.message);
-  }
+    try {
+        await fs.writeFile(file, JSON.stringify(data), "utf8");
+    } catch (err) {
+        console.warn("[cache] Could not save disk cache", file, err?.message);
+    }
 }
 
 async function loadDiskCache(file) {
-  try {
-    const text = await fs.readFile(file, "utf8");
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
+    try {
+        const text = await fs.readFile(file, "utf8");
+        return JSON.parse(text);
+    } catch {
+        return null;
+    }
 }
 
 // ─── Channel loading ─────────────────────────────────────────────────────────
 
 async function doRefreshChannels(env) {
-  const playlistSources = buildProviderPlaylistSources(env);
-  if (playlistSources.length === 0) throw new HttpError(500, "No IPTV playlist sources configured.");
+    const playlistSources = buildProviderPlaylistSources(env);
+    if (playlistSources.length === 0) throw new HttpError(500, "No IPTV playlist sources configured.");
 
-  const channels = [];
-  const nextStreamIndex = new Map();
-  const seenKeys = new Set();
-  let successCount = 0;
-  let playlistOkCount = 0;
-  let lastStatus = null;
+    const channels = [];
+    const nextStreamIndex = new Map();
+    const seenKeys = new Set();
+    let successCount = 0;
+    let playlistOkCount = 0;
+    let lastStatus = null;
 
-  const sourceResults = await Promise.all(playlistSources.map(async (playlistSource) => {
-    let response = null;
-    const liveCatalog = await loadXtreamCatalog(env, playlistSource, "live", false).catch(() => null);
-    try {
-      response = await fetchProviderPlaylist(env, playlistSource.url);
-    } catch {
-      response = null;
-    }
-    return { playlistSource, response, liveCatalog };
-  }));
-
-  for (const { playlistSource, response, liveCatalog } of sourceResults) {
-    if (!response && !liveCatalog) { lastStatus = "network error"; continue; }
-
-    if (response && response.ok) {
-      successCount += 1;
-      playlistOkCount += 1;
-      await parseM3uChannels(response, async (channel) => {
-        if (seenKeys.has(channel.key)) return;
-        const xtreamItem = channel.streamId ? liveCatalog?.itemsById?.get(channel.streamId) : null;
-        const name = cleanString(xtreamItem?.name, channel.name);
-        const logo = mediaLogo(xtreamItem) || channel.logo;
-        const category = (xtreamItem ? catalogCategory(liveCatalog, xtreamItem) : "") || channel.category;
-        seenKeys.add(channel.key);
-        nextStreamIndex.set(channel.key, channel.sourceUrl);
-        channels.push({ key: channel.key, name: withSourceSuffix(name, playlistSource.label), logo, category });
-      });
-      continue;
-    }
-
-    if (liveCatalog) {
-      const xtreamChannels = await channelsFromXtreamCatalog(playlistSource, liveCatalog);
-      if (xtreamChannels.length > 0) {
-        successCount += 1;
-        for (const channel of xtreamChannels) {
-          if (seenKeys.has(channel.key)) continue;
-          seenKeys.add(channel.key);
-          nextStreamIndex.set(channel.key, channel.sourceUrl);
-          channels.push({ key: channel.key, name: channel.name, logo: channel.logo, category: channel.category });
+    const sourceResults = await Promise.all(playlistSources.map(async (playlistSource) => {
+        let response = null;
+        const liveCatalog = await loadXtreamCatalog(env, playlistSource, "live", false).catch(() => null);
+        try {
+            response = await fetchProviderPlaylist(env, playlistSource.url);
+        } catch {
+            response = null;
         }
-        continue;
-      }
+        return { playlistSource, response, liveCatalog };
+    }));
+
+    for (const { playlistSource, response, liveCatalog } of sourceResults) {
+        if (!response && !liveCatalog) { lastStatus = "network error"; continue; }
+
+        if (response && response.ok) {
+            successCount += 1;
+            playlistOkCount += 1;
+            await parseM3uChannels(response, async (channel) => {
+                if (seenKeys.has(channel.key)) return;
+                const xtreamItem = channel.streamId ? liveCatalog?.itemsById?.get(channel.streamId) : null;
+                const name = cleanString(xtreamItem?.name, channel.name);
+                const logo = mediaLogo(xtreamItem) || channel.logo;
+                const category = (xtreamItem ? catalogCategory(liveCatalog, xtreamItem) : "") || channel.category;
+                seenKeys.add(channel.key);
+                nextStreamIndex.set(channel.key, channel.sourceUrl);
+                channels.push({ key: channel.key, name: withSourceSuffix(name, playlistSource.label), logo, category });
+            });
+            continue;
+        }
+
+        if (liveCatalog) {
+            const xtreamChannels = await channelsFromXtreamCatalog(playlistSource, liveCatalog);
+            if (xtreamChannels.length > 0) {
+                successCount += 1;
+                for (const channel of xtreamChannels) {
+                    if (seenKeys.has(channel.key)) continue;
+                    seenKeys.add(channel.key);
+                    nextStreamIndex.set(channel.key, channel.sourceUrl);
+                    channels.push({ key: channel.key, name: channel.name, logo: channel.logo, category: channel.category });
+                }
+                continue;
+            }
+        }
+
+        lastStatus = response ? response.status : "network error";
     }
 
-    lastStatus = response ? response.status : "network error";
-  }
+    if (successCount === 0) {
+        if (channelCache.channels.length > 0) return channelCache.channels; // serve stale
+        throw new HttpError(502, `All IPTV playlist sources failed${lastStatus ? ` (last status: ${lastStatus})` : ""}.`);
+    }
 
-  if (successCount === 0) {
-    if (channelCache.channels.length > 0) return channelCache.channels; // serve stale
-    throw new HttpError(502, `All IPTV playlist sources failed${lastStatus ? ` (last status: ${lastStatus})` : ""}.`);
-  }
+    // If we only managed to build channels via the smaller Xtream fallback, do not replace an existing
+    // full playlist cache (this is what causes the 34k -> 9k swings).
+    if (playlistOkCount === 0 && channelCache.channels.length > 0) {
+        console.warn(`[cache] channels refresh used Xtream fallback only (${channels.length}); keeping existing cache (${channelCache.channels.length}).`);
+        return channelCache.channels;
+    }
 
-  // If we only managed to build channels via the smaller Xtream fallback, do not replace an existing
-  // full playlist cache (this is what causes the 34k -> 9k swings).
-  if (playlistOkCount === 0 && channelCache.channels.length > 0) {
-    console.warn(`[cache] channels refresh used Xtream fallback only (${channels.length}); keeping existing cache (${channelCache.channels.length}).`);
-    return channelCache.channels;
-  }
+    streamIndex.clear();
+    for (const [key, sourceUrl] of nextStreamIndex) streamIndex.set(key, sourceUrl);
+    channelCache.at = Date.now();
+    channelCache.channels = channels;
 
-  streamIndex.clear();
-  for (const [key, sourceUrl] of nextStreamIndex) streamIndex.set(key, sourceUrl);
-  channelCache.at = Date.now();
-  channelCache.channels = channels;
+    // Persist to disk so next restart is instant
+    void saveDiskCache(CHANNEL_DISK_CACHE_FILE, {
+        at: channelCache.at,
+        channels,
+        streamIndex: [...nextStreamIndex.entries()],
+    });
 
-  // Persist to disk so next restart is instant
-  void saveDiskCache(CHANNEL_DISK_CACHE_FILE, {
-    at: channelCache.at,
-    channels,
-    streamIndex: [...nextStreamIndex.entries()],
-  });
-
-  console.log(`[cache] channels refreshed: ${channels.length} channels`);
-  return channels;
+    console.log(`[cache] channels refreshed: ${channels.length} channels`);
+    return channels;
 }
 
 async function loadChannels(env, force = false) {
-  const now = Date.now();
-  const ttlMs = envInt(env, "CHANNEL_CACHE_SECONDS", 120) * 1000;
+    const now = Date.now();
+    const ttlMs = envInt(env, "CHANNEL_CACHE_SECONDS", 120) * 1000;
 
-  // ── INSTANT PATH: return whatever is in cache right now ──────────────────
-  if (!force && channelCache.channels.length > 0) {
-    // If stale, kick off a background refresh but DO NOT wait for it
-    if (now - channelCache.at >= ttlMs && !channelLoadPromise) {
-      channelLoadPromise = doRefreshChannels(env).finally(() => { channelLoadPromise = null; });
+    // ── INSTANT PATH: return whatever is in cache right now ──────────────────
+    if (!force && channelCache.channels.length > 0) {
+        // If stale, kick off a background refresh but DO NOT wait for it
+        if (now - channelCache.at >= ttlMs && !channelLoadPromise) {
+            channelLoadPromise = doRefreshChannels(env).finally(() => { channelLoadPromise = null; });
+        }
+        return channelCache.channels; // ← returns in <1ms
     }
-    return channelCache.channels; // ← returns in <1ms
-  }
 
-  // ── COLD START: must wait once (disk was not pre-loaded yet) ─────────────
-  if (!force && channelLoadPromise) return channelLoadPromise;
-  channelLoadPromise = doRefreshChannels(env).finally(() => { channelLoadPromise = null; });
-  return channelLoadPromise;
+    // ── COLD START: must wait once (disk was not pre-loaded yet) ─────────────
+    if (!force && channelLoadPromise) return channelLoadPromise;
+    channelLoadPromise = doRefreshChannels(env).finally(() => { channelLoadPromise = null; });
+    return channelLoadPromise;
 }
 
 async function doRefreshPlaylistChannels(env) {
-  const playlistSources = buildProviderPlaylistSources(env);
-  if (playlistSources.length === 0) throw new HttpError(500, "No IPTV playlist sources configured.");
+    const playlistSources = buildProviderPlaylistSources(env);
+    if (playlistSources.length === 0) throw new HttpError(500, "No IPTV playlist sources configured.");
 
-  const channels = [];
-  const nextStreamIndex = new Map();
-  const seenKeys = new Set();
-  let successCount = 0;
-  let lastStatus = null;
+    const channels = [];
+    const nextStreamIndex = new Map();
+    const seenKeys = new Set();
+    let successCount = 0;
+    let lastStatus = null;
 
-  const sourceResults = await Promise.all(playlistSources.map(async (playlistSource) => {
-    const liveCatalog = await loadXtreamCatalog(env, playlistSource, "live", false).catch(() => null);
-    if (liveCatalog) {
-      const ch = await channelsFromXtreamCatalog(playlistSource, liveCatalog);
-      if (ch.length > 0) return { playlistSource, status: 200, channels: ch, mode: "xtream" };
+    const sourceResults = await Promise.all(playlistSources.map(async (playlistSource) => {
+        const liveCatalog = await loadXtreamCatalog(env, playlistSource, "live", false).catch(() => null);
+        if (liveCatalog) {
+            const ch = await channelsFromXtreamCatalog(playlistSource, liveCatalog);
+            if (ch.length > 0) return { playlistSource, status: 200, channels: ch, mode: "xtream" };
+        }
+        try {
+            const response = await fetchProviderPlaylist(env, playlistSource.url);
+            if (!response.ok) return { playlistSource, status: response.status, channels: [] };
+            const ch = [];
+            await parseM3uChannels(response, async (channel) => {
+                ch.push({
+                    key: channel.key,
+                    name: withSourceSuffix(channel.name, playlistSource.label),
+                    logo: channel.logo,
+                    category: channel.category,
+                    sourceUrl: channel.sourceUrl,
+                });
+            });
+            return { playlistSource, status: response.status, channels: ch };
+        } catch {
+            return { playlistSource, status: "network error", channels: [], error: "network error" };
+        }
+    }));
+
+    for (const { status, channels: sourceChannels, error } of sourceResults) {
+        if (error) { lastStatus = error || "network error"; continue; }
+        if (status !== 200) { lastStatus = status; continue; }
+        successCount += 1;
+        for (const channel of sourceChannels) {
+            if (seenKeys.has(channel.key)) continue;
+            seenKeys.add(channel.key);
+            nextStreamIndex.set(channel.key, channel.sourceUrl);
+            channels.push(channel);
+        }
     }
-    try {
-      const response = await fetchProviderPlaylist(env, playlistSource.url);
-      if (!response.ok) return { playlistSource, status: response.status, channels: [] };
-      const ch = [];
-      await parseM3uChannels(response, async (channel) => {
-        ch.push({
-          key: channel.key,
-          name: withSourceSuffix(channel.name, playlistSource.label),
-          logo: channel.logo,
-          category: channel.category,
-          sourceUrl: channel.sourceUrl,
-        });
-      });
-      return { playlistSource, status: response.status, channels: ch };
-    } catch {
-      return { playlistSource, status: "network error", channels: [], error: "network error" };
+
+    if (successCount === 0) {
+        if (playlistChannelCache.channels.length > 0) return playlistChannelCache.channels; // serve stale
+        throw new HttpError(502, `All IPTV playlist sources failed${lastStatus ? ` (last status: ${lastStatus})` : ""}.`);
     }
-  }));
 
-  for (const { status, channels: sourceChannels, error } of sourceResults) {
-    if (error) { lastStatus = error || "network error"; continue; }
-    if (status !== 200) { lastStatus = status; continue; }
-    successCount += 1;
-    for (const channel of sourceChannels) {
-      if (seenKeys.has(channel.key)) continue;
-      seenKeys.add(channel.key);
-      nextStreamIndex.set(channel.key, channel.sourceUrl);
-      channels.push(channel);
-    }
-  }
+    streamIndex.clear();
+    for (const [key, sourceUrl] of nextStreamIndex) streamIndex.set(key, sourceUrl);
+    playlistChannelCache.at = Date.now();
+    playlistChannelCache.channels = channels;
 
-  if (successCount === 0) {
-    if (playlistChannelCache.channels.length > 0) return playlistChannelCache.channels; // serve stale
-    throw new HttpError(502, `All IPTV playlist sources failed${lastStatus ? ` (last status: ${lastStatus})` : ""}.`);
-  }
+    // Persist to disk so next restart is instant
+    void saveDiskCache(PLAYLIST_DISK_CACHE_FILE, {
+        at: playlistChannelCache.at,
+        channels,
+        streamIndex: [...nextStreamIndex.entries()],
+    });
 
-  streamIndex.clear();
-  for (const [key, sourceUrl] of nextStreamIndex) streamIndex.set(key, sourceUrl);
-  playlistChannelCache.at = Date.now();
-  playlistChannelCache.channels = channels;
-
-  // Persist to disk so next restart is instant
-  void saveDiskCache(PLAYLIST_DISK_CACHE_FILE, {
-    at: playlistChannelCache.at,
-    channels,
-    streamIndex: [...nextStreamIndex.entries()],
-  });
-
-  console.log(`[cache] playlist channels refreshed: ${channels.length} channels`);
-  return channels;
+    console.log(`[cache] playlist channels refreshed: ${channels.length} channels`);
+    return channels;
 }
 
 async function loadPlaylistChannels(env, force = false) {
-  const now = Date.now();
-  const ttlMs = envInt(env, "M3U_CHANNEL_CACHE_SECONDS", envInt(env, "CHANNEL_CACHE_SECONDS", 120)) * 1000;
+    const now = Date.now();
+    const ttlMs = envInt(env, "M3U_CHANNEL_CACHE_SECONDS", envInt(env, "CHANNEL_CACHE_SECONDS", 120)) * 1000;
 
-  // ── INSTANT PATH: return whatever is in cache right now ──────────────────
-  if (!force && playlistChannelCache.channels.length > 0) {
-    if (now - playlistChannelCache.at >= ttlMs && !playlistChannelLoadPromise) {
-      playlistChannelLoadPromise = doRefreshPlaylistChannels(env).finally(() => { playlistChannelLoadPromise = null; });
+    // ── INSTANT PATH: return whatever is in cache right now ──────────────────
+    if (!force && playlistChannelCache.channels.length > 0) {
+        if (now - playlistChannelCache.at >= ttlMs && !playlistChannelLoadPromise) {
+            playlistChannelLoadPromise = doRefreshPlaylistChannels(env).finally(() => { playlistChannelLoadPromise = null; });
+        }
+        return playlistChannelCache.channels; // ← returns in <1ms
     }
-    return playlistChannelCache.channels; // ← returns in <1ms
-  }
 
-  // ── COLD START: must wait once (disk was not pre-loaded yet) ─────────────
-  if (!force && playlistChannelLoadPromise) return playlistChannelLoadPromise;
-  playlistChannelLoadPromise = doRefreshPlaylistChannels(env).finally(() => { playlistChannelLoadPromise = null; });
-  return playlistChannelLoadPromise;
+    // ── COLD START: must wait once (disk was not pre-loaded yet) ─────────────
+    if (!force && playlistChannelLoadPromise) return playlistChannelLoadPromise;
+    playlistChannelLoadPromise = doRefreshPlaylistChannels(env).finally(() => { playlistChannelLoadPromise = null; });
+    return playlistChannelLoadPromise;
 }
 
 async function getStreamForKey(key, env) {
-  validateKey(key);
-  const cachedSourceUrl = streamIndex.get(key);
-  if (cachedSourceUrl) return { key, sourceUrl: cachedSourceUrl };
-  throw new HttpError(410, "This legacy /live/{key} URL no longer resolves statelessly. Refresh /api/channels and use the returned url field.");
+    validateKey(key);
+    const cachedSourceUrl = streamIndex.get(key);
+    if (cachedSourceUrl) return { key, sourceUrl: cachedSourceUrl };
+    throw new HttpError(410, "This legacy /live/{key} URL no longer resolves statelessly. Refresh /api/channels and use the returned url field.");
 }
 
 // Channel record / payload
 
 function channelCacheSnapshot(hit) {
-  return {
-    hit,
-    at: channelCache.at ? new Date(channelCache.at).toISOString() : null,
-    age_seconds: channelCache.at ? Math.round((Date.now() - channelCache.at) / 100) / 10 : 0,
-    count: channelCache.channels.length,
-  };
+    return {
+        hit,
+        at: channelCache.at ? new Date(channelCache.at).toISOString() : null,
+        age_seconds: channelCache.at ? Math.round((Date.now() - channelCache.at) / 100) / 10 : 0,
+        count: channelCache.channels.length,
+    };
 }
 
 function playlistCacheSnapshot(hit, entry) {
-  return { hit, age_ms: entry ? Date.now() - entry.at : null };
+    return { hit, age_ms: entry ? Date.now() - entry.at : null };
 }
 
 function upstreamUrlCandidates(url, env) {
-  const candidates = [url];
-  const fallback = httpsFallbackCandidate(url, env);
-  if (fallback && !candidates.includes(fallback)) candidates.push(fallback);
-  return candidates;
+    const candidates = [url];
+    const fallback = httpsFallbackCandidate(url, env);
+    if (fallback && !candidates.includes(fallback)) candidates.push(fallback);
+    return candidates;
 }
 
 // ─── FIXED: use AbortController + setTimeout instead of AbortSignal.timeout()
@@ -1130,271 +1130,271 @@ function upstreamUrlCandidates(url, env) {
 // try/catch boundaries in some Node 18 builds. A manual controller throws the
 // ordinary AbortError which is caught reliably everywhere.
 function timeoutSignal(timeoutMs) {
-  // kept for API compatibility but no longer used internally
-  return undefined;
+    // kept for API compatibility but no longer used internally
+    return undefined;
 }
 
 async function fetchWithTimeout(url, init, timeoutMs) {
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    return fetch(url, init);
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } catch (error) {
-    if (error?.name === "AbortError" || error?.name === "TimeoutError") {
-      const e = new Error(`Upstream timed out after ${timeoutMs}ms: ${url}`);
-      e.code = "TIMEOUT";
-      throw e;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        return fetch(url, init);
     }
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { ...init, signal: controller.signal });
+    } catch (error) {
+        if (error?.name === "AbortError" || error?.name === "TimeoutError") {
+            const e = new Error(`Upstream timed out after ${timeoutMs}ms: ${url}`);
+            e.code = "TIMEOUT";
+            throw e;
+        }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 async function channelRecord(channel, request, env) {
-  const base = publicBase(request, env);
-  const cdn = streamBase(request, env);
-  const sourceUrl = streamIndex.get(channel.key);
-  const directToken = sourceUrl ? await makeUrlToken({ u: sourceUrl }, env) : null;
-  const directUrl = directToken ? `${cdn}/direct/${directToken}.m3u8` : `${cdn}/live/${channel.key}/index.m3u8`;
-  const liveUrl = directToken ? `${cdn}/live/${channel.key}/index.m3u8?src=${encodeURIComponent(directToken)}` : `${cdn}/live/${channel.key}/index.m3u8`;
-  return {
-    key: channel.key,
-    name: channel.name,
-    logo: channel.logo,
-    category: channel.category,
-    url: liveUrl,
-    m3u8: liveUrl,
-    direct_url: directUrl,
-    lookup_url: `${base}/live/${channel.key}/index.m3u8`,
-  };
+    const base = publicBase(request, env);
+    const cdn = streamBase(request, env);
+    const sourceUrl = streamIndex.get(channel.key);
+    const directToken = sourceUrl ? await makeUrlToken({ u: sourceUrl }, env) : null;
+    const directUrl = directToken ? `${cdn}/direct/${directToken}.m3u8` : `${cdn}/live/${channel.key}/index.m3u8`;
+    const liveUrl = directToken ? `${cdn}/live/${channel.key}/index.m3u8?src=${encodeURIComponent(directToken)}` : `${cdn}/live/${channel.key}/index.m3u8`;
+    return {
+        key: channel.key,
+        name: channel.name,
+        logo: channel.logo,
+        category: channel.category,
+        url: liveUrl,
+        m3u8: liveUrl,
+        direct_url: directUrl,
+        lookup_url: `${base}/live/${channel.key}/index.m3u8`,
+    };
 }
 
 async function channelsPayload(request, env, force = false) {
-  const url = new URL(request.url);
-  const q = cleanString(url.searchParams.get("q"));
+    const url = new URL(request.url);
+    const q = cleanString(url.searchParams.get("q"));
 
-  let channels = await loadChannels(env, force);
-  if (q) {
-    channels = channels.filter((ch) => channelMatchesQuery(ch, q));
-  }
-  const hit = !force && channelCache.channels.length > 0 && Date.now() - channelCache.at < envInt(env, "CHANNEL_CACHE_SECONDS", 120) * 1000;
-  const records = [];
-  for (const channel of channels) records.push(await channelRecord(channel, request, env));
-  return {
-    status: "ok",
-    count: records.length,
-    cache: channelCacheSnapshot(hit),
-    playlist_cache: playlistCacheSnapshot(false, null),
-    worker_url: publicBase(request, env),
-    channels: records,
-  };
+    let channels = await loadChannels(env, force);
+    if (q) {
+        channels = channels.filter((ch) => channelMatchesQuery(ch, q));
+    }
+    const hit = !force && channelCache.channels.length > 0 && Date.now() - channelCache.at < envInt(env, "CHANNEL_CACHE_SECONDS", 120) * 1000;
+    const records = [];
+    for (const channel of channels) records.push(await channelRecord(channel, request, env));
+    return {
+        status: "ok",
+        count: records.length,
+        cache: channelCacheSnapshot(hit),
+        playlist_cache: playlistCacheSnapshot(false, null),
+        worker_url: publicBase(request, env),
+        channels: records,
+    };
 }
 
 // Movie and TV series payloads
 
 async function appendPlaylistMediaRecords(records, source, env, kind) {
-  let response;
-  try {
-    response = await fetchProviderPlaylist(env, source.url);
-  } catch {
-    return { ok: false, status: "network error", count: 0 };
-  }
-  if (!response.ok) return { ok: false, status: response.status, count: 0 };
+    let response;
+    try {
+        response = await fetchProviderPlaylist(env, source.url);
+    } catch {
+        return { ok: false, status: "network error", count: 0 };
+    }
+    if (!response.ok) return { ok: false, status: response.status, count: 0 };
 
-  const before = records.length;
-  await parseM3uEntries(response, async (entry) => {
-    if (entry.kind !== kind) return;
-    records.push({
-      source: source.label,
-      type: kind === "series" ? "tvseries_episode" : "movie",
-      key: entry.key,
-      stream_id: entry.streamId,
-      name: entry.name,
-      logo: entry.logo,
-      category: entry.category,
-      url: entry.sourceUrl,
+    const before = records.length;
+    await parseM3uEntries(response, async (entry) => {
+        if (entry.kind !== kind) return;
+        records.push({
+            source: source.label,
+            type: kind === "series" ? "tvseries_episode" : "movie",
+            key: entry.key,
+            stream_id: entry.streamId,
+            name: entry.name,
+            logo: entry.logo,
+            category: entry.category,
+            url: entry.sourceUrl,
+        });
     });
-  });
-  return { ok: true, status: response.status, count: records.length - before };
+    return { ok: true, status: response.status, count: records.length - before };
 }
 
 async function moviesPayload(request, env, force = false) {
-  const url = new URL(request.url);
-  const sources = selectedPlaylistSources(env, url.searchParams.get("source"));
-  const movies = [];
-  const sourceResults = [];
+    const url = new URL(request.url);
+    const sources = selectedPlaylistSources(env, url.searchParams.get("source"));
+    const movies = [];
+    const sourceResults = [];
 
-  for (const source of sources) {
-    const before = movies.length;
-    const catalog = await loadXtreamCatalog(env, source, "movies", force).catch(() => null);
-    if (catalog && catalog.items.length > 0) {
-      for (const item of catalog.items) {
-        const id = itemId(item, "movies");
-        if (!id) continue;
-        const extension = cleanString(item.container_extension, "mp4");
-        movies.push({
-          source: source.label,
-          type: "movie",
-          stream_id: id,
-          name: cleanString(item.name, "Unknown"),
-          logo: mediaLogo(item),
-          category: catalogCategory(catalog, item),
-          category_id: cleanString(item.category_id),
-          url: xtreamMediaUrl(catalog.config, "movie", id, extension),
-          container_extension: extension,
-          rating: mediaRating(item),
-          added: cleanString(item.added) || null,
-        });
-      }
-      sourceResults.push({ source: source.label, mode: "xtream", count: movies.length - before });
-      continue;
+    for (const source of sources) {
+        const before = movies.length;
+        const catalog = await loadXtreamCatalog(env, source, "movies", force).catch(() => null);
+        if (catalog && catalog.items.length > 0) {
+            for (const item of catalog.items) {
+                const id = itemId(item, "movies");
+                if (!id) continue;
+                const extension = cleanString(item.container_extension, "mp4");
+                movies.push({
+                    source: source.label,
+                    type: "movie",
+                    stream_id: id,
+                    name: cleanString(item.name, "Unknown"),
+                    logo: mediaLogo(item),
+                    category: catalogCategory(catalog, item),
+                    category_id: cleanString(item.category_id),
+                    url: xtreamMediaUrl(catalog.config, "movie", id, extension),
+                    container_extension: extension,
+                    rating: mediaRating(item),
+                    added: cleanString(item.added) || null,
+                });
+            }
+            sourceResults.push({ source: source.label, mode: "xtream", count: movies.length - before });
+            continue;
+        }
+
+        const parsed = await appendPlaylistMediaRecords(movies, source, env, "movie");
+        sourceResults.push({ source: source.label, mode: "playlist", count: parsed.count, ok: parsed.ok, status: parsed.status });
     }
 
-    const parsed = await appendPlaylistMediaRecords(movies, source, env, "movie");
-    sourceResults.push({ source: source.label, mode: "playlist", count: parsed.count, ok: parsed.ok, status: parsed.status });
-  }
-
-  return {
-    status: "ok",
-    count: movies.length,
-    worker_url: publicBase(request, env),
-    sources: sourceResults,
-    movies,
-  };
+    return {
+        status: "ok",
+        count: movies.length,
+        worker_url: publicBase(request, env),
+        sources: sourceResults,
+        movies,
+    };
 }
 
 function seriesRecordFromCatalogItem(item, catalog, source, request, env) {
-  const id = itemId(item, "series");
-  return {
-    source: source.label,
-    type: "tvseries",
-    series_id: id,
-    name: cleanString(item.name, "Unknown"),
-    logo: mediaLogo(item),
-    category: catalogCategory(catalog, item),
-    category_id: cleanString(item.category_id),
-    plot: cleanString(item.plot),
-    genre: cleanString(item.genre),
-    release_date: cleanString(item.releaseDate ?? item.release_date),
-    rating: mediaRating(item),
-    episodes_api_url: sourceApiUrl(request, env, "/api/tvseries", {
-      source: source.label,
-      series_id: id,
-    }),
-    upstream_details_url: xtreamApiUrl(catalog.config, "get_series_info", { series_id: id }).toString(),
-  };
+    const id = itemId(item, "series");
+    return {
+        source: source.label,
+        type: "tvseries",
+        series_id: id,
+        name: cleanString(item.name, "Unknown"),
+        logo: mediaLogo(item),
+        category: catalogCategory(catalog, item),
+        category_id: cleanString(item.category_id),
+        plot: cleanString(item.plot),
+        genre: cleanString(item.genre),
+        release_date: cleanString(item.releaseDate ?? item.release_date),
+        rating: mediaRating(item),
+        episodes_api_url: sourceApiUrl(request, env, "/api/tvseries", {
+            source: source.label,
+            series_id: id,
+        }),
+        upstream_details_url: xtreamApiUrl(catalog.config, "get_series_info", { series_id: id }).toString(),
+    };
 }
 
 function directEpisodeUrl(config, episode) {
-  const directSource = cleanString(episode?.direct_source);
-  if (/^https?:\/\//i.test(directSource)) return directSource;
-  const id = cleanString(episode?.id ?? episode?.stream_id);
-  if (!id) return "";
-  const extension = cleanString(episode?.container_extension ?? episode?.info?.container_extension, "mp4");
-  return xtreamMediaUrl(config, "series", id, extension);
+    const directSource = cleanString(episode?.direct_source);
+    if (/^https?:\/\//i.test(directSource)) return directSource;
+    const id = cleanString(episode?.id ?? episode?.stream_id);
+    if (!id) return "";
+    const extension = cleanString(episode?.container_extension ?? episode?.info?.container_extension, "mp4");
+    return xtreamMediaUrl(config, "series", id, extension);
 }
 
 function flattenSeriesEpisodes(source, seriesId, infoEntry) {
-  const episodes = [];
-  const groups = infoEntry?.payload?.episodes;
-  if (!groups || typeof groups !== "object") return episodes;
+    const episodes = [];
+    const groups = infoEntry?.payload?.episodes;
+    if (!groups || typeof groups !== "object") return episodes;
 
-  const seasonKeys = Object.keys(groups).sort((a, b) => Number(a) - Number(b));
-  for (const seasonKey of seasonKeys) {
-    const seasonEpisodes = Array.isArray(groups[seasonKey]) ? groups[seasonKey] : [];
-    for (const episode of seasonEpisodes) {
-      const id = cleanString(episode?.id ?? episode?.stream_id);
-      const url = directEpisodeUrl(infoEntry.config, episode);
-      if (!id || !url) continue;
-      const extension = cleanString(episode?.container_extension ?? episode?.info?.container_extension, "mp4");
-      episodes.push({
-        source: source.label,
-        type: "tvseries_episode",
-        series_id: cleanString(seriesId),
-        episode_id: id,
-        season: Number.isFinite(Number(seasonKey)) ? Number(seasonKey) : seasonKey,
-        episode_num: episode?.episode_num ?? null,
-        title: cleanString(episode?.title ?? episode?.name, `Episode ${episode?.episode_num ?? ""}`.trim()),
-        url,
-        container_extension: extension,
-        added: cleanString(episode?.added) || null,
-      });
+    const seasonKeys = Object.keys(groups).sort((a, b) => Number(a) - Number(b));
+    for (const seasonKey of seasonKeys) {
+        const seasonEpisodes = Array.isArray(groups[seasonKey]) ? groups[seasonKey] : [];
+        for (const episode of seasonEpisodes) {
+            const id = cleanString(episode?.id ?? episode?.stream_id);
+            const url = directEpisodeUrl(infoEntry.config, episode);
+            if (!id || !url) continue;
+            const extension = cleanString(episode?.container_extension ?? episode?.info?.container_extension, "mp4");
+            episodes.push({
+                source: source.label,
+                type: "tvseries_episode",
+                series_id: cleanString(seriesId),
+                episode_id: id,
+                season: Number.isFinite(Number(seasonKey)) ? Number(seasonKey) : seasonKey,
+                episode_num: episode?.episode_num ?? null,
+                title: cleanString(episode?.title ?? episode?.name, `Episode ${episode?.episode_num ?? ""}`.trim()),
+                url,
+                container_extension: extension,
+                added: cleanString(episode?.added) || null,
+            });
+        }
     }
-  }
-  return episodes;
+    return episodes;
 }
 
 async function tvSeriesEpisodesPayload(request, env, seriesId, force = false) {
-  const url = new URL(request.url);
-  const sources = selectedPlaylistSources(env, url.searchParams.get("source"));
-  const episodes = [];
-  const sourceResults = [];
+    const url = new URL(request.url);
+    const sources = selectedPlaylistSources(env, url.searchParams.get("source"));
+    const episodes = [];
+    const sourceResults = [];
 
-  for (const source of sources) {
-    const infoEntry = await loadXtreamSeriesInfo(env, source, seriesId, force).catch(() => null);
-    const sourceEpisodes = flattenSeriesEpisodes(source, seriesId, infoEntry);
-    episodes.push(...sourceEpisodes);
-    sourceResults.push({
-      source: source.label,
-      mode: "xtream",
-      series_id: cleanString(seriesId),
-      count: sourceEpisodes.length,
-      ok: Boolean(infoEntry?.payload),
-    });
-  }
+    for (const source of sources) {
+        const infoEntry = await loadXtreamSeriesInfo(env, source, seriesId, force).catch(() => null);
+        const sourceEpisodes = flattenSeriesEpisodes(source, seriesId, infoEntry);
+        episodes.push(...sourceEpisodes);
+        sourceResults.push({
+            source: source.label,
+            mode: "xtream",
+            series_id: cleanString(seriesId),
+            count: sourceEpisodes.length,
+            ok: Boolean(infoEntry?.payload),
+        });
+    }
 
-  return {
-    status: "ok",
-    count: episodes.length,
-    worker_url: publicBase(request, env),
-    sources: sourceResults,
-    episodes,
-  };
+    return {
+        status: "ok",
+        count: episodes.length,
+        worker_url: publicBase(request, env),
+        sources: sourceResults,
+        episodes,
+    };
 }
 
 async function tvSeriesPayload(request, env, force = false) {
-  const url = new URL(request.url);
-  const seriesId = cleanString(url.searchParams.get("series_id") || url.searchParams.get("id"));
-  if (seriesId) return tvSeriesEpisodesPayload(request, env, seriesId, force);
+    const url = new URL(request.url);
+    const seriesId = cleanString(url.searchParams.get("series_id") || url.searchParams.get("id"));
+    if (seriesId) return tvSeriesEpisodesPayload(request, env, seriesId, force);
 
-  const sources = selectedPlaylistSources(env, url.searchParams.get("source"));
-  const series = [];
-  const sourceResults = [];
+    const sources = selectedPlaylistSources(env, url.searchParams.get("source"));
+    const series = [];
+    const sourceResults = [];
 
-  for (const source of sources) {
-    const before = series.length;
-    const catalog = await loadXtreamCatalog(env, source, "series", force).catch(() => null);
-    if (catalog && catalog.items.length > 0) {
-      for (const item of catalog.items) {
-        const id = itemId(item, "series");
-        if (!id) continue;
-        series.push(seriesRecordFromCatalogItem(item, catalog, source, request, env));
-      }
-      sourceResults.push({ source: source.label, mode: "xtream", count: series.length - before });
-      continue;
+    for (const source of sources) {
+        const before = series.length;
+        const catalog = await loadXtreamCatalog(env, source, "series", force).catch(() => null);
+        if (catalog && catalog.items.length > 0) {
+            for (const item of catalog.items) {
+                const id = itemId(item, "series");
+                if (!id) continue;
+                series.push(seriesRecordFromCatalogItem(item, catalog, source, request, env));
+            }
+            sourceResults.push({ source: source.label, mode: "xtream", count: series.length - before });
+            continue;
+        }
+
+        const parsed = await appendPlaylistMediaRecords(series, source, env, "series");
+        sourceResults.push({ source: source.label, mode: "playlist", count: parsed.count, ok: parsed.ok, status: parsed.status });
     }
 
-    const parsed = await appendPlaylistMediaRecords(series, source, env, "series");
-    sourceResults.push({ source: source.label, mode: "playlist", count: parsed.count, ok: parsed.ok, status: parsed.status });
-  }
-
-  return {
-    status: "ok",
-    count: series.length,
-    worker_url: publicBase(request, env),
-    sources: sourceResults,
-    tvseries: series,
-  };
+    return {
+        status: "ok",
+        count: series.length,
+        worker_url: publicBase(request, env),
+        sources: sourceResults,
+        tvseries: series,
+    };
 }
 
 // Dashboard and generated M3U playlists
 
 function dashboardPage() {
-  return `<!doctype html>
+    return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -1749,567 +1749,567 @@ function dashboardPage() {
 }
 
 function m3uAttr(value) {
-  return String(value ?? "").replace(/[\r\n"]/g, " ").trim();
+    return String(value ?? "").replace(/[\r\n"]/g, " ").trim();
 }
 
 function m3uDisplayName(value) {
-  return cleanString(value, "Unknown").replace(/[\r\n]/g, " ");
+    return cleanString(value, "Unknown").replace(/[\r\n]/g, " ");
 }
 
 function appendM3uEntry(lines, { id, name, logo, category, url }) {
-  if (!url) return;
-  const displayName = m3uDisplayName(name);
-  lines.push(`#EXTINF:-1 tvg-id="${m3uAttr(id)}" tvg-name="${m3uAttr(displayName)}" tvg-logo="${m3uAttr(logo)}" group-title="${m3uAttr(category)}",${displayName}`);
-  lines.push(url);
+    if (!url) return;
+    const displayName = m3uDisplayName(name);
+    lines.push(`#EXTINF:-1 tvg-id="${m3uAttr(id)}" tvg-name="${m3uAttr(displayName)}" tvg-logo="${m3uAttr(logo)}" group-title="${m3uAttr(category)}",${displayName}`);
+    lines.push(url);
 }
 
 function generatedPlaylistCacheKey(account, includes) {
-  return [
-    account.username,
-    includes.includeLive ? "live1" : "live0",
-    includes.includeMovies ? "movies1" : "movies0",
-    includes.includeSeries ? "series1" : "series0",
-  ].join("|");
+    return [
+        account.username,
+        includes.includeLive ? "live1" : "live0",
+        includes.includeMovies ? "movies1" : "movies0",
+        includes.includeSeries ? "series1" : "series0",
+    ].join("|");
 }
 
 function generatedLiveUrl(channel, request, env) {
-  return `${streamBase(request, env)}/live/${channel.key}/index.m3u8`;
+    return `${streamBase(request, env)}/live/${channel.key}/index.m3u8`;
 }
 
 async function m3uSeriesEpisodeRecords(request, env, force = false) {
-  const url = new URL(request.url);
-  const sources = selectedPlaylistSources(env, url.searchParams.get("source"));
-  const maxSeries = Math.max(0, envInt(env, "M3U_SERIES_MAX_SERIES", 75));
-  const maxEpisodes = Math.max(0, envInt(env, "M3U_SERIES_MAX_EPISODES", 2500));
-  const episodes = [];
+    const url = new URL(request.url);
+    const sources = selectedPlaylistSources(env, url.searchParams.get("source"));
+    const maxSeries = Math.max(0, envInt(env, "M3U_SERIES_MAX_SERIES", 75));
+    const maxEpisodes = Math.max(0, envInt(env, "M3U_SERIES_MAX_EPISODES", 2500));
+    const episodes = [];
 
-  for (const source of sources) {
-    const catalog = await loadXtreamCatalog(env, source, "series", force).catch(() => null);
-    if (!catalog || catalog.items.length === 0) continue;
+    for (const source of sources) {
+        const catalog = await loadXtreamCatalog(env, source, "series", force).catch(() => null);
+        if (!catalog || catalog.items.length === 0) continue;
 
-    let loadedSeries = 0;
-    for (const item of catalog.items) {
-      if (maxSeries > 0 && loadedSeries >= maxSeries) break;
-      if (maxEpisodes > 0 && episodes.length >= maxEpisodes) break;
+        let loadedSeries = 0;
+        for (const item of catalog.items) {
+            if (maxSeries > 0 && loadedSeries >= maxSeries) break;
+            if (maxEpisodes > 0 && episodes.length >= maxEpisodes) break;
 
-      const seriesId = itemId(item, "series");
-      if (!seriesId) continue;
-      loadedSeries += 1;
-      const infoEntry = await loadXtreamSeriesInfo(env, source, seriesId, force).catch(() => null);
-      const seriesName = cleanString(item.name, "Unknown");
-      const category = catalogCategory(catalog, item);
-      const logo = mediaLogo(item);
-      for (const episode of flattenSeriesEpisodes(source, seriesId, infoEntry)) {
-        if (maxEpisodes > 0 && episodes.length >= maxEpisodes) break;
-        const season = String(episode.season ?? "").padStart(2, "0");
-        const episodeNum = String(episode.episode_num ?? "").padStart(2, "0");
-        const episodeLabel = season && episodeNum ? ` S${season}E${episodeNum}` : "";
-        episodes.push({
-          id: episode.episode_id,
-          name: `${seriesName}${episodeLabel} - ${episode.title}`,
-          logo,
-          category: category || "TV Series",
-          url: episode.url,
-        });
-      }
+            const seriesId = itemId(item, "series");
+            if (!seriesId) continue;
+            loadedSeries += 1;
+            const infoEntry = await loadXtreamSeriesInfo(env, source, seriesId, force).catch(() => null);
+            const seriesName = cleanString(item.name, "Unknown");
+            const category = catalogCategory(catalog, item);
+            const logo = mediaLogo(item);
+            for (const episode of flattenSeriesEpisodes(source, seriesId, infoEntry)) {
+                if (maxEpisodes > 0 && episodes.length >= maxEpisodes) break;
+                const season = String(episode.season ?? "").padStart(2, "0");
+                const episodeNum = String(episode.episode_num ?? "").padStart(2, "0");
+                const episodeLabel = season && episodeNum ? ` S${season}E${episodeNum}` : "";
+                episodes.push({
+                    id: episode.episode_id,
+                    name: `${seriesName}${episodeLabel} - ${episode.title}`,
+                    logo,
+                    category: category || "TV Series",
+                    url: episode.url,
+                });
+            }
+        }
     }
-  }
 
-  return episodes;
+    return episodes;
 }
 
 async function generatedM3uBody(account, request, env) {
-  const lines = ["#EXTM3U"];
-  const includes = playlistIncludeFlags(request, account);
+    const lines = ["#EXTM3U"];
+    const includes = playlistIncludeFlags(request, account);
 
-  if (includes.includeLive) {
-    const channels = await loadPlaylistChannels(env, false);
-    for (const channel of channels) {
-      appendM3uEntry(lines, {
-        id: channel.key,
-        name: channel.name,
-        logo: channel.logo,
-        category: channel.category || "Live",
-        url: generatedLiveUrl(channel, request, env),
-      });
+    if (includes.includeLive) {
+        const channels = await loadPlaylistChannels(env, false);
+        for (const channel of channels) {
+            appendM3uEntry(lines, {
+                id: channel.key,
+                name: channel.name,
+                logo: channel.logo,
+                category: channel.category || "Live",
+                url: generatedLiveUrl(channel, request, env),
+            });
+        }
     }
-  }
 
-  if (includes.includeMovies) {
-    const payload = await moviesPayload(request, env, false);
-    for (const movie of payload.movies) {
-      appendM3uEntry(lines, {
-        id: movie.stream_id,
-        name: movie.name,
-        logo: movie.logo,
-        category: movie.category || "Movies",
-        url: movie.url,
-      });
+    if (includes.includeMovies) {
+        const payload = await moviesPayload(request, env, false);
+        for (const movie of payload.movies) {
+            appendM3uEntry(lines, {
+                id: movie.stream_id,
+                name: movie.name,
+                logo: movie.logo,
+                category: movie.category || "Movies",
+                url: movie.url,
+            });
+        }
     }
-  }
 
-  if (includes.includeSeries) {
-    const episodes = await m3uSeriesEpisodeRecords(request, env, false);
-    for (const episode of episodes) appendM3uEntry(lines, episode);
-  }
+    if (includes.includeSeries) {
+        const episodes = await m3uSeriesEpisodeRecords(request, env, false);
+        for (const episode of episodes) appendM3uEntry(lines, episode);
+    }
 
-  return `${lines.join("\n")}\n`;
+    return `${lines.join("\n")}\n`;
 }
 
 async function buildGeneratedPlaylistCached(account, request, env) {
-  const includes = playlistIncludeFlags(request, account);
-  const cacheKey = generatedPlaylistCacheKey(account, includes);
-  const body = await generatedM3uBody(account, request, env);
-  rememberMapEntry(generatedPlaylistCache, cacheKey, { at: Date.now(), body }, MAX_GENERATED_PLAYLIST_CACHE_ENTRIES);
-  return { body, cacheKey };
+    const includes = playlistIncludeFlags(request, account);
+    const cacheKey = generatedPlaylistCacheKey(account, includes);
+    const body = await generatedM3uBody(account, request, env);
+    rememberMapEntry(generatedPlaylistCache, cacheKey, { at: Date.now(), body }, MAX_GENERATED_PLAYLIST_CACHE_ENTRIES);
+    return { body, cacheKey };
 }
 
 async function generatedM3uResponse(request, env, waitUntil = (promise) => promise) {
-  const account = await getPlaylistAccessUser(request, env);
-  const includes = playlistIncludeFlags(request, account);
-  const cacheKey = generatedPlaylistCacheKey(account, includes);
-  const freshMs = Math.max(1000, envInt(env, "GENERATED_PLAYLIST_CACHE_MS", 60000));
-  const staleMs = Math.max(freshMs, envInt(env, "GENERATED_PLAYLIST_STALE_MS", 900000));
-  const buildTimeoutMs = Math.max(1000, envInt(env, "GENERATED_PLAYLIST_BUILD_TIMEOUT_MS", 4800));
-  const cached = generatedPlaylistCache.get(cacheKey);
-  const ageMs = cached ? Date.now() - cached.at : Number.POSITIVE_INFINITY;
+    const account = await getPlaylistAccessUser(request, env);
+    const includes = playlistIncludeFlags(request, account);
+    const cacheKey = generatedPlaylistCacheKey(account, includes);
+    const freshMs = Math.max(1000, envInt(env, "GENERATED_PLAYLIST_CACHE_MS", 60000));
+    const staleMs = Math.max(freshMs, envInt(env, "GENERATED_PLAYLIST_STALE_MS", 900000));
+    const buildTimeoutMs = Math.max(1000, envInt(env, "GENERATED_PLAYLIST_BUILD_TIMEOUT_MS", 4800));
+    const cached = generatedPlaylistCache.get(cacheKey);
+    const ageMs = cached ? Date.now() - cached.at : Number.POSITIVE_INFINITY;
 
-  if (cached && ageMs < freshMs) {
-    return playlistResponse(cached.body);
-  }
+    if (cached && ageMs < freshMs) {
+        return playlistResponse(cached.body);
+    }
 
-  if (cached && ageMs < staleMs) {
-    waitUntil(buildGeneratedPlaylistCached(account, request, env).catch(() => null));
-    return playlistResponse(cached.body);
-  }
+    if (cached && ageMs < staleMs) {
+        waitUntil(buildGeneratedPlaylistCached(account, request, env).catch(() => null));
+        return playlistResponse(cached.body);
+    }
 
-  let built;
-  try {
-    built = await Promise.race([
-      buildGeneratedPlaylistCached(account, request, env),
-      new Promise((_, reject) => setTimeout(() => reject(new HttpError(504, "Playlist build timed out.")), buildTimeoutMs)),
-    ]);
-  } catch (error) {
-    if (cached) return playlistResponse(cached.body);
-    throw error;
-  }
+    let built;
+    try {
+        built = await Promise.race([
+            buildGeneratedPlaylistCached(account, request, env),
+            new Promise((_, reject) => setTimeout(() => reject(new HttpError(504, "Playlist build timed out.")), buildTimeoutMs)),
+        ]);
+    } catch (error) {
+        if (cached) return playlistResponse(cached.body);
+        throw error;
+    }
 
-  const body = built.body;
-  return withCors(
-    new Response(body, {
-      headers: {
-        "content-type": "application/x-mpegURL; charset=utf-8",
-        "cache-control": "public, max-age=15, s-maxage=15, stale-while-revalidate=60",
-        "content-disposition": `inline; filename="${m3uAttr(account.username)}.m3u"`,
-      },
-    }),
-  );
+    const body = built.body;
+    return withCors(
+        new Response(body, {
+            headers: {
+                "content-type": "application/x-mpegURL; charset=utf-8",
+                "cache-control": "public, max-age=15, s-maxage=15, stale-while-revalidate=60",
+                "content-disposition": `inline; filename="${m3uAttr(account.username)}.m3u"`,
+            },
+        }),
+    );
 }
 
 // Fetch helpers
 
 async function fetchProviderPlaylist(env, url) {
-  const timeoutMs = envInt(env, "PLAYLIST_FETCH_TIMEOUT_MS", 12000);
-  const headers = {
-    "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
-    accept: "application/x-mpegURL, application/vnd.apple.mpegurl, text/plain, */*",
-  };
+    const timeoutMs = envInt(env, "PLAYLIST_FETCH_TIMEOUT_MS", 12000);
+    const headers = {
+        "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
+        accept: "application/x-mpegURL, application/vnd.apple.mpegurl, text/plain, */*",
+    };
 
-  let firstBadResponse = null;
-  for (const candidateUrl of upstreamUrlCandidates(url, env)) {
-    try {
-      const response = await fetchWithTimeout(candidateUrl, { headers, redirect: "follow" }, timeoutMs);
-      if (response.ok) return response;
-      if (!firstBadResponse) firstBadResponse = response;
-    } catch {
-      // try next candidate
+    let firstBadResponse = null;
+    for (const candidateUrl of upstreamUrlCandidates(url, env)) {
+        try {
+            const response = await fetchWithTimeout(candidateUrl, { headers, redirect: "follow" }, timeoutMs);
+            if (response.ok) return response;
+            if (!firstBadResponse) firstBadResponse = response;
+        } catch {
+            // try next candidate
+        }
     }
-  }
-  if (firstBadResponse) return firstBadResponse;
-  throw new Error("Provider playlist fetch failed.");
+    if (firstBadResponse) return firstBadResponse;
+    throw new Error("Provider playlist fetch failed.");
 }
 
 // ─── FIXED: fetchHls now uses fetchWithTimeout so it can't hang forever
 async function fetchHls(url, env, referer) {
-  try {
-    const timeoutMs = envInt(env, "HLS_FETCH_TIMEOUT_MS", 6000);
-    const headers = {
-      accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-      "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
-    };
-    if (referer) headers.referer = referer;
-    const response = await fetchWithTimeout(url, { headers, redirect: "follow" }, timeoutMs);
-    if (!response.ok) return null;
-    const text = await response.text();
-    if (!text.includes("#EXTM3U")) return null;
-    return { finalUrl: response.url, text };
-  } catch {
-    return null;
-  }
+    try {
+        const timeoutMs = envInt(env, "HLS_FETCH_TIMEOUT_MS", 6000);
+        const headers = {
+            accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+            "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
+        };
+        if (referer) headers.referer = referer;
+        const response = await fetchWithTimeout(url, { headers, redirect: "follow" }, timeoutMs);
+        if (!response.ok) return null;
+        const text = await response.text();
+        if (!text.includes("#EXTM3U")) return null;
+        return { finalUrl: response.url, text };
+    } catch {
+        return null;
+    }
 }
 
 // HTTPS fallback / URL candidates
 
 function httpsFallbackCandidate(url, env) {
-  const forceHttps = envBool(env, "FORCE_HTTPS_UPSTREAM", true);
-  if (!forceHttps) return null;
-  const parsed = new URL(url);
-  if (parsed.protocol !== "http:") return null;
-  const allowAltPorts = envBool(env, "FORCE_HTTPS_UPSTREAM_ALT_PORTS", false);
-  if (parsed.port && parsed.port !== "80" && !allowAltPorts) return null;
-  parsed.protocol = "https:";
-  const upgraded = parsed.toString();
-  return upgraded === url ? null : upgraded;
+    const forceHttps = envBool(env, "FORCE_HTTPS_UPSTREAM", true);
+    if (!forceHttps) return null;
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:") return null;
+    const allowAltPorts = envBool(env, "FORCE_HTTPS_UPSTREAM_ALT_PORTS", false);
+    if (parsed.port && parsed.port !== "80" && !allowAltPorts) return null;
+    parsed.protocol = "https:";
+    const upgraded = parsed.toString();
+    return upgraded === url ? null : upgraded;
 }
 
 function addUrlCandidate(values, url, env) {
-  if (!values.includes(url)) values.push(url);
-  const fallback = httpsFallbackCandidate(url, env);
-  if (fallback && !values.includes(fallback)) values.push(fallback);
+    if (!values.includes(url)) values.push(url);
+    const fallback = httpsFallbackCandidate(url, env);
+    if (fallback && !values.includes(fallback)) values.push(fallback);
 }
 
 function upstreamHlsCandidates(sourceUrl, env) {
-  const parsed = new URL(sourceUrl);
-  const path = parsed.pathname;
-  const query = parsed.search;
-  const origin = parsed.origin;
-  const pathParts = path.split("/").filter(Boolean);
-  const filename = pathParts[pathParts.length - 1] || "";
-  const lowerPath = path.toLowerCase();
-  const lowerFilename = filename.toLowerCase();
-  const stem = filename.includes(".") ? filename.slice(0, filename.lastIndexOf(".")) : filename;
-  const candidates = [];
+    const parsed = new URL(sourceUrl);
+    const path = parsed.pathname;
+    const query = parsed.search;
+    const origin = parsed.origin;
+    const pathParts = path.split("/").filter(Boolean);
+    const filename = pathParts[pathParts.length - 1] || "";
+    const lowerPath = path.toLowerCase();
+    const lowerFilename = filename.toLowerCase();
+    const stem = filename.includes(".") ? filename.slice(0, filename.lastIndexOf(".")) : filename;
+    const candidates = [];
 
-  const addPathCandidate = (candidatePath) => {
-    const candidate = new URL(sourceUrl);
-    candidate.pathname = candidatePath;
-    candidate.search = query;
-    addUrlCandidate(candidates, candidate.toString(), env);
-  };
+    const addPathCandidate = (candidatePath) => {
+        const candidate = new URL(sourceUrl);
+        candidate.pathname = candidatePath;
+        candidate.search = query;
+        addUrlCandidate(candidates, candidate.toString(), env);
+    };
 
-  const looksLikeXtreamLive = pathParts.length >= 3 && !lowerPath.includes("/movie/") && !lowerPath.includes("/series/");
-  if (looksLikeXtreamLive) {
-    const user = pathParts[pathParts.length - 3];
-    const password = pathParts[pathParts.length - 2];
-    const streamId = stem || pathParts[pathParts.length - 1];
-    const baseUrl = (origin && origin !== "null" ? origin : (envString(env, "IPTV_BASE_URL", DEFAULT_IPTV_BASE_URL) || DEFAULT_IPTV_BASE_URL)).replace(/\/+$/, "");
-    addUrlCandidate(candidates, `${baseUrl}/live/${user}/${password}/${streamId}.m3u8${query}`, env);
-  }
+    const looksLikeXtreamLive = pathParts.length >= 3 && !lowerPath.includes("/movie/") && !lowerPath.includes("/series/");
+    if (looksLikeXtreamLive) {
+        const user = pathParts[pathParts.length - 3];
+        const password = pathParts[pathParts.length - 2];
+        const streamId = stem || pathParts[pathParts.length - 1];
+        const baseUrl = (origin && origin !== "null" ? origin : (envString(env, "IPTV_BASE_URL", DEFAULT_IPTV_BASE_URL) || DEFAULT_IPTV_BASE_URL)).replace(/\/+$/, "");
+        addUrlCandidate(candidates, `${baseUrl}/live/${user}/${password}/${streamId}.m3u8${query}`, env);
+    }
 
-  if (lowerPath.endsWith(".m3u8") || lowerPath.endsWith(".m3u")) addPathCandidate(path);
-  if (lowerPath.endsWith(".ts")) addPathCandidate(path.slice(0, -3) + ".m3u8");
-  else if (filename && !filename.includes(".")) addPathCandidate(`${path}.m3u8`);
-  else if (lowerFilename.endsWith(".m3u")) addPathCandidate(`${path.slice(0, path.lastIndexOf("."))}.m3u8`);
-  else if (filename.includes(".") && !lowerFilename.endsWith(".m3u8")) addPathCandidate(`${path.slice(0, path.lastIndexOf("."))}.m3u8`);
+    if (lowerPath.endsWith(".m3u8") || lowerPath.endsWith(".m3u")) addPathCandidate(path);
+    if (lowerPath.endsWith(".ts")) addPathCandidate(path.slice(0, -3) + ".m3u8");
+    else if (filename && !filename.includes(".")) addPathCandidate(`${path}.m3u8`);
+    else if (lowerFilename.endsWith(".m3u")) addPathCandidate(`${path.slice(0, path.lastIndexOf("."))}.m3u8`);
+    else if (filename.includes(".") && !lowerFilename.endsWith(".m3u8")) addPathCandidate(`${path.slice(0, path.lastIndexOf("."))}.m3u8`);
 
-  if (looksLikeXtreamLive) {
-    const user = pathParts[pathParts.length - 3];
-    const password = pathParts[pathParts.length - 2];
-    const streamId = stem || pathParts[pathParts.length - 1];
-    const baseUrl = (origin && origin !== "null" ? origin : (envString(env, "IPTV_BASE_URL", DEFAULT_IPTV_BASE_URL) || DEFAULT_IPTV_BASE_URL)).replace(/\/+$/, "");
-    addUrlCandidate(candidates, `${baseUrl}/${user}/${password}/${streamId}.m3u8${query}`, env);
-  }
+    if (looksLikeXtreamLive) {
+        const user = pathParts[pathParts.length - 3];
+        const password = pathParts[pathParts.length - 2];
+        const streamId = stem || pathParts[pathParts.length - 1];
+        const baseUrl = (origin && origin !== "null" ? origin : (envString(env, "IPTV_BASE_URL", DEFAULT_IPTV_BASE_URL) || DEFAULT_IPTV_BASE_URL)).replace(/\/+$/, "");
+        addUrlCandidate(candidates, `${baseUrl}/${user}/${password}/${streamId}.m3u8${query}`, env);
+    }
 
-  return candidates;
+    return candidates;
 }
 
 // Upstream HLS discovery
 
 async function findUpstreamHls(key, sourceUrl, env) {
-  return withInflight(upstreamHlsInflight, key, async () => {
-    const ttlMs = envInt(env, "UPSTREAM_HLS_CACHE_SECONDS", 60) * 1000;
-    const cached = upstreamHlsCache.get(key);
-    if (cached && Date.now() - cached.at < ttlMs && cached.url) {
-      const fetched = await fetchHls(cached.url, env);
-      if (fetched) {
-        rememberMapEntry(upstreamHlsCache, key, { url: fetched.finalUrl, at: Date.now() }, MAX_UPSTREAM_HLS_CACHE_ENTRIES);
-        return { url: fetched.finalUrl, text: fetched.text };
-      }
-    }
-    for (const candidate of upstreamHlsCandidates(sourceUrl, env)) {
-      const fetched = await fetchHls(candidate, env);
-      if (fetched) {
-        rememberMapEntry(upstreamHlsCache, key, { url: fetched.finalUrl, at: Date.now() }, MAX_UPSTREAM_HLS_CACHE_ENTRIES);
-        return { url: fetched.finalUrl, text: fetched.text };
-      }
-    }
-    rememberMapEntry(upstreamHlsCache, key, { url: null, at: Date.now() }, MAX_UPSTREAM_HLS_CACHE_ENTRIES);
-    return null;
-  });
+    return withInflight(upstreamHlsInflight, key, async () => {
+        const ttlMs = envInt(env, "UPSTREAM_HLS_CACHE_SECONDS", 60) * 1000;
+        const cached = upstreamHlsCache.get(key);
+        if (cached && Date.now() - cached.at < ttlMs && cached.url) {
+            const fetched = await fetchHls(cached.url, env);
+            if (fetched) {
+                rememberMapEntry(upstreamHlsCache, key, { url: fetched.finalUrl, at: Date.now() }, MAX_UPSTREAM_HLS_CACHE_ENTRIES);
+                return { url: fetched.finalUrl, text: fetched.text };
+            }
+        }
+        for (const candidate of upstreamHlsCandidates(sourceUrl, env)) {
+            const fetched = await fetchHls(candidate, env);
+            if (fetched) {
+                rememberMapEntry(upstreamHlsCache, key, { url: fetched.finalUrl, at: Date.now() }, MAX_UPSTREAM_HLS_CACHE_ENTRIES);
+                return { url: fetched.finalUrl, text: fetched.text };
+            }
+        }
+        rememberMapEntry(upstreamHlsCache, key, { url: null, at: Date.now() }, MAX_UPSTREAM_HLS_CACHE_ENTRIES);
+        return null;
+    });
 }
 
 // Playlist rewriting
 
 function parseTargetDuration(text) {
-  const declaredMatch = text.match(/#EXT-X-TARGETDURATION:(\d+)/);
-  const declared = declaredMatch ? Number.parseInt(declaredMatch[1], 10) : 0;
-  let measured = 0;
-  for (const match of text.matchAll(/#EXTINF:([0-9.]+)/g)) {
-    const d = Number.parseFloat(match[1]);
-    if (Number.isFinite(d)) measured = Math.max(measured, Math.ceil(d));
-  }
-  return Math.max(1, measured || declared || 6);
+    const declaredMatch = text.match(/#EXT-X-TARGETDURATION:(\d+)/);
+    const declared = declaredMatch ? Number.parseInt(declaredMatch[1], 10) : 0;
+    let measured = 0;
+    for (const match of text.matchAll(/#EXTINF:([0-9.]+)/g)) {
+        const d = Number.parseFloat(match[1]);
+        if (Number.isFinite(d)) measured = Math.max(measured, Math.ceil(d));
+    }
+    return Math.max(1, measured || declared || 6);
 }
 
 function trimLivePlaylistText(text, env) {
-  const configuredKeepSegments = envInt(env, "LIVE_WINDOW_SEGMENTS", 0);
-  if (configuredKeepSegments <= 0 || !/#EXTINF:/m.test(text)) return text;
+    const configuredKeepSegments = envInt(env, "LIVE_WINDOW_SEGMENTS", 0);
+    if (configuredKeepSegments <= 0 || !/#EXTINF:/m.test(text)) return text;
 
-  const keepSegments = Math.max(2, configuredKeepSegments);
-  const lines = text.split(/\r?\n/);
-  const header = [], footer = [], segments = [];
-  let pending = [], seenFirstSegment = false, mediaSequence = null, mediaSequenceIndex = -1;
+    const keepSegments = Math.max(2, configuredKeepSegments);
+    const lines = text.split(/\r?\n/);
+    const header = [], footer = [], segments = [];
+    let pending = [], seenFirstSegment = false, mediaSequence = null, mediaSequenceIndex = -1;
 
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    if (!seenFirstSegment) {
-      if (!line.startsWith("#")) {
-        seenFirstSegment = true;
-        segments.push({ lines: [...pending, rawLine] });
-        pending = [];
-        continue;
-      }
-      if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
-        mediaSequence = Number.parseInt(line.slice("#EXT-X-MEDIA-SEQUENCE:".length), 10);
-        mediaSequenceIndex = header.length;
-      }
-      if (line.startsWith("#EXTINF") || line.startsWith("#EXT-X-PROGRAM-DATE-TIME") || line.startsWith("#EXT-X-BYTERANGE") || line.startsWith("#EXT-X-DISCONTINUITY")) {
-        pending.push(rawLine); continue;
-      }
-      header.push(rawLine);
-      continue;
+    for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        if (!seenFirstSegment) {
+            if (!line.startsWith("#")) {
+                seenFirstSegment = true;
+                segments.push({ lines: [...pending, rawLine] });
+                pending = [];
+                continue;
+            }
+            if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+                mediaSequence = Number.parseInt(line.slice("#EXT-X-MEDIA-SEQUENCE:".length), 10);
+                mediaSequenceIndex = header.length;
+            }
+            if (line.startsWith("#EXTINF") || line.startsWith("#EXT-X-PROGRAM-DATE-TIME") || line.startsWith("#EXT-X-BYTERANGE") || line.startsWith("#EXT-X-DISCONTINUITY")) {
+                pending.push(rawLine); continue;
+            }
+            header.push(rawLine);
+            continue;
+        }
+        if (!line.startsWith("#")) { segments.push({ lines: [...pending, rawLine] }); pending = []; continue; }
+        pending.push(rawLine);
     }
-    if (!line.startsWith("#")) { segments.push({ lines: [...pending, rawLine] }); pending = []; continue; }
-    pending.push(rawLine);
-  }
 
-  if (pending.length > 0) footer.push(...pending);
-  if (segments.length <= keepSegments) return text;
+    if (pending.length > 0) footer.push(...pending);
+    if (segments.length <= keepSegments) return text;
 
-  const dropped = segments.length - keepSegments;
-  const kept = segments.slice(-keepSegments);
-  if (mediaSequenceIndex >= 0) {
-    const nextSequence = Math.max(0, (Number.isFinite(mediaSequence) ? mediaSequence : 0) + dropped);
-    header[mediaSequenceIndex] = `#EXT-X-MEDIA-SEQUENCE:${nextSequence}`;
-  }
-  return `${[...header, ...kept.flatMap((s) => s.lines), ...footer].join("\n")}\n`;
+    const dropped = segments.length - keepSegments;
+    const kept = segments.slice(-keepSegments);
+    if (mediaSequenceIndex >= 0) {
+        const nextSequence = Math.max(0, (Number.isFinite(mediaSequence) ? mediaSequence : 0) + dropped);
+        header[mediaSequenceIndex] = `#EXT-X-MEDIA-SEQUENCE:${nextSequence}`;
+    }
+    return `${[...header, ...kept.flatMap((s) => s.lines), ...footer].join("\n")}\n`;
 }
 
 async function upstreamAssetUrl(key, absoluteUrl, request, env, playlistUrl) {
-  const httpsFallback = httpsFallbackCandidate(absoluteUrl, env);
-  const path = new URL(absoluteUrl).pathname;
-  const filenameParts = path.split("/").filter(Boolean);
-  const filename = filenameParts[filenameParts.length - 1] || "segment.bin";
-  const token = await makeUrlToken({ u: absoluteUrl, r: playlistUrl, f: httpsFallback || undefined }, env);
-  // Use CDN base for segments so .ts files are served/cached through the CDN
-  const base = streamBase(request, env);
-  if (path.toLowerCase().endsWith(".m3u8")) return `${base}/uplive/${key}/${token}.m3u8`;
-  return `${base}/upseg/${key}/${token}/${filename}`;
+    const httpsFallback = httpsFallbackCandidate(absoluteUrl, env);
+    const path = new URL(absoluteUrl).pathname;
+    const filenameParts = path.split("/").filter(Boolean);
+    const filename = filenameParts[filenameParts.length - 1] || "segment.bin";
+    const token = await makeUrlToken({ u: absoluteUrl, r: playlistUrl, f: httpsFallback || undefined }, env);
+    // Use CDN base for segments so .ts files are served/cached through the CDN
+    const base = streamBase(request, env);
+    if (path.toLowerCase().endsWith(".m3u8")) return `${base}/uplive/${key}/${token}.m3u8`;
+    return `${base}/upseg/${key}/${token}/${filename}`;
 }
 
 async function rewriteUriAttributes(line, key, playlistUrl, request, env) {
-  const matches = [...line.matchAll(/URI="([^"]+)"/g)];
-  if (matches.length === 0) return line;
-  let output = "", lastIndex = 0;
-  for (const match of matches) {
-    const absoluteUrl = new URL(match[1], playlistUrl).toString();
-    output += line.slice(lastIndex, match.index ?? 0);
-    output += `URI="${await upstreamAssetUrl(key, absoluteUrl, request, env, playlistUrl)}"`;
-    lastIndex = (match.index ?? 0) + match[0].length;
-  }
-  return output + line.slice(lastIndex);
+    const matches = [...line.matchAll(/URI="([^"]+)"/g)];
+    if (matches.length === 0) return line;
+    let output = "", lastIndex = 0;
+    for (const match of matches) {
+        const absoluteUrl = new URL(match[1], playlistUrl).toString();
+        output += line.slice(lastIndex, match.index ?? 0);
+        output += `URI="${await upstreamAssetUrl(key, absoluteUrl, request, env, playlistUrl)}"`;
+        lastIndex = (match.index ?? 0) + match[0].length;
+    }
+    return output + line.slice(lastIndex);
 }
 
 async function rewriteUpstreamPlaylist(text, playlistUrl, request, env, key) {
-  const trimmedText = trimLivePlaylistText(text, env);
-  const configuredTarget = envInt(env, "UPSTREAM_TARGET_DURATION", 0);
-  const measuredTarget = parseTargetDuration(trimmedText);
-  const targetDuration = configuredTarget > 0 ? Math.min(Math.max(1, configuredTarget), measuredTarget) : measuredTarget;
-  const startOffsetSegments = Math.max(0, envInt(env, "LIVE_START_OFFSET_SEGMENTS", 0));
-  const startOffsetSeconds = Math.max(1, targetDuration * startOffsetSegments);
-  const isMediaPlaylist = /#EXTINF:/m.test(trimmedText) || /#EXT-X-PART:/m.test(trimmedText);
-  let insertedStart = false;
-  const lines = [];
+    const trimmedText = trimLivePlaylistText(text, env);
+    const configuredTarget = envInt(env, "UPSTREAM_TARGET_DURATION", 0);
+    const measuredTarget = parseTargetDuration(trimmedText);
+    const targetDuration = configuredTarget > 0 ? Math.min(Math.max(1, configuredTarget), measuredTarget) : measuredTarget;
+    const startOffsetSegments = Math.max(0, envInt(env, "LIVE_START_OFFSET_SEGMENTS", 0));
+    const startOffsetSeconds = Math.max(1, targetDuration * startOffsetSegments);
+    const isMediaPlaylist = /#EXTINF:/m.test(trimmedText) || /#EXT-X-PART:/m.test(trimmedText);
+    let insertedStart = false;
+    const lines = [];
 
-  for (const rawLine of trimmedText.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) { lines.push(rawLine); continue; }
-    if (line.startsWith("#EXTM3U")) {
-      lines.push(rawLine);
-      if (isMediaPlaylist && !insertedStart && startOffsetSegments > 0) {
-        lines.push(`#EXT-X-START:TIME-OFFSET=-${startOffsetSeconds},PRECISE=YES`);
-        insertedStart = true;
-      }
-      continue;
+    for (const rawLine of trimmedText.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line) { lines.push(rawLine); continue; }
+        if (line.startsWith("#EXTM3U")) {
+            lines.push(rawLine);
+            if (isMediaPlaylist && !insertedStart && startOffsetSegments > 0) {
+                lines.push(`#EXT-X-START:TIME-OFFSET=-${startOffsetSeconds},PRECISE=YES`);
+                insertedStart = true;
+            }
+            continue;
+        }
+        if (line.startsWith("#EXT-X-TARGETDURATION")) { lines.push(`#EXT-X-TARGETDURATION:${targetDuration}`); continue; }
+        if (line.startsWith("#EXT-X-ALLOW-CACHE")) { lines.push("#EXT-X-ALLOW-CACHE:NO"); continue; }
+        if (line.startsWith("#EXT-X-START")) {
+            if (isMediaPlaylist && !insertedStart && startOffsetSegments > 0) {
+                lines.push(`#EXT-X-START:TIME-OFFSET=-${startOffsetSeconds},PRECISE=YES`);
+                insertedStart = true;
+            }
+            continue;
+        }
+        if (line.startsWith("#")) { lines.push(await rewriteUriAttributes(rawLine, key, playlistUrl, request, env)); continue; }
+        lines.push(await upstreamAssetUrl(key, new URL(line, playlistUrl).toString(), request, env, playlistUrl));
     }
-    if (line.startsWith("#EXT-X-TARGETDURATION")) { lines.push(`#EXT-X-TARGETDURATION:${targetDuration}`); continue; }
-    if (line.startsWith("#EXT-X-ALLOW-CACHE")) { lines.push("#EXT-X-ALLOW-CACHE:NO"); continue; }
-    if (line.startsWith("#EXT-X-START")) {
-      if (isMediaPlaylist && !insertedStart && startOffsetSegments > 0) {
-        lines.push(`#EXT-X-START:TIME-OFFSET=-${startOffsetSeconds},PRECISE=YES`);
-        insertedStart = true;
-      }
-      continue;
-    }
-    if (line.startsWith("#")) { lines.push(await rewriteUriAttributes(rawLine, key, playlistUrl, request, env)); continue; }
-    lines.push(await upstreamAssetUrl(key, new URL(line, playlistUrl).toString(), request, env, playlistUrl));
-  }
 
-  return `${lines.join("\n")}\n`;
+    return `${lines.join("\n")}\n`;
 }
 
 // Segment fetching
 
 function mediaTypeForPath(path) {
-  const lower = path.toLowerCase();
-  if (lower.endsWith(".m3u8")) return "application/x-mpegURL; charset=utf-8";
-  if (lower.endsWith(".ts")) return "video/mp2t";
-  if (lower.endsWith(".m4s")) return "video/iso.segment";
-  if (lower.endsWith(".mp4")) return "video/mp4";
-  if (lower.endsWith(".aac")) return "audio/aac";
-  if (lower.endsWith(".m4a")) return "audio/mp4";
-  return "application/octet-stream";
+    const lower = path.toLowerCase();
+    if (lower.endsWith(".m3u8")) return "application/x-mpegURL; charset=utf-8";
+    if (lower.endsWith(".ts")) return "video/mp2t";
+    if (lower.endsWith(".m4s")) return "video/iso.segment";
+    if (lower.endsWith(".mp4")) return "video/mp4";
+    if (lower.endsWith(".aac")) return "audio/aac";
+    if (lower.endsWith(".m4a")) return "audio/mp4";
+    return "application/octet-stream";
 }
 
 async function fetchUpstreamAsset(url, referer, env, ttlSeconds, request) {
-  try {
-    const headers = {
-      "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
-      referer,
-    };
-    if (request && request.headers.get("range")) headers.range = request.headers.get("range");
-    if (request && request.headers.get("if-range")) headers["if-range"] = request.headers.get("if-range");
-    return await fetch(url, { method: request ? request.method : "GET", headers, redirect: "follow" });
-  } catch {
-    return null;
-  }
+    try {
+        const headers = {
+            "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
+            referer,
+        };
+        if (request && request.headers.get("range")) headers.range = request.headers.get("range");
+        if (request && request.headers.get("if-range")) headers["if-range"] = request.headers.get("if-range");
+        return await fetch(url, { method: request ? request.method : "GET", headers, redirect: "follow" });
+    } catch {
+        return null;
+    }
 }
 
 function extractPrefetchSegmentUrls(text, playlistUrl, env, limit) {
-  if (limit <= 0) return [];
-  const output = [], seen = new Set();
-  const lines = text.split(/\r?\n/);
-  for (let i = lines.length - 1; i >= 0 && output.length < limit; i--) {
-    const line = lines[i].trim();
-    if (!line || line.startsWith("#") || line.toLowerCase().endsWith(".m3u8")) continue;
-    const absoluteUrl = new URL(line, playlistUrl).toString();
-    if (!seen.has(absoluteUrl)) { seen.add(absoluteUrl); output.push(absoluteUrl); }
-  }
-  return output;
+    if (limit <= 0) return [];
+    const output = [], seen = new Set();
+    const lines = text.split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0 && output.length < limit; i--) {
+        const line = lines[i].trim();
+        if (!line || line.startsWith("#") || line.toLowerCase().endsWith(".m3u8")) continue;
+        const absoluteUrl = new URL(line, playlistUrl).toString();
+        if (!seen.has(absoluteUrl)) { seen.add(absoluteUrl); output.push(absoluteUrl); }
+    }
+    return output;
 }
 
 async function prefetchSegments(segmentUrls, referer, env) {
-  const ttlSeconds = envInt(env, "SEGMENT_CACHE_SECONDS", 30);
-  await Promise.all(segmentUrls.map((url) => fetchUpstreamAsset(url, referer, env, ttlSeconds, null)));
+    const ttlSeconds = envInt(env, "SEGMENT_CACHE_SECONDS", 30);
+    await Promise.all(segmentUrls.map((url) => fetchUpstreamAsset(url, referer, env, ttlSeconds, null)));
 }
 
 // Live playlist proxy
 
 async function buildLivePlaylistBody(key, sourceUrl, request, env, waitUntil, cacheKey) {
-  return withInflight(livePlaylistInflight, cacheKey, async () => {
-    const upstream = await findUpstreamHls(key, sourceUrl, env);
-    if (!upstream) throw new HttpError(502, "Upstream HLS unavailable.");
-    const body = await rewriteUpstreamPlaylist(upstream.text, upstream.url, request, env, key);
-    const prefetchCount = Math.max(0, envInt(env, "PREFETCH_SEGMENTS", 0));
-    const segmentUrls = extractPrefetchSegmentUrls(upstream.text, upstream.url, env, prefetchCount);
-    rememberMapEntry(livePlaylistCache, cacheKey, { at: Date.now(), body }, MAX_LIVE_PLAYLIST_CACHE_ENTRIES);
-    if (segmentUrls.length > 0) waitUntil(prefetchSegments(segmentUrls, upstream.url, env));
-    return body;
-  });
+    return withInflight(livePlaylistInflight, cacheKey, async () => {
+        const upstream = await findUpstreamHls(key, sourceUrl, env);
+        if (!upstream) throw new HttpError(502, "Upstream HLS unavailable.");
+        const body = await rewriteUpstreamPlaylist(upstream.text, upstream.url, request, env, key);
+        const prefetchCount = Math.max(0, envInt(env, "PREFETCH_SEGMENTS", 0));
+        const segmentUrls = extractPrefetchSegmentUrls(upstream.text, upstream.url, env, prefetchCount);
+        rememberMapEntry(livePlaylistCache, cacheKey, { at: Date.now(), body }, MAX_LIVE_PLAYLIST_CACHE_ENTRIES);
+        if (segmentUrls.length > 0) waitUntil(prefetchSegments(segmentUrls, upstream.url, env));
+        return body;
+    });
 }
 
 async function proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, cacheKey) {
-  const now = Date.now();
-  const freshMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", 2000));
-  const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 0));
-  const cached = livePlaylistCache.get(cacheKey);
-  if (cached && now - cached.at < freshMs) return playlistResponse(cached.body);
-  try {
-    const body = await buildLivePlaylistBody(key, sourceUrl, request, env, waitUntil, cacheKey);
-    return playlistResponse(body);
-  } catch (error) {
-    if (cached && now - cached.at < staleMs) return playlistResponse(cached.body);
-    throw error;
-  }
+    const now = Date.now();
+    const freshMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", 2000));
+    const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 0));
+    const cached = livePlaylistCache.get(cacheKey);
+    if (cached && now - cached.at < freshMs) return playlistResponse(cached.body);
+    try {
+        const body = await buildLivePlaylistBody(key, sourceUrl, request, env, waitUntil, cacheKey);
+        return playlistResponse(body);
+    } catch (error) {
+        if (cached && now - cached.at < staleMs) return playlistResponse(cached.body);
+        throw error;
+    }
 }
 
 async function proxyChannelPlaylist(key, request, env, waitUntil) {
-  const requestUrl = new URL(request.url);
-  const srcToken = requestUrl.searchParams.get("src");
-  if (srcToken) {
-    const tokenData = await readUrlToken(srcToken, env);
-    return proxyLiveFromSource(key, tokenData.u, request, env, waitUntil, `live:${key}:${srcToken}`);
-  }
-  const channel = await getStreamForKey(key, env);
-  return proxyLiveFromSource(key, channel.sourceUrl, request, env, waitUntil, `live:${key}`);
+    const requestUrl = new URL(request.url);
+    const srcToken = requestUrl.searchParams.get("src");
+    if (srcToken) {
+        const tokenData = await readUrlToken(srcToken, env);
+        return proxyLiveFromSource(key, tokenData.u, request, env, waitUntil, `live:${key}:${srcToken}`);
+    }
+    const channel = await getStreamForKey(key, env);
+    return proxyLiveFromSource(key, channel.sourceUrl, request, env, waitUntil, `live:${key}`);
 }
 
 async function proxyDirectPlaylist(token, request, env, waitUntil) {
-  const tokenData = await readUrlToken(token, env);
-  const sourceUrl = tokenData.u;
-  const key = await streamKey(sourceUrl);
-  return proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, `direct:${key}`);
+    const tokenData = await readUrlToken(token, env);
+    const sourceUrl = tokenData.u;
+    const key = await streamKey(sourceUrl);
+    return proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, `direct:${key}`);
 }
 
 async function buildNestedPlaylistBody(key, tokenData, request, env, waitUntil, cacheKey) {
-  return withInflight(livePlaylistInflight, cacheKey, async () => {
-    const fetched = (await fetchHls(tokenData.u, env, tokenData.r)) || (tokenData.f ? await fetchHls(tokenData.f, env, tokenData.r) : null);
-    if (!fetched) throw new HttpError(502, "Upstream unavailable.");
-    const body = await rewriteUpstreamPlaylist(fetched.text, fetched.finalUrl, request, env, key);
-    const prefetchCount = Math.max(0, envInt(env, "PREFETCH_SEGMENTS", 0));
-    const segmentUrls = extractPrefetchSegmentUrls(fetched.text, fetched.finalUrl, env, prefetchCount);
-    rememberMapEntry(livePlaylistCache, cacheKey, { at: Date.now(), body }, MAX_LIVE_PLAYLIST_CACHE_ENTRIES);
-    if (segmentUrls.length > 0) waitUntil(prefetchSegments(segmentUrls, fetched.finalUrl, env));
-    return body;
-  });
+    return withInflight(livePlaylistInflight, cacheKey, async () => {
+        const fetched = (await fetchHls(tokenData.u, env, tokenData.r)) || (tokenData.f ? await fetchHls(tokenData.f, env, tokenData.r) : null);
+        if (!fetched) throw new HttpError(502, "Upstream unavailable.");
+        const body = await rewriteUpstreamPlaylist(fetched.text, fetched.finalUrl, request, env, key);
+        const prefetchCount = Math.max(0, envInt(env, "PREFETCH_SEGMENTS", 0));
+        const segmentUrls = extractPrefetchSegmentUrls(fetched.text, fetched.finalUrl, env, prefetchCount);
+        rememberMapEntry(livePlaylistCache, cacheKey, { at: Date.now(), body }, MAX_LIVE_PLAYLIST_CACHE_ENTRIES);
+        if (segmentUrls.length > 0) waitUntil(prefetchSegments(segmentUrls, fetched.finalUrl, env));
+        return body;
+    });
 }
 
 async function proxyNestedPlaylist(key, token, request, env, waitUntil) {
-  validateKey(key);
-  const tokenData = await readUrlToken(token, env);
-  const cacheKey = `uplive:${key}:${tokenData.u}`;
-  const now = Date.now();
-  const freshMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", 2000));
-  const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 0));
-  const cached = livePlaylistCache.get(cacheKey);
-  if (cached && now - cached.at < freshMs) return playlistResponse(cached.body);
-  try {
-    const body = await buildNestedPlaylistBody(key, tokenData, request, env, waitUntil, cacheKey);
-    return playlistResponse(body);
-  } catch (error) {
-    if (cached && now - cached.at < staleMs) return playlistResponse(cached.body);
-    throw error;
-  }
+    validateKey(key);
+    const tokenData = await readUrlToken(token, env);
+    const cacheKey = `uplive:${key}:${tokenData.u}`;
+    const now = Date.now();
+    const freshMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", 2000));
+    const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 0));
+    const cached = livePlaylistCache.get(cacheKey);
+    if (cached && now - cached.at < freshMs) return playlistResponse(cached.body);
+    try {
+        const body = await buildNestedPlaylistBody(key, tokenData, request, env, waitUntil, cacheKey);
+        return playlistResponse(body);
+    } catch (error) {
+        if (cached && now - cached.at < staleMs) return playlistResponse(cached.body);
+        throw error;
+    }
 }
 
 async function proxySegment(key, token, filename, request, env) {
-  validateKey(key);
-  const tokenData = await readUrlToken(token, env);
-  const referer = tokenData.r || tokenData.u;
-  const ttlSeconds = Math.max(1, envInt(env, "SEGMENT_CACHE_SECONDS", 30));
+    validateKey(key);
+    const tokenData = await readUrlToken(token, env);
+    const referer = tokenData.r || tokenData.u;
+    const ttlSeconds = Math.max(1, envInt(env, "SEGMENT_CACHE_SECONDS", 30));
 
-  const primary = await fetchUpstreamAsset(tokenData.u, referer, env, ttlSeconds, request);
-  const fallback = (!primary || primary.status >= 400) && tokenData.f
-    ? await fetchUpstreamAsset(tokenData.f, referer, env, ttlSeconds, request)
-    : null;
+    const primary = await fetchUpstreamAsset(tokenData.u, referer, env, ttlSeconds, request);
+    const fallback = (!primary || primary.status >= 400) && tokenData.f
+        ? await fetchUpstreamAsset(tokenData.f, referer, env, ttlSeconds, request)
+        : null;
 
-  const upstream = fallback && fallback.ok ? fallback : primary;
-  if (!upstream) throw new HttpError(502, "Upstream segment fetch failed.");
-  if (!upstream.ok) return withCors(new Response(upstream.body, { status: upstream.status, headers: upstream.headers }));
+    const upstream = fallback && fallback.ok ? fallback : primary;
+    if (!upstream) throw new HttpError(502, "Upstream segment fetch failed.");
+    if (!upstream.ok) return withCors(new Response(upstream.body, { status: upstream.status, headers: upstream.headers }));
 
-  const headers = new Headers(upstream.headers);
-  headers.set("cache-control", `public, max-age=${ttlSeconds}, s-maxage=${ttlSeconds}, stale-while-revalidate=15`);
-  if (!headers.has("content-type")) headers.set("content-type", mediaTypeForPath(filename));
-  headers.set("access-control-allow-origin", "*");
-  headers.set("access-control-allow-methods", "GET,HEAD,OPTIONS");
-  headers.set("access-control-allow-headers", "*");
-  headers.set("access-control-expose-headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
-  headers.set("x-content-type-options", "nosniff");
-  headers.set("x-proxied-by", "node-express");
-  headers.set("x-worker-origin", publicBase(request, env));
+    const headers = new Headers(upstream.headers);
+    headers.set("cache-control", `public, max-age=${ttlSeconds}, s-maxage=${ttlSeconds}, stale-while-revalidate=15`);
+    if (!headers.has("content-type")) headers.set("content-type", mediaTypeForPath(filename));
+    headers.set("access-control-allow-origin", "*");
+    headers.set("access-control-allow-methods", "GET,HEAD,OPTIONS");
+    headers.set("access-control-allow-headers", "*");
+    headers.set("access-control-expose-headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
+    headers.set("x-content-type-options", "nosniff");
+    headers.set("x-proxied-by", "node-express");
+    headers.set("x-worker-origin", publicBase(request, env));
 
-  return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers });
+    return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers });
 }
 
 // ─── Xtream Codes Protocol API ───────────────────────────────────────────────
@@ -2322,397 +2322,397 @@ const xtreamMovieUrlIndex = new Map();   // streamId → upstreamUrl
 const xtreamEpisodeUrlIndex = new Map(); // episodeId → upstreamUrl
 
 function xtreamServerInfo(request, env) {
-  const base = publicBase(request, env);
-  const parsed = new URL(base);
-  const now = Math.floor(Date.now() / 1000);
-  return {
-    url: parsed.hostname,
-    port: parsed.port || (parsed.protocol === "https:" ? "443" : "80"),
-    https_port: parsed.protocol === "https:" ? (parsed.port || "443") : "443",
-    server_protocol: parsed.protocol.replace(":", ""),
-    rtmp_port: "1935",
-    timezone: "UTC",
-    timestamp_now: now,
-    time_now: new Date().toISOString().replace("T", " ").slice(0, 19),
-    process: true,
-  };
+    const base = publicBase(request, env);
+    const parsed = new URL(base);
+    const now = Math.floor(Date.now() / 1000);
+    return {
+        url: parsed.hostname,
+        port: parsed.port || (parsed.protocol === "https:" ? "443" : "80"),
+        https_port: parsed.protocol === "https:" ? (parsed.port || "443") : "443",
+        server_protocol: parsed.protocol.replace(":", ""),
+        rtmp_port: "1935",
+        timezone: "UTC",
+        timestamp_now: now,
+        time_now: new Date().toISOString().replace("T", " ").slice(0, 19),
+        process: true,
+    };
 }
 
 function xtreamUserInfoPayload(user, request, env) {
-  const now = Math.floor(Date.now() / 1000);
-  const expDate = user.expiresAt ? Math.floor(new Date(user.expiresAt).getTime() / 1000) : null;
-  return {
-    user_info: {
-      username: user.username,
-      password: user.password,
-      message: "",
-      auth: 1,
-      status: isAccessUserExpired(user) ? "Expired" : "Active",
-      exp_date: expDate ? String(expDate) : null,
-      is_trial: "0",
-      active_cons: "1",
-      created_at: user.createdAt ? String(Math.floor(new Date(user.createdAt).getTime() / 1000)) : String(now),
-      max_connections: "10",
-      allowed_output_formats: ["m3u8", "ts", "rtmpe"],
-    },
-    server_info: xtreamServerInfo(request, env),
-  };
+    const now = Math.floor(Date.now() / 1000);
+    const expDate = user.expiresAt ? Math.floor(new Date(user.expiresAt).getTime() / 1000) : null;
+    return {
+        user_info: {
+            username: user.username,
+            password: user.password,
+            message: "",
+            auth: 1,
+            status: isAccessUserExpired(user) ? "Expired" : "Active",
+            exp_date: expDate ? String(expDate) : null,
+            is_trial: "0",
+            active_cons: "1",
+            created_at: user.createdAt ? String(Math.floor(new Date(user.createdAt).getTime() / 1000)) : String(now),
+            max_connections: "10",
+            allowed_output_formats: ["m3u8", "ts", "rtmpe"],
+        },
+        server_info: xtreamServerInfo(request, env),
+    };
 }
 
 function aggregateXtreamCategories(catalogs) {
-  const seen = new Set();
-  const result = [];
-  for (const catalog of catalogs) {
-    if (!catalog) continue;
-    for (const [id, name] of catalog.categoriesById.entries()) {
-      if (seen.has(id)) continue;
-      seen.add(id);
-      result.push({ category_id: id, category_name: name, parent_id: 0 });
+    const seen = new Set();
+    const result = [];
+    for (const catalog of catalogs) {
+        if (!catalog) continue;
+        for (const [id, name] of catalog.categoriesById.entries()) {
+            if (seen.has(id)) continue;
+            seen.add(id);
+            result.push({ category_id: id, category_name: name, parent_id: 0 });
+        }
     }
-  }
-  if (result.length === 0) result.push({ category_id: "1", category_name: "All", parent_id: 0 });
-  return result;
+    if (result.length === 0) result.push({ category_id: "1", category_name: "All", parent_id: 0 });
+    return result;
 }
 
 async function xtreamLiveCategories(env) {
-  const sources = buildProviderPlaylistSources(env);
-  const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "live", false).catch(() => null)));
-  return aggregateXtreamCategories(catalogs);
+    const sources = buildProviderPlaylistSources(env);
+    const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "live", false).catch(() => null)));
+    return aggregateXtreamCategories(catalogs);
 }
 
 async function xtreamLiveStreams(env) {
-  const sources = buildProviderPlaylistSources(env);
-  const result = [];
-  const seenIds = new Set();
-  let num = 1;
-  for (const source of sources) {
-    const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
-    if (!catalog) continue;
-    for (const item of catalog.items) {
-      const id = itemId(item, "live");
-      if (!id || seenIds.has(id)) continue;
-      seenIds.add(id);
-      result.push({
-        num: num++,
-        name: cleanString(item.name, "Unknown"),
-        stream_type: "live",
-        stream_id: id,
-        stream_icon: mediaLogo(item),
-        epg_channel_id: cleanString(item.epg_channel_id),
-        added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
-        category_id: cleanString(item.category_id),
-        custom_sid: "",
-        tv_archive: 0,
-        direct_source: "",
-        tv_archive_duration: 0,
-      });
+    const sources = buildProviderPlaylistSources(env);
+    const result = [];
+    const seenIds = new Set();
+    let num = 1;
+    for (const source of sources) {
+        const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
+        if (!catalog) continue;
+        for (const item of catalog.items) {
+            const id = itemId(item, "live");
+            if (!id || seenIds.has(id)) continue;
+            seenIds.add(id);
+            result.push({
+                num: num++,
+                name: cleanString(item.name, "Unknown"),
+                stream_type: "live",
+                stream_id: id,
+                stream_icon: mediaLogo(item),
+                epg_channel_id: cleanString(item.epg_channel_id),
+                added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
+                category_id: cleanString(item.category_id),
+                custom_sid: "",
+                tv_archive: 0,
+                direct_source: "",
+                tv_archive_duration: 0,
+            });
+        }
     }
-  }
-  return result;
+    return result;
 }
 
 async function xtreamVodCategories(env) {
-  const sources = buildProviderPlaylistSources(env);
-  const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "movies", false).catch(() => null)));
-  return aggregateXtreamCategories(catalogs);
+    const sources = buildProviderPlaylistSources(env);
+    const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "movies", false).catch(() => null)));
+    return aggregateXtreamCategories(catalogs);
 }
 
 async function xtreamVodStreams(env) {
-  const sources = buildProviderPlaylistSources(env);
-  const result = [];
-  const seenIds = new Set();
-  let num = 1;
-  for (const source of sources) {
-    const catalog = await loadXtreamCatalog(env, source, "movies", false).catch(() => null);
-    if (!catalog) continue;
-    for (const item of catalog.items) {
-      const id = itemId(item, "movies");
-      if (!id || seenIds.has(id)) continue;
-      seenIds.add(id);
-      const ext = cleanString(item.container_extension, "mp4");
-      const upstreamUrl = xtreamMediaUrl(catalog.config, "movie", String(id), ext);
-      xtreamMovieUrlIndex.set(String(id), upstreamUrl); // populate index
-      result.push({
-        num: num++,
-        name: cleanString(item.name, "Unknown"),
-        stream_type: "movie",
-        stream_id: id,
-        stream_icon: mediaLogo(item),
-        rating: String(mediaRating(item) ?? ""),
-        rating_5based: String(mediaRating(item) ?? ""),
-        added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
-        category_id: cleanString(item.category_id),
-        container_extension: ext,
-        custom_sid: "",
-        direct_source: "",
-      });
+    const sources = buildProviderPlaylistSources(env);
+    const result = [];
+    const seenIds = new Set();
+    let num = 1;
+    for (const source of sources) {
+        const catalog = await loadXtreamCatalog(env, source, "movies", false).catch(() => null);
+        if (!catalog) continue;
+        for (const item of catalog.items) {
+            const id = itemId(item, "movies");
+            if (!id || seenIds.has(id)) continue;
+            seenIds.add(id);
+            const ext = cleanString(item.container_extension, "mp4");
+            const upstreamUrl = xtreamMediaUrl(catalog.config, "movie", String(id), ext);
+            xtreamMovieUrlIndex.set(String(id), upstreamUrl); // populate index
+            result.push({
+                num: num++,
+                name: cleanString(item.name, "Unknown"),
+                stream_type: "movie",
+                stream_id: id,
+                stream_icon: mediaLogo(item),
+                rating: String(mediaRating(item) ?? ""),
+                rating_5based: String(mediaRating(item) ?? ""),
+                added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
+                category_id: cleanString(item.category_id),
+                container_extension: ext,
+                custom_sid: "",
+                direct_source: "",
+            });
+        }
     }
-  }
-  return result;
+    return result;
 }
 
 async function xtreamSeriesCategories(env) {
-  const sources = buildProviderPlaylistSources(env);
-  const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "series", false).catch(() => null)));
-  return aggregateXtreamCategories(catalogs);
+    const sources = buildProviderPlaylistSources(env);
+    const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "series", false).catch(() => null)));
+    return aggregateXtreamCategories(catalogs);
 }
 
 async function xtreamSeriesList(env) {
-  const sources = buildProviderPlaylistSources(env);
-  const result = [];
-  const seenIds = new Set();
-  let num = 1;
-  for (const source of sources) {
-    const catalog = await loadXtreamCatalog(env, source, "series", false).catch(() => null);
-    if (!catalog) continue;
-    for (const item of catalog.items) {
-      const id = itemId(item, "series");
-      if (!id || seenIds.has(id)) continue;
-      seenIds.add(id);
-      result.push({
-        num: num++,
-        name: cleanString(item.name, "Unknown"),
-        series_id: id,
-        cover: mediaLogo(item),
-        plot: cleanString(item.plot),
-        cast: cleanString(item.cast),
-        director: cleanString(item.director),
-        genre: cleanString(item.genre),
-        releaseDate: cleanString(item.releaseDate ?? item.release_date),
-        last_modified: cleanString(item.last_modified) || String(Math.floor(Date.now() / 1000)),
-        rating: String(mediaRating(item) ?? ""),
-        rating_5based: String(mediaRating(item) ?? ""),
-        backdrop_path: Array.isArray(item.backdrop_path) ? item.backdrop_path : [],
-        youtube_trailer: cleanString(item.youtube_trailer),
-        episode_run_time: cleanString(item.episode_run_time),
-        category_id: cleanString(item.category_id),
-      });
+    const sources = buildProviderPlaylistSources(env);
+    const result = [];
+    const seenIds = new Set();
+    let num = 1;
+    for (const source of sources) {
+        const catalog = await loadXtreamCatalog(env, source, "series", false).catch(() => null);
+        if (!catalog) continue;
+        for (const item of catalog.items) {
+            const id = itemId(item, "series");
+            if (!id || seenIds.has(id)) continue;
+            seenIds.add(id);
+            result.push({
+                num: num++,
+                name: cleanString(item.name, "Unknown"),
+                series_id: id,
+                cover: mediaLogo(item),
+                plot: cleanString(item.plot),
+                cast: cleanString(item.cast),
+                director: cleanString(item.director),
+                genre: cleanString(item.genre),
+                releaseDate: cleanString(item.releaseDate ?? item.release_date),
+                last_modified: cleanString(item.last_modified) || String(Math.floor(Date.now() / 1000)),
+                rating: String(mediaRating(item) ?? ""),
+                rating_5based: String(mediaRating(item) ?? ""),
+                backdrop_path: Array.isArray(item.backdrop_path) ? item.backdrop_path : [],
+                youtube_trailer: cleanString(item.youtube_trailer),
+                episode_run_time: cleanString(item.episode_run_time),
+                category_id: cleanString(item.category_id),
+            });
+        }
     }
-  }
-  return result;
+    return result;
 }
 
 async function xtreamSeriesInfoPayload(env, seriesId) {
-  const sources = buildProviderPlaylistSources(env);
-  for (const source of sources) {
-    const infoEntry = await loadXtreamSeriesInfo(env, source, seriesId, false).catch(() => null);
-    if (!infoEntry?.payload) continue;
-    const { payload, config } = infoEntry;
-    const episodesOut = {};
-    const groups = payload.episodes;
-    if (groups && typeof groups === "object") {
-      for (const [season, eps] of Object.entries(groups)) {
-        episodesOut[season] = Array.isArray(eps)
-          ? eps.map((ep) => {
-              const epId = cleanString(ep?.id ?? ep?.stream_id);
-              const ext = cleanString(ep?.container_extension ?? ep?.info?.container_extension, "mp4");
-              if (epId) {
-                const upUrl = directEpisodeUrl(config, ep);
-                if (upUrl) xtreamEpisodeUrlIndex.set(String(epId), upUrl); // populate index
-              }
-              return { ...ep, id: epId, stream_id: epId };
-            })
-          : [];
-      }
+    const sources = buildProviderPlaylistSources(env);
+    for (const source of sources) {
+        const infoEntry = await loadXtreamSeriesInfo(env, source, seriesId, false).catch(() => null);
+        if (!infoEntry?.payload) continue;
+        const { payload, config } = infoEntry;
+        const episodesOut = {};
+        const groups = payload.episodes;
+        if (groups && typeof groups === "object") {
+            for (const [season, eps] of Object.entries(groups)) {
+                episodesOut[season] = Array.isArray(eps)
+                    ? eps.map((ep) => {
+                        const epId = cleanString(ep?.id ?? ep?.stream_id);
+                        const ext = cleanString(ep?.container_extension ?? ep?.info?.container_extension, "mp4");
+                        if (epId) {
+                            const upUrl = directEpisodeUrl(config, ep);
+                            if (upUrl) xtreamEpisodeUrlIndex.set(String(epId), upUrl); // populate index
+                        }
+                        return { ...ep, id: epId, stream_id: epId };
+                    })
+                    : [];
+            }
+        }
+        return { seasons: payload.seasons ?? [], info: payload.info ?? {}, episodes: episodesOut };
     }
-    return { seasons: payload.seasons ?? [], info: payload.info ?? {}, episodes: episodesOut };
-  }
-  return { seasons: [], info: {}, episodes: {} };
+    return { seasons: [], info: {}, episodes: {} };
 }
 
 // Auth helper reused by stream URL handlers
 async function requireXtreamAuth(username, password) {
-  const users = await loadAccessUsers(process.env);
-  const user = users.find((u) => u.username === username && u.password === password);
-  if (!user || user.disabled || isAccessUserExpired(user)) throw new HttpError(403, "Invalid credentials.");
-  return user;
+    const users = await loadAccessUsers(process.env);
+    const user = users.find((u) => u.username === username && u.password === password);
+    if (!user || user.disabled || isAccessUserExpired(user)) throw new HttpError(403, "Invalid credentials.");
+    return user;
 }
 
 // Look up live source URL from catalogs by stream_id
 async function findXtreamLiveUrl(env, streamId) {
-  for (const source of buildProviderPlaylistSources(env)) {
-    const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
-    if (!catalog) continue;
-    const item = catalog.itemsById.get(String(streamId));
-    if (item) {
-      const ext = cleanString(item.container_extension, "ts");
-      return xtreamMediaUrl(catalog.config, "live", String(streamId), ext);
+    for (const source of buildProviderPlaylistSources(env)) {
+        const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
+        if (!catalog) continue;
+        const item = catalog.itemsById.get(String(streamId));
+        if (item) {
+            const ext = cleanString(item.container_extension, "ts");
+            return xtreamMediaUrl(catalog.config, "live", String(streamId), ext);
+        }
     }
-  }
-  return null;
+    return null;
 }
 
 // Look up movie URL by stream_id (index first, then catalog scan)
 async function findXtreamMovieUrl(env, streamId) {
-  const cached = xtreamMovieUrlIndex.get(String(streamId));
-  if (cached) return cached;
-  for (const source of buildProviderPlaylistSources(env)) {
-    const catalog = await loadXtreamCatalog(env, source, "movies", false).catch(() => null);
-    if (!catalog) continue;
-    const item = catalog.itemsById.get(String(streamId));
-    if (item) {
-      const ext = cleanString(item.container_extension, "mp4");
-      const url = xtreamMediaUrl(catalog.config, "movie", String(streamId), ext);
-      xtreamMovieUrlIndex.set(String(streamId), url);
-      return url;
+    const cached = xtreamMovieUrlIndex.get(String(streamId));
+    if (cached) return cached;
+    for (const source of buildProviderPlaylistSources(env)) {
+        const catalog = await loadXtreamCatalog(env, source, "movies", false).catch(() => null);
+        if (!catalog) continue;
+        const item = catalog.itemsById.get(String(streamId));
+        if (item) {
+            const ext = cleanString(item.container_extension, "mp4");
+            const url = xtreamMediaUrl(catalog.config, "movie", String(streamId), ext);
+            xtreamMovieUrlIndex.set(String(streamId), url);
+            return url;
+        }
     }
-  }
-  return null;
+    return null;
 }
 
 // Look up episode URL by episode_id (populated when get_series_info is called)
 async function findXtreamEpisodeUrl(episodeId) {
-  return xtreamEpisodeUrlIndex.get(String(episodeId)) ?? null;
+    return xtreamEpisodeUrlIndex.get(String(episodeId)) ?? null;
 }
 
 async function handleXtreamApi(request, env, waitUntil) {
-  const url = new URL(request.url);
-  const username = cleanString(url.searchParams.get("username"));
-  const password = cleanString(url.searchParams.get("password"));
-  const action = cleanString(url.searchParams.get("action"));
+    const url = new URL(request.url);
+    const username = cleanString(url.searchParams.get("username"));
+    const password = cleanString(url.searchParams.get("password"));
+    const action = cleanString(url.searchParams.get("action"));
 
-  // Authenticate
-  const users = await loadAccessUsers(env);
-  const user = users.find((u) => u.username === username && u.password === password);
-  if (!user || user.disabled || isAccessUserExpired(user)) {
-    return json({ user_info: { username, password, auth: 0, status: "Disabled" } });
-  }
+    // Authenticate
+    const users = await loadAccessUsers(env);
+    const user = users.find((u) => u.username === username && u.password === password);
+    if (!user || user.disabled || isAccessUserExpired(user)) {
+        return json({ user_info: { username, password, auth: 0, status: "Disabled" } });
+    }
 
-  if (!action) return json(xtreamUserInfoPayload(user, request, env));
-  if (action === "get_live_categories") return json(await xtreamLiveCategories(env));
-  if (action === "get_live_streams") return json(await xtreamLiveStreams(env));
-  if (action === "get_vod_categories") return json(await xtreamVodCategories(env));
-  if (action === "get_vod_streams") return json(await xtreamVodStreams(env));
-  if (action === "get_series_categories") return json(await xtreamSeriesCategories(env));
-  if (action === "get_series") return json(await xtreamSeriesList(env));
-  if (action === "get_series_info") {
-    const seriesId = cleanString(url.searchParams.get("series_id"));
-    return json(await xtreamSeriesInfoPayload(env, seriesId));
-  }
-  return json([]);
+    if (!action) return json(xtreamUserInfoPayload(user, request, env));
+    if (action === "get_live_categories") return json(await xtreamLiveCategories(env));
+    if (action === "get_live_streams") return json(await xtreamLiveStreams(env));
+    if (action === "get_vod_categories") return json(await xtreamVodCategories(env));
+    if (action === "get_vod_streams") return json(await xtreamVodStreams(env));
+    if (action === "get_series_categories") return json(await xtreamSeriesCategories(env));
+    if (action === "get_series") return json(await xtreamSeriesList(env));
+    if (action === "get_series_info") {
+        const seriesId = cleanString(url.searchParams.get("series_id"));
+        return json(await xtreamSeriesInfoPayload(env, seriesId));
+    }
+    return json([]);
 }
 
 // ─── Main request handler ─────────────────────────────────────────────────────
 
 async function handleRequest(request, env, waitUntil) {
-  if (request.method === "OPTIONS") return withCors(new Response(null, { status: 204 }));
+    if (request.method === "OPTIONS") return withCors(new Response(null, { status: 204 }));
 
-  const url = new URL(request.url);
-  const path = url.pathname;
-  const isDashboardMutation = request.method === "POST" && (path === "/api/access-users" || path === "/api/access-users/delete");
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const isDashboardMutation = request.method === "POST" && (path === "/api/access-users" || path === "/api/access-users/delete");
 
-  if (request.method !== "GET" && request.method !== "HEAD" && !isDashboardMutation) {
-    return json({ error: "Method not allowed." }, 405);
-  }
+    if (request.method !== "GET" && request.method !== "HEAD" && !isDashboardMutation) {
+        return json({ error: "Method not allowed." }, 405);
+    }
 
-  if (path === "/") {
-    if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
-    return htmlResponse(dashboardPage());
-  }
+    if (path === "/") {
+        if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+        return htmlResponse(dashboardPage());
+    }
 
-  if (path === "/api/access-users" && request.method === "GET") {
-    return accessUsersPayload(request, env);
-  }
+    if (path === "/api/access-users" && request.method === "GET") {
+        return accessUsersPayload(request, env);
+    }
 
-  if (path === "/api/access-users" && request.method === "POST") {
-    return createAccessUser(request, env);
-  }
+    if (path === "/api/access-users" && request.method === "POST") {
+        return createAccessUser(request, env);
+    }
 
-  if (path === "/api/access-users/delete" && request.method === "POST") {
-    return deleteAccessUser(request, env);
-  }
+    if (path === "/api/access-users/delete" && request.method === "POST") {
+        return deleteAccessUser(request, env);
+    }
 
-  if (path === "/get.php") {
-    return generatedM3uResponse(request, env, waitUntil);
-  }
+    if (path === "/get.php") {
+        return generatedM3uResponse(request, env, waitUntil);
+    }
 
-  // ─── Xtream Codes API (/player_api.php) ─────────────────────────────────────
-  if (path === "/player_api.php" || path === "/player_api") {
-    return handleXtreamApi(request, env, waitUntil);
-  }
+    // ─── Xtream Codes API (/player_api.php) ─────────────────────────────────────
+    if (path === "/player_api.php" || path === "/player_api") {
+        return handleXtreamApi(request, env, waitUntil);
+    }
 
-  // Xtream EPG stub — apps need this endpoint to exist even if EPG is empty
-  if (path === "/xmltv.php") {
-    return withCors(new Response('<?xml version="1.0" encoding="UTF-8"?><tv></tv>', {
-      headers: { "content-type": "application/xml; charset=utf-8", "cache-control": "no-store" },
-    }));
-  }
+    // Xtream EPG stub — apps need this endpoint to exist even if EPG is empty
+    if (path === "/xmltv.php") {
+        return withCors(new Response('<?xml version="1.0" encoding="UTF-8"?><tv></tv>', {
+            headers: { "content-type": "application/xml; charset=utf-8", "cache-control": "no-store" },
+        }));
+    }
 
-  // ─── Xtream live stream proxy: /live/{user}/{pass}/{stream_id}.{ext} ─────────
-  // (Only when stream_id is numeric — hex-key URLs are handled below)
-  const xtreamLiveMatch = path.match(/^\/live\/([^/]+)\/([^/]+)\/([0-9]+)\.(m3u8|ts|mp4|mpeg)$/);
-  if (xtreamLiveMatch) {
-    await requireXtreamAuth(xtreamLiveMatch[1], xtreamLiveMatch[2]);
-    const sourceUrl = await findXtreamLiveUrl(env, xtreamLiveMatch[3]);
-    if (!sourceUrl) throw new HttpError(404, "Live stream not found.");
-    const key = await streamKey(sourceUrl);
-    return proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, `live:${key}`);
-  }
+    // ─── Xtream live stream proxy: /live/{user}/{pass}/{stream_id}.{ext} ─────────
+    // (Only when stream_id is numeric — hex-key URLs are handled below)
+    const xtreamLiveMatch = path.match(/^\/live\/([^/]+)\/([^/]+)\/([0-9]+)\.(m3u8|ts|mp4|mpeg)$/);
+    if (xtreamLiveMatch) {
+        await requireXtreamAuth(xtreamLiveMatch[1], xtreamLiveMatch[2]);
+        const sourceUrl = await findXtreamLiveUrl(env, xtreamLiveMatch[3]);
+        if (!sourceUrl) throw new HttpError(404, "Live stream not found.");
+        const key = await streamKey(sourceUrl);
+        return proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, `live:${key}`);
+    }
 
-  // ─── Xtream movie: /movie/{user}/{pass}/{stream_id}.{ext} ────────────────────
-  const xtreamMovieMatch = path.match(/^\/movie\/([^/]+)\/([^/]+)\/([0-9]+)\.([^/]+)$/);
-  if (xtreamMovieMatch) {
-    await requireXtreamAuth(xtreamMovieMatch[1], xtreamMovieMatch[2]);
-    const movieUrl = await findXtreamMovieUrl(env, xtreamMovieMatch[3]);
-    if (!movieUrl) throw new HttpError(404, "Movie not found.");
-    // Proxy through our own /upseg/ endpoint — hides upstream credentials,
-    // eliminates "unsafe URL" warnings in IPTV apps.
-    const key = await streamKey(movieUrl);
-    const token = await makeUrlToken({ u: movieUrl }, env);
-    const filename = `${xtreamMovieMatch[3]}.${xtreamMovieMatch[4]}`;
-    return withCors(new Response(null, {
-      status: 302,
-      headers: { location: `${publicBase(request, env)}/upseg/${key}/${token}/${filename}` },
-    }));
-  }
+    // ─── Xtream movie: /movie/{user}/{pass}/{stream_id}.{ext} ────────────────────
+    const xtreamMovieMatch = path.match(/^\/movie\/([^/]+)\/([^/]+)\/([0-9]+)\.([^/]+)$/);
+    if (xtreamMovieMatch) {
+        await requireXtreamAuth(xtreamMovieMatch[1], xtreamMovieMatch[2]);
+        const movieUrl = await findXtreamMovieUrl(env, xtreamMovieMatch[3]);
+        if (!movieUrl) throw new HttpError(404, "Movie not found.");
+        // Proxy through our own /upseg/ endpoint — hides upstream credentials,
+        // eliminates "unsafe URL" warnings in IPTV apps.
+        const key = await streamKey(movieUrl);
+        const token = await makeUrlToken({ u: movieUrl }, env);
+        const filename = `${xtreamMovieMatch[3]}.${xtreamMovieMatch[4]}`;
+        return withCors(new Response(null, {
+            status: 302,
+            headers: { location: `${publicBase(request, env)}/upseg/${key}/${token}/${filename}` },
+        }));
+    }
 
-  // ─── Xtream series episode: /series/{user}/{pass}/{episode_id}.{ext} ─────────
-  const xtreamSeriesMatch = path.match(/^\/series\/([^/]+)\/([^/]+)\/([0-9]+)\.([^/]+)$/);
-  if (xtreamSeriesMatch) {
-    await requireXtreamAuth(xtreamSeriesMatch[1], xtreamSeriesMatch[2]);
-    const episodeUrl = await findXtreamEpisodeUrl(xtreamSeriesMatch[3]);
-    if (!episodeUrl) throw new HttpError(404, "Episode not found — open the series in your app first to load episode data.");
-    // Proxy through our own /upseg/ endpoint — hides upstream credentials.
-    const key = await streamKey(episodeUrl);
-    const token = await makeUrlToken({ u: episodeUrl }, env);
-    const filename = `${xtreamSeriesMatch[3]}.${xtreamSeriesMatch[4]}`;
-    return withCors(new Response(null, {
-      status: 302,
-      headers: { location: `${publicBase(request, env)}/upseg/${key}/${token}/${filename}` },
-    }));
-  }
+    // ─── Xtream series episode: /series/{user}/{pass}/{episode_id}.{ext} ─────────
+    const xtreamSeriesMatch = path.match(/^\/series\/([^/]+)\/([^/]+)\/([0-9]+)\.([^/]+)$/);
+    if (xtreamSeriesMatch) {
+        await requireXtreamAuth(xtreamSeriesMatch[1], xtreamSeriesMatch[2]);
+        const episodeUrl = await findXtreamEpisodeUrl(xtreamSeriesMatch[3]);
+        if (!episodeUrl) throw new HttpError(404, "Episode not found — open the series in your app first to load episode data.");
+        // Proxy through our own /upseg/ endpoint — hides upstream credentials.
+        const key = await streamKey(episodeUrl);
+        const token = await makeUrlToken({ u: episodeUrl }, env);
+        const filename = `${xtreamSeriesMatch[3]}.${xtreamSeriesMatch[4]}`;
+        return withCors(new Response(null, {
+            status: 302,
+            headers: { location: `${publicBase(request, env)}/upseg/${key}/${token}/${filename}` },
+        }));
+    }
 
-  if (path === "/api/channels" || path === "/api/channels.json" || path === "/channels") {
-    const force = (url.searchParams.get("refresh") || "").toLowerCase();
-    const refresh = force === "1" || force === "true" || force === "yes";
-    return json(await channelsPayload(request, env, refresh));
-  }
+    if (path === "/api/channels" || path === "/api/channels.json" || path === "/channels") {
+        const force = (url.searchParams.get("refresh") || "").toLowerCase();
+        const refresh = force === "1" || force === "true" || force === "yes";
+        return json(await channelsPayload(request, env, refresh));
+    }
 
-  if (path === "/api/movies" || path === "/api/movies.json" || path === "/movies") {
-    const force = (url.searchParams.get("refresh") || "").toLowerCase();
-    const refresh = force === "1" || force === "true" || force === "yes";
-    return json(await moviesPayload(request, env, refresh));
-  }
+    if (path === "/api/movies" || path === "/api/movies.json" || path === "/movies") {
+        const force = (url.searchParams.get("refresh") || "").toLowerCase();
+        const refresh = force === "1" || force === "true" || force === "yes";
+        return json(await moviesPayload(request, env, refresh));
+    }
 
-  if (path === "/api/tvseries" || path === "/api/tvseries.json" || path === "/tvseries") {
-    const force = (url.searchParams.get("refresh") || "").toLowerCase();
-    const refresh = force === "1" || force === "true" || force === "yes";
-    return json(await tvSeriesPayload(request, env, refresh));
-  }
+    if (path === "/api/tvseries" || path === "/api/tvseries.json" || path === "/tvseries") {
+        const force = (url.searchParams.get("refresh") || "").toLowerCase();
+        const refresh = force === "1" || force === "true" || force === "yes";
+        return json(await tvSeriesPayload(request, env, refresh));
+    }
 
-  const directPlaylistMatch = path.match(/^\/(?:direct|source|playlist)\/([^/]+)\.m3u8$/);
-  if (directPlaylistMatch) return proxyDirectPlaylist(directPlaylistMatch[1], request, env, waitUntil);
+    const directPlaylistMatch = path.match(/^\/(?:direct|source|playlist)\/([^/]+)\.m3u8$/);
+    if (directPlaylistMatch) return proxyDirectPlaylist(directPlaylistMatch[1], request, env, waitUntil);
 
-  const liveMatch = path.match(/^\/(?:live|play)\/([a-f0-9]{20})\/index\.m3u8$/);
-  if (liveMatch) return proxyChannelPlaylist(liveMatch[1], request, env, waitUntil);
+    const liveMatch = path.match(/^\/(?:live|play)\/([a-f0-9]{20})\/index\.m3u8$/);
+    if (liveMatch) return proxyChannelPlaylist(liveMatch[1], request, env, waitUntil);
 
-  const nestedPlaylistMatch = path.match(/^\/(?:uplive|upstream-playlist)\/([a-f0-9]{20})\/([^/]+)\.m3u8$/);
-  if (nestedPlaylistMatch) return proxyNestedPlaylist(nestedPlaylistMatch[1], nestedPlaylistMatch[2], request, env, waitUntil);
+    const nestedPlaylistMatch = path.match(/^\/(?:uplive|upstream-playlist)\/([a-f0-9]{20})\/([^/]+)\.m3u8$/);
+    if (nestedPlaylistMatch) return proxyNestedPlaylist(nestedPlaylistMatch[1], nestedPlaylistMatch[2], request, env, waitUntil);
 
-  const segmentMatch = path.match(/^\/(?:upseg|upstream-segment)\/([a-f0-9]{20})\/([^/]+)\/([^/]+)$/);
-  if (segmentMatch) return proxySegment(segmentMatch[1], segmentMatch[2], segmentMatch[3], request, env);
+    const segmentMatch = path.match(/^\/(?:upseg|upstream-segment)\/([a-f0-9]{20})\/([^/]+)\/([^/]+)$/);
+    if (segmentMatch) return proxySegment(segmentMatch[1], segmentMatch[2], segmentMatch[3], request, env);
 
-  return json({ error: "Not found." }, 404);
+    return json({ error: "Not found." }, 404);
 }
 
 // Express server
@@ -2721,64 +2721,109 @@ const app = express();
 app.use(express.raw({ type: "*/*", limit: "64kb" }));
 
 async function pipeWebResponse(webResponse, res) {
-  res.status(webResponse.status);
-  webResponse.headers.forEach((value, key) => res.set(key, value));
+    res.status(webResponse.status);
+    webResponse.headers.forEach((value, key) => res.set(key, value));
 
-  if (webResponse.body) {
-    const reader = webResponse.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(Buffer.from(value));
+    if (webResponse.body) {
+        const reader = webResponse.body.getReader();
+        let finished = false;
+
+        const cleanup = () => {
+            if (!finished) {
+                finished = true;
+                reader.cancel().catch(() => {});
+            }
+        };
+
+        res.on("close", cleanup);
+        res.on("finish", cleanup);
+        res.on("error", cleanup);
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done || finished) break;
+                res.write(Buffer.from(value));
+            }
+        } catch (error) {
+            const isAborted = error?.name === "AbortError" || 
+                              error?.message?.includes("terminated") || 
+                              error?.code === "UND_ERR_SOCKET" ||
+                              error?.message?.includes("other side closed") ||
+                              error?.message?.includes("ECONNRESET");
+            if (isAborted) {
+                console.log(`[stream] Connection closed: ${error.message}`);
+            } else {
+                console.error("[stream] Error piping response:", error);
+            }
+        } finally {
+            finished = true;
+            res.off("close", cleanup);
+            res.off("finish", cleanup);
+            res.off("error", cleanup);
+            try {
+                await reader.cancel();
+            } catch {
+                // ignore
+            }
+            res.end();
+        }
+    } else {
+        res.end();
     }
-    res.end();
-  } else {
-    res.end();
-  }
 }
 
 app.use(async (req, res) => {
-  try {
-    const proto = (req.headers["x-forwarded-proto"] || "http").split(",")[0].trim();
-    const host = req.headers["x-forwarded-host"] || req.headers.host;
-    const fullUrl = `${proto}://${host}${req.originalUrl}`;
+    try {
+        const proto = (req.headers["x-forwarded-proto"] || "http").split(",")[0].trim();
+        const host = req.headers["x-forwarded-host"] || req.headers.host;
+        const fullUrl = `${proto}://${host}${req.originalUrl}`;
 
-    const headers = {};
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (typeof v === "string") headers[k] = v;
+        const headers = {};
+        for (const [k, v] of Object.entries(req.headers)) {
+            if (typeof v === "string") headers[k] = v;
+        }
+        const requestInit = { method: req.method, headers };
+        if (req.method !== "GET" && req.method !== "HEAD") {
+            requestInit.body = Buffer.isBuffer(req.body) ? req.body : undefined;
+            requestInit.duplex = "half";
+        }
+        const webRequest = new Request(fullUrl, requestInit);
+
+        const waitUntil = (promise) => promise.catch((err) => console.error("Background task error:", err));
+
+        const webResponse = await handleRequest(webRequest, process.env, waitUntil);
+
+        if (webResponse.status >= 300 && webResponse.status < 400) {
+            return res.redirect(webResponse.status, webResponse.headers.get("location") || "/");
+        }
+
+        await pipeWebResponse(webResponse, res);
+    } catch (error) {
+        const status = error instanceof HttpError ? error.status : 500;
+        const message = error instanceof HttpError ? error.message : "Unexpected error.";
+        const isAborted = error?.name === "AbortError" || 
+                          error?.message?.includes("terminated") || 
+                          error?.code === "UND_ERR_SOCKET" ||
+                          error?.message?.includes("other side closed") ||
+                          error?.message?.includes("ECONNRESET");
+        if (isAborted) {
+            console.warn(`Request closed or failed due to network: ${error.message}`);
+        } else {
+            console.error("Request failed:", error);
+        }
+        if (!res.headersSent) {
+            res.status(status).json({ error: message });
+        }
     }
-    const requestInit = { method: req.method, headers };
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      requestInit.body = Buffer.isBuffer(req.body) ? req.body : undefined;
-      requestInit.duplex = "half";
-    }
-    const webRequest = new Request(fullUrl, requestInit);
-
-    const waitUntil = (promise) => promise.catch((err) => console.error("Background task error:", err));
-
-    const webResponse = await handleRequest(webRequest, process.env, waitUntil);
-
-    if (webResponse.status >= 300 && webResponse.status < 400) {
-      return res.redirect(webResponse.status, webResponse.headers.get("location") || "/");
-    }
-
-    await pipeWebResponse(webResponse, res);
-  } catch (error) {
-    const status = error instanceof HttpError ? error.status : 500;
-    const message = error instanceof HttpError ? error.message : "Unexpected error.";
-    console.error("Request failed:", error);
-    if (!res.headersSent) {
-      res.status(status).json({ error: message });
-    }
-  }
 });
 
 // Safety nets — keep the process alive even if something unexpected slips through
 process.on("unhandledRejection", (reason) => {
-  console.error("[unhandledRejection]", reason);
+    console.error("[unhandledRejection]", reason);
 });
 process.on("uncaughtException", (err) => {
-  console.error("[uncaughtException]", err);
+    console.error("[uncaughtException]", err);
 });
 
 const PORT = process.env.PORT || 7860;
@@ -2786,37 +2831,37 @@ const PORT = process.env.PORT || 7860;
 // Pre-warm caches from disk on startup so the very first /api/channels request
 // is instant. Then kick off a live refresh in the background.
 async function prewarmCaches() {
-  const env = process.env;
+    const env = process.env;
 
-  // 1. Load channel cache from disk
-  const diskChannels = await loadDiskCache(CHANNEL_DISK_CACHE_FILE);
-  if (diskChannels && Array.isArray(diskChannels.channels) && diskChannels.channels.length > 0) {
-    channelCache.at = diskChannels.at || 0;
-    channelCache.channels = diskChannels.channels;
-    if (Array.isArray(diskChannels.streamIndex)) {
-      for (const [k, v] of diskChannels.streamIndex) streamIndex.set(k, v);
+    // 1. Load channel cache from disk
+    const diskChannels = await loadDiskCache(CHANNEL_DISK_CACHE_FILE);
+    if (diskChannels && Array.isArray(diskChannels.channels) && diskChannels.channels.length > 0) {
+        channelCache.at = diskChannels.at || 0;
+        channelCache.channels = diskChannels.channels;
+        if (Array.isArray(diskChannels.streamIndex)) {
+            for (const [k, v] of diskChannels.streamIndex) streamIndex.set(k, v);
+        }
+        console.log(`[cache] channels restored from disk: ${channelCache.channels.length} channels (age ${Math.round((Date.now() - channelCache.at) / 1000)}s)`);
     }
-    console.log(`[cache] channels restored from disk: ${channelCache.channels.length} channels (age ${Math.round((Date.now() - channelCache.at) / 1000)}s)`);
-  }
 
-  // 2. Load playlist channel cache from disk
-  const diskPlaylist = await loadDiskCache(PLAYLIST_DISK_CACHE_FILE);
-  if (diskPlaylist && Array.isArray(diskPlaylist.channels) && diskPlaylist.channels.length > 0) {
-    playlistChannelCache.at = diskPlaylist.at || 0;
-    playlistChannelCache.channels = diskPlaylist.channels;
-    if (Array.isArray(diskPlaylist.streamIndex)) {
-      for (const [k, v] of diskPlaylist.streamIndex) streamIndex.set(k, v);
+    // 2. Load playlist channel cache from disk
+    const diskPlaylist = await loadDiskCache(PLAYLIST_DISK_CACHE_FILE);
+    if (diskPlaylist && Array.isArray(diskPlaylist.channels) && diskPlaylist.channels.length > 0) {
+        playlistChannelCache.at = diskPlaylist.at || 0;
+        playlistChannelCache.channels = diskPlaylist.channels;
+        if (Array.isArray(diskPlaylist.streamIndex)) {
+            for (const [k, v] of diskPlaylist.streamIndex) streamIndex.set(k, v);
+        }
+        console.log(`[cache] playlist channels restored from disk: ${playlistChannelCache.channels.length} channels`);
     }
-    console.log(`[cache] playlist channels restored from disk: ${playlistChannelCache.channels.length} channels`);
-  }
 
-  // 3. Kick off live refresh in background (don't block startup)
-  void doRefreshChannels(env).catch((err) => console.warn("[cache] background channel refresh failed:", err?.message));
-  void doRefreshPlaylistChannels(env).catch((err) => console.warn("[cache] background playlist refresh failed:", err?.message));
+    // 3. Kick off live refresh in background (don't block startup)
+    void doRefreshChannels(env).catch((err) => console.warn("[cache] background channel refresh failed:", err?.message));
+    void doRefreshPlaylistChannels(env).catch((err) => console.warn("[cache] background playlist refresh failed:", err?.message));
 }
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`running on port ${PORT}`);
-  console.log(`Public base: ${process.env.WORKER_PUBLIC_BASE || "(auto from request)"}`);
-  void prewarmCaches();
+    console.log(`running on port ${PORT}`);
+    console.log(`Public base: ${process.env.WORKER_PUBLIC_BASE || "(auto from request)"}`);
+    void prewarmCaches();
 });
