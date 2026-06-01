@@ -9,6 +9,7 @@ import path from "path";
 import { spawn } from "child_process";
 import { Readable } from "stream";
 import express from "express";
+import ffmpegStatic from "ffmpeg-static";
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
@@ -2236,7 +2237,7 @@ function resegmentIdleMs(env) {
 }
 
 function ffmpegPath(env) {
-    return envString(env, "FFMPEG_PATH", "ffmpeg") || "ffmpeg";
+    return envString(env, "FFMPEG_PATH", ffmpegStatic || "/usr/bin/ffmpeg") || ffmpegStatic || "/usr/bin/ffmpeg";
 }
 
 function useHlsResegmenter(env) {
@@ -2345,9 +2346,10 @@ function buildFfmpegHlsArgs(inputUrl, outputDir, env, referer) {
     return { args, playlistPath };
 }
 
-async function waitForFile(filePath, timeoutMs) {
+async function waitForFile(filePath, timeoutMs, entry = null) {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
+        if (entry?.exitedAt) return false;
         try {
             const stat = await fs.stat(filePath);
             if (stat.size > 0) return true;
@@ -2418,8 +2420,12 @@ async function ensureResegmentSession(key, sourceUrl, request, env) {
     });
 
     const timeoutMs = Math.max(3000, envInt(env, "HLS_RESEGMENT_START_TIMEOUT_MS", 6000));
-    const ready = await waitForFile(playlistPath, timeoutMs);
+    const ready = await waitForFile(playlistPath, timeoutMs, entry);
     if (!ready) {
+        const missingFfmpeg = entry.exitCode === -1 && /ENOENT|not found/i.test(entry.lastLog);
+        if (missingFfmpeg) {
+            throw new HttpError(500, `${ffmpegPath(env)} is not installed or not on PATH. On Hugging Face Spaces, keep packages.txt with "ffmpeg" and rebuild the Space, or set FFMPEG_PATH to the ffmpeg binary.`);
+        }
         const detail = entry.exitedAt ? ` ffmpeg exited with code ${entry.exitCode}.` : "";
         const log = entry.lastLog ? ` ${entry.lastLog.split(/\r?\n/).filter(Boolean).slice(-2).join(" ")}` : "";
         throw new HttpError(504, `${seconds}-second HLS resegmenter did not produce a playlist in time.${detail}${log}`);
