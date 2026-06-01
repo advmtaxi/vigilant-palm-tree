@@ -4,6 +4,7 @@
 import { webcrypto } from "crypto";
 import fs from "fs/promises";
 import express from "express";
+import { Readable } from "stream"; // Added for native backpressure and memory optimization
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
@@ -2306,6 +2307,10 @@ async function proxySegment(key, token, filename, request, env) {
     const headers = new Headers(upstream.headers);
     headers.set("cache-control", `public, max-age=${ttlSeconds}, s-maxage=${ttlSeconds}, stale-while-revalidate=15`);
     if (!headers.has("content-type")) headers.set("content-type", mediaTypeForPath(filename));
+    
+    // Explicitly declare partial content support here
+    headers.set("accept-ranges", "bytes");
+
     headers.set("access-control-allow-origin", "*");
     headers.set("access-control-allow-methods", "GET,HEAD,OPTIONS");
     headers.set("access-control-allow-headers", "*");
@@ -2728,51 +2733,40 @@ app.use(express.raw({ type: "*/*", limit: "64kb" }));
 async function pipeWebResponse(webResponse, res) {
     res.status(webResponse.status);
     webResponse.headers.forEach((value, key) => res.set(key, value));
+    
+    // Force Express to send headers immediately so the player doesn't sit pending
+    res.flushHeaders();
 
     if (webResponse.body) {
-        const reader = webResponse.body.getReader();
-        let finished = false;
+        // Convert the Web Stream to a Node Stream for hardware-optimized piping
+        const nodeStream = Readable.fromWeb(webResponse.body);
 
+        let finished = false;
         const cleanup = () => {
             if (!finished) {
                 finished = true;
-                reader.cancel().catch(() => {});
+                if (!nodeStream.destroyed) nodeStream.destroy();
             }
         };
 
         res.on("close", cleanup);
         res.on("finish", cleanup);
         res.on("error", cleanup);
-
-        try {
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done || finished) break;
-                res.write(Buffer.from(value));
-            }
-        } catch (error) {
+        
+        nodeStream.on("error", (error) => {
             const isAborted = error?.name === "AbortError" || 
-                              error?.message?.includes("terminated") || 
                               error?.code === "UND_ERR_SOCKET" ||
-                              error?.message?.includes("other side closed") ||
                               error?.message?.includes("ECONNRESET");
-            if (isAborted) {
-                console.log(`[stream] Connection closed: ${error.message}`);
-            } else {
-                console.error("[stream] Error piping response:", error);
+            if (!isAborted) {
+                console.error("[stream] Upstream read error:", error.message);
             }
-        } finally {
-            finished = true;
-            res.off("close", cleanup);
-            res.off("finish", cleanup);
-            res.off("error", cleanup);
-            try {
-                await reader.cancel();
-            } catch {
-                // ignore
-            }
+            cleanup();
             res.end();
-        }
+        });
+
+        // Pipe directly to the client. This implements native backpressure,
+        // instantly reducing memory bloat and latency.
+        nodeStream.pipe(res);
     } else {
         res.end();
     }
