@@ -3,13 +3,7 @@
 
 import { webcrypto } from "crypto";
 import fs from "fs/promises";
-import { createReadStream } from "fs";
-import os from "os";
-import path from "path";
-import { spawn } from "child_process";
-import { Readable } from "stream";
 import express from "express";
-import ffmpegStatic from "ffmpeg-static";
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
@@ -64,14 +58,12 @@ const upstreamHlsCache = new Map();
 const livePlaylistCache = new Map();
 const generatedPlaylistCache = new Map();
 const hmacKeyCache = new Map();
-const resegmentSessions = new Map();
 const upstreamHlsInflight = new Map();
 const livePlaylistInflight = new Map();
 const xtreamCatalogCache = new Map();
 const xtreamCatalogInflight = new Map();
 let channelLoadPromise = null;
 let playlistChannelLoadPromise = null;
-let lastResegmentCleanup = 0;
 
 // Disk-persist cache paths (loaded on startup so first request is always instant)
 const CHANNEL_DISK_CACHE_FILE = process.env.CHANNEL_DISK_CACHE_FILE || "channel-cache.json";
@@ -81,11 +73,6 @@ const MAX_UPSTREAM_HLS_CACHE_ENTRIES = 500;
 const MAX_LIVE_PLAYLIST_CACHE_ENTRIES = 500;
 const MAX_XTREAM_CATALOG_CACHE_ENTRIES = 100;
 const MAX_GENERATED_PLAYLIST_CACHE_ENTRIES = 200;
-const DEFAULT_HLS_SEGMENT_SECONDS = 1;
-const DEFAULT_LIVE_WINDOW_SEGMENTS = 1;
-const DEFAULT_LIVE_PLAYLIST_CACHE_MS = 0;
-const DEFAULT_LIVE_PLAYLIST_STALE_MS = 0;
-const DEFAULT_SEGMENT_CACHE_SECONDS = 6;
 
 const ACCESS_DURATION_MONTHS = {
     "1m": 1,
@@ -174,12 +161,9 @@ function playlistResponse(body) {
             headers: {
                 "content-type": "application/x-mpegURL; charset=utf-8",
                 "cache-control": "no-store, no-cache, max-age=0, must-revalidate",
-                "cdn-cache-control": "no-store",
-                "surrogate-control": "no-store",
                 pragma: "no-cache",
                 expires: "0",
                 "content-disposition": "inline",
-                "x-accel-buffering": "no",
             },
         }),
     );
@@ -2072,32 +2056,11 @@ function parseTargetDuration(text) {
     return Math.max(1, measured || declared || 6);
 }
 
-function hlsSegmentSeconds(env) {
-    return Math.max(1, envInt(env, "HLS_SEGMENT_SECONDS", envInt(env, "UPSTREAM_TARGET_DURATION", DEFAULT_HLS_SEGMENT_SECONDS)));
-}
-
-function rewriteExtinfDuration(line, seconds) {
-    const duration = Number.isInteger(seconds) ? `${seconds}.000` : seconds.toFixed(3);
-    return line.replace(/^#EXTINF:[^,]*/, `#EXTINF:${duration}`);
-}
-
-function livePlaylistCacheMs(env) {
-    return Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", DEFAULT_LIVE_PLAYLIST_CACHE_MS));
-}
-
-function livePlaylistStaleMs(env) {
-    return Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", DEFAULT_LIVE_PLAYLIST_STALE_MS));
-}
-
-function shouldStoreLivePlaylist(env) {
-    return livePlaylistCacheMs(env) > 0 || livePlaylistStaleMs(env) > 0;
-}
-
 function trimLivePlaylistText(text, env) {
-    const configuredKeepSegments = envInt(env, "LIVE_WINDOW_SEGMENTS", DEFAULT_LIVE_WINDOW_SEGMENTS);
+    const configuredKeepSegments = envInt(env, "LIVE_WINDOW_SEGMENTS", 0);
     if (configuredKeepSegments <= 0 || !/#EXTINF:/m.test(text)) return text;
 
-    const keepSegments = Math.max(1, configuredKeepSegments);
+    const keepSegments = Math.max(2, configuredKeepSegments);
     const lines = text.split(/\r?\n/);
     const header = [], footer = [], segments = [];
     let pending = [], seenFirstSegment = false, mediaSequence = null, mediaSequenceIndex = -1;
@@ -2165,13 +2128,13 @@ async function rewriteUriAttributes(line, key, playlistUrl, request, env) {
 
 async function rewriteUpstreamPlaylist(text, playlistUrl, request, env, key) {
     const trimmedText = trimLivePlaylistText(text, env);
-    const targetDuration = hlsSegmentSeconds(env);
+    const configuredTarget = envInt(env, "UPSTREAM_TARGET_DURATION", 0);
+    const measuredTarget = parseTargetDuration(trimmedText);
+    const targetDuration = configuredTarget > 0 ? Math.min(Math.max(1, configuredTarget), measuredTarget) : measuredTarget;
     const startOffsetSegments = Math.max(0, envInt(env, "LIVE_START_OFFSET_SEGMENTS", 0));
     const startOffsetSeconds = Math.max(1, targetDuration * startOffsetSegments);
     const isMediaPlaylist = /#EXTINF:/m.test(trimmedText) || /#EXT-X-PART:/m.test(trimmedText);
     let insertedStart = false;
-    let insertedTargetDuration = false;
-    let insertedAllowCache = false;
     const lines = [];
 
     for (const rawLine of trimmedText.split(/\r?\n/)) {
@@ -2179,22 +2142,14 @@ async function rewriteUpstreamPlaylist(text, playlistUrl, request, env, key) {
         if (!line) { lines.push(rawLine); continue; }
         if (line.startsWith("#EXTM3U")) {
             lines.push(rawLine);
-            if (isMediaPlaylist && !insertedTargetDuration) {
-                lines.push(`#EXT-X-TARGETDURATION:${targetDuration}`);
-                insertedTargetDuration = true;
-            }
-            if (isMediaPlaylist && !insertedAllowCache) {
-                lines.push("#EXT-X-ALLOW-CACHE:NO");
-                insertedAllowCache = true;
-            }
             if (isMediaPlaylist && !insertedStart && startOffsetSegments > 0) {
                 lines.push(`#EXT-X-START:TIME-OFFSET=-${startOffsetSeconds},PRECISE=YES`);
                 insertedStart = true;
             }
             continue;
         }
-        if (line.startsWith("#EXT-X-TARGETDURATION")) { continue; }
-        if (line.startsWith("#EXT-X-ALLOW-CACHE")) { continue; }
+        if (line.startsWith("#EXT-X-TARGETDURATION")) { lines.push(`#EXT-X-TARGETDURATION:${targetDuration}`); continue; }
+        if (line.startsWith("#EXT-X-ALLOW-CACHE")) { lines.push("#EXT-X-ALLOW-CACHE:NO"); continue; }
         if (line.startsWith("#EXT-X-START")) {
             if (isMediaPlaylist && !insertedStart && startOffsetSegments > 0) {
                 lines.push(`#EXT-X-START:TIME-OFFSET=-${startOffsetSeconds},PRECISE=YES`);
@@ -2202,7 +2157,6 @@ async function rewriteUpstreamPlaylist(text, playlistUrl, request, env, key) {
             }
             continue;
         }
-        if (line.startsWith("#EXTINF")) { lines.push(rewriteExtinfDuration(rawLine, targetDuration)); continue; }
         if (line.startsWith("#")) { lines.push(await rewriteUriAttributes(rawLine, key, playlistUrl, request, env)); continue; }
         lines.push(await upstreamAssetUrl(key, new URL(line, playlistUrl).toString(), request, env, playlistUrl));
     }
@@ -2221,316 +2175,6 @@ function mediaTypeForPath(path) {
     if (lower.endsWith(".aac")) return "audio/aac";
     if (lower.endsWith(".m4a")) return "audio/mp4";
     return "application/octet-stream";
-}
-
-function resegmentRoot(env) {
-    return envString(env, "HLS_RESEGMENT_DIR", path.join(os.tmpdir(), "hls-resegment"));
-}
-
-function resegmentMode(env) {
-    const mode = envString(env, "HLS_RESEGMENT_MODE", "encode").toLowerCase();
-    return mode === "copy" ? "copy" : "encode";
-}
-
-function resegmentIdleMs(env) {
-    return Math.max(10, envInt(env, "HLS_RESEGMENT_IDLE_SECONDS", 60)) * 1000;
-}
-
-function ffmpegPath(env) {
-    return envString(env, "FFMPEG_PATH", ffmpegStatic || "/usr/bin/ffmpeg") || ffmpegStatic || "/usr/bin/ffmpeg";
-}
-
-function useHlsResegmenter(env) {
-    return envBool(env, "HLS_RESEGMENT_ENABLED", true);
-}
-
-function safeHlsFilename(filename) {
-    return /^[A-Za-z0-9._-]+\.ts$/.test(filename);
-}
-
-function resolvedInside(baseDir, filename) {
-    const resolvedBase = path.resolve(baseDir);
-    const resolvedFile = path.resolve(baseDir, filename);
-    return resolvedFile.startsWith(`${resolvedBase}${path.sep}`) ? resolvedFile : null;
-}
-
-function parseByteRange(rangeHeader, size) {
-    const match = String(rangeHeader || "").match(/^bytes=(\d*)-(\d*)$/);
-    if (!match) return null;
-    let start;
-    let end;
-    if (match[1] === "" && match[2] === "") return null;
-    if (match[1] === "") {
-        const suffixLength = Number.parseInt(match[2], 10);
-        if (!Number.isFinite(suffixLength) || suffixLength <= 0) return null;
-        start = Math.max(0, size - suffixLength);
-        end = size - 1;
-    } else {
-        start = Number.parseInt(match[1], 10);
-        end = match[2] === "" ? size - 1 : Number.parseInt(match[2], 10);
-    }
-    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= size) return null;
-    return { start, end: Math.min(end, size - 1) };
-}
-
-async function stopResegmentSession(entry) {
-    if (!entry) return;
-    if (entry.process && !entry.process.killed) {
-        entry.process.kill("SIGTERM");
-        setTimeout(() => {
-            if (entry.process && !entry.process.killed) entry.process.kill("SIGKILL");
-        }, 2000).unref?.();
-    }
-    await fs.rm(entry.dir, { recursive: true, force: true }).catch(() => {});
-}
-
-async function cleanupResegmentSessions(env) {
-    const now = Date.now();
-    if (now - lastResegmentCleanup < 5000) return;
-    lastResegmentCleanup = now;
-    const idleMs = resegmentIdleMs(env);
-    for (const [key, entry] of resegmentSessions) {
-        if (now - entry.lastAccess <= idleMs) continue;
-        resegmentSessions.delete(key);
-        void stopResegmentSession(entry);
-    }
-}
-
-function buildFfmpegHlsArgs(inputUrl, outputDir, env, referer) {
-    const seconds = hlsSegmentSeconds(env);
-    const listSize = Math.max(1, envInt(env, "LIVE_WINDOW_SEGMENTS", DEFAULT_LIVE_WINDOW_SEGMENTS));
-    const mode = resegmentMode(env);
-    const segmentPattern = path.join(outputDir, "seg_%09d.ts");
-    const playlistPath = path.join(outputDir, "index.m3u8");
-    const args = [
-        "-hide_banner",
-        "-loglevel", envString(env, "FFMPEG_LOGLEVEL", "warning") || "warning",
-        "-nostdin",
-        "-fflags", "nobuffer",
-        "-flags", "low_delay",
-        "-rw_timeout", String(Math.max(5, envInt(env, "HLS_RESEGMENT_RW_TIMEOUT_SECONDS", 15)) * 1000000),
-        "-user_agent", envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
-    ];
-    if (referer) args.push("-headers", `Referer: ${referer}\r\n`);
-    args.push("-i", inputUrl, "-map", "0:v:0?", "-map", "0:a:0?");
-
-    if (mode === "copy") {
-        args.push("-c", "copy", "-avoid_negative_ts", "make_zero");
-    } else {
-        const crf = Math.max(18, Math.min(35, envInt(env, "HLS_RESEGMENT_CRF", 28)));
-        const audioKbps = Math.max(64, Math.min(192, envInt(env, "HLS_RESEGMENT_AUDIO_KBPS", 128)));
-        args.push(
-            "-c:v", "libx264",
-            "-preset", envString(env, "HLS_RESEGMENT_PRESET", "ultrafast") || "ultrafast",
-            "-tune", "zerolatency",
-            "-crf", String(crf),
-            "-force_key_frames", `expr:gte(t,n_forced*${seconds})`,
-            "-sc_threshold", "0",
-            "-c:a", "aac",
-            "-b:a", `${audioKbps}k`,
-            "-ac", "2",
-        );
-    }
-
-    args.push(
-        ...(envBool(env, "HLS_LOW_LATENCY", true) ? ["-lhls", "1"] : []),
-        "-f", "hls",
-        "-hls_time", String(seconds),
-        "-hls_init_time", String(seconds),
-        "-hls_list_size", String(listSize),
-        "-hls_delete_threshold", "1",
-        "-hls_flags", "delete_segments+omit_endlist+independent_segments+program_date_time",
-        "-hls_segment_filename", segmentPattern,
-        playlistPath,
-    );
-    return { args, playlistPath };
-}
-
-async function waitForFile(filePath, timeoutMs, entry = null) {
-    const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
-        if (entry?.exitedAt) return false;
-        try {
-            const stat = await fs.stat(filePath);
-            if (stat.size > 0) return true;
-        } catch {
-            // keep polling until ffmpeg writes the first live segment
-        }
-        await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-    return false;
-}
-
-async function ensureResegmentSession(key, sourceUrl, request, env) {
-    validateKey(key);
-    await cleanupResegmentSessions(env);
-    const upstream = envBool(env, "HLS_RESEGMENT_DISCOVER_UPSTREAM", false)
-        ? await findUpstreamHls(key, sourceUrl, env)
-        : null;
-    const inputUrl = upstream?.url || sourceUrl;
-
-    const seconds = hlsSegmentSeconds(env);
-    const mode = resegmentMode(env);
-    const existing = resegmentSessions.get(key);
-    if (existing && existing.inputUrl === inputUrl && existing.seconds === seconds && existing.mode === mode && !existing.exitedAt) {
-        existing.lastAccess = Date.now();
-        return existing;
-    }
-
-    if (existing) {
-        resegmentSessions.delete(key);
-        await stopResegmentSession(existing);
-    }
-
-    const dir = path.join(resegmentRoot(env), key);
-    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
-    await fs.mkdir(dir, { recursive: true });
-
-    const { args, playlistPath } = buildFfmpegHlsArgs(inputUrl, dir, env, inputUrl);
-    const child = spawn(ffmpegPath(env), args, { stdio: ["ignore", "ignore", "pipe"] });
-    const entry = {
-        key,
-        sourceUrl,
-        inputUrl,
-        dir,
-        playlistPath,
-        process: child,
-        startedAt: Date.now(),
-        lastAccess: Date.now(),
-        seconds,
-        mode,
-        lastLog: "",
-        exitedAt: 0,
-        exitCode: null,
-    };
-    resegmentSessions.set(key, entry);
-
-    child.stderr.on("data", (chunk) => {
-        const text = chunk.toString();
-        entry.lastLog = (entry.lastLog + text).slice(-2000);
-    });
-    child.on("error", (error) => {
-        entry.exitedAt = Date.now();
-        entry.exitCode = -1;
-        entry.lastLog = `${entry.lastLog}\n${error.message}`.slice(-2000);
-    });
-    child.on("exit", (code) => {
-        entry.exitedAt = Date.now();
-        entry.exitCode = code;
-    });
-
-    const timeoutMs = Math.max(3000, envInt(env, "HLS_RESEGMENT_START_TIMEOUT_MS", 6000));
-    const ready = await waitForFile(playlistPath, timeoutMs, entry);
-    if (!ready) {
-        const missingFfmpeg = entry.exitCode === -1 && /ENOENT|not found/i.test(entry.lastLog);
-        if (missingFfmpeg) {
-            throw new HttpError(500, `${ffmpegPath(env)} is not installed or not on PATH. On Hugging Face Spaces, keep packages.txt with "ffmpeg" and rebuild the Space, or set FFMPEG_PATH to the ffmpeg binary.`);
-        }
-        const detail = entry.exitedAt ? ` ffmpeg exited with code ${entry.exitCode}.` : "";
-        const log = entry.lastLog ? ` ${entry.lastLog.split(/\r?\n/).filter(Boolean).slice(-2).join(" ")}` : "";
-        throw new HttpError(504, `${seconds}-second HLS resegmenter did not produce a playlist in time.${detail}${log}`);
-    }
-    return entry;
-}
-
-function rewriteResegmentedPlaylist(text, key, request, env) {
-    const base = streamBase(request, env);
-    const seconds = hlsSegmentSeconds(env);
-    const segmentUrl = (filename) => `${base}/rseg/${key}/${encodeURIComponent(filename)}`;
-    let insertedTargetDuration = false;
-    let insertedAllowCache = false;
-    const lines = [];
-
-    for (const rawLine of text.split(/\r?\n/)) {
-        const line = rawLine.trim();
-        if (!line) continue;
-        if (line.startsWith("#EXTM3U")) {
-            lines.push(rawLine);
-            lines.push(`#EXT-X-TARGETDURATION:${seconds}`);
-            lines.push("#EXT-X-ALLOW-CACHE:NO");
-            insertedTargetDuration = true;
-            insertedAllowCache = true;
-            continue;
-        }
-        if (line.startsWith("#EXT-X-TARGETDURATION")) {
-            if (!insertedTargetDuration) {
-                lines.push(`#EXT-X-TARGETDURATION:${seconds}`);
-                insertedTargetDuration = true;
-            }
-            continue;
-        }
-        if (line.startsWith("#EXT-X-ALLOW-CACHE")) {
-            if (!insertedAllowCache) {
-                lines.push("#EXT-X-ALLOW-CACHE:NO");
-                insertedAllowCache = true;
-            }
-            continue;
-        }
-        if (line.startsWith("#EXTINF")) { lines.push(rewriteExtinfDuration(rawLine, seconds)); continue; }
-        if (line.startsWith("#EXT-X-PREFETCH:")) {
-            const filename = line.slice("#EXT-X-PREFETCH:".length).trim();
-            lines.push(`#EXT-X-PREFETCH:${segmentUrl(filename)}`);
-            continue;
-        }
-        if (line.includes('URI="')) {
-            lines.push(rawLine.replace(/URI="([^"]+)"/g, (_, filename) => `URI="${safeHlsFilename(filename) ? segmentUrl(filename) : filename}"`));
-            continue;
-        }
-        if (line.startsWith("#")) { lines.push(rawLine); continue; }
-        lines.push(segmentUrl(line));
-    }
-    return `${lines.join("\n")}\n`;
-}
-
-async function proxyResegmentedPlaylist(key, sourceUrl, request, env) {
-    const entry = await ensureResegmentSession(key, sourceUrl, request, env);
-    entry.lastAccess = Date.now();
-    const text = await fs.readFile(entry.playlistPath, "utf8");
-    return playlistResponse(rewriteResegmentedPlaylist(text, key, request, env));
-}
-
-async function proxyResegmentedSegment(key, filename, request, env) {
-    validateKey(key);
-    await cleanupResegmentSessions(env);
-    const entry = resegmentSessions.get(key);
-    if (!entry) throw new HttpError(404, "Resegmented live session is not active.");
-    entry.lastAccess = Date.now();
-    if (!safeHlsFilename(filename)) throw new HttpError(400, "Invalid segment filename.");
-    const filePath = resolvedInside(entry.dir, filename);
-    if (!filePath) throw new HttpError(400, "Invalid segment filename.");
-    let stat;
-    try {
-        stat = await fs.stat(filePath);
-    } catch {
-        throw new HttpError(404, "Segment expired.");
-    }
-    const ttlSeconds = Math.max(1, envInt(env, "SEGMENT_CACHE_SECONDS", DEFAULT_SEGMENT_CACHE_SECONDS));
-    const headers = new Headers({
-        "content-type": mediaTypeForPath(filename),
-        "content-length": String(stat.size),
-        "cache-control": `public, max-age=${ttlSeconds}, s-maxage=${ttlSeconds}`,
-        "accept-ranges": "bytes",
-        "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET,HEAD,OPTIONS",
-        "access-control-allow-headers": "*",
-        "access-control-expose-headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
-        "x-content-type-options": "nosniff",
-        "x-accel-buffering": "no",
-    });
-    const range = parseByteRange(request.headers.get("range"), stat.size);
-    if (request.headers.get("range") && !range) {
-        headers.set("content-range", `bytes */${stat.size}`);
-        headers.delete("content-length");
-        return new Response(null, { status: 416, headers });
-    }
-    if (range) {
-        headers.set("content-range", `bytes ${range.start}-${range.end}/${stat.size}`);
-        headers.set("content-length", String(range.end - range.start + 1));
-        if (request.method === "HEAD") return new Response(null, { status: 206, headers });
-        return new Response(Readable.toWeb(createReadStream(filePath, { start: range.start, end: range.end })), { status: 206, headers });
-    }
-    if (request.method === "HEAD") return new Response(null, { headers });
-    return new Response(Readable.toWeb(createReadStream(filePath)), { headers });
 }
 
 async function fetchUpstreamAsset(url, referer, env, ttlSeconds, request) {
@@ -2561,7 +2205,7 @@ function extractPrefetchSegmentUrls(text, playlistUrl, env, limit) {
 }
 
 async function prefetchSegments(segmentUrls, referer, env) {
-    const ttlSeconds = envInt(env, "SEGMENT_CACHE_SECONDS", DEFAULT_SEGMENT_CACHE_SECONDS);
+    const ttlSeconds = envInt(env, "SEGMENT_CACHE_SECONDS", 30);
     await Promise.all(segmentUrls.map((url) => fetchUpstreamAsset(url, referer, env, ttlSeconds, null)));
 }
 
@@ -2574,9 +2218,7 @@ async function buildLivePlaylistBody(key, sourceUrl, request, env, waitUntil, ca
         const body = await rewriteUpstreamPlaylist(upstream.text, upstream.url, request, env, key);
         const prefetchCount = Math.max(0, envInt(env, "PREFETCH_SEGMENTS", 0));
         const segmentUrls = extractPrefetchSegmentUrls(upstream.text, upstream.url, env, prefetchCount);
-        if (shouldStoreLivePlaylist(env)) {
-            rememberMapEntry(livePlaylistCache, cacheKey, { at: Date.now(), body }, MAX_LIVE_PLAYLIST_CACHE_ENTRIES);
-        }
+        rememberMapEntry(livePlaylistCache, cacheKey, { at: Date.now(), body }, MAX_LIVE_PLAYLIST_CACHE_ENTRIES);
         if (segmentUrls.length > 0) waitUntil(prefetchSegments(segmentUrls, upstream.url, env));
         return body;
     });
@@ -2584,8 +2226,8 @@ async function buildLivePlaylistBody(key, sourceUrl, request, env, waitUntil, ca
 
 async function proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, cacheKey) {
     const now = Date.now();
-    const freshMs = livePlaylistCacheMs(env);
-    const staleMs = livePlaylistStaleMs(env);
+    const freshMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", 2000));
+    const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 0));
     const cached = livePlaylistCache.get(cacheKey);
     if (cached && now - cached.at < freshMs) return playlistResponse(cached.body);
     try {
@@ -2602,11 +2244,9 @@ async function proxyChannelPlaylist(key, request, env, waitUntil) {
     const srcToken = requestUrl.searchParams.get("src");
     if (srcToken) {
         const tokenData = await readUrlToken(srcToken, env);
-        if (useHlsResegmenter(env)) return proxyResegmentedPlaylist(key, tokenData.u, request, env);
         return proxyLiveFromSource(key, tokenData.u, request, env, waitUntil, `live:${key}:${srcToken}`);
     }
     const channel = await getStreamForKey(key, env);
-    if (useHlsResegmenter(env)) return proxyResegmentedPlaylist(key, channel.sourceUrl, request, env);
     return proxyLiveFromSource(key, channel.sourceUrl, request, env, waitUntil, `live:${key}`);
 }
 
@@ -2614,7 +2254,6 @@ async function proxyDirectPlaylist(token, request, env, waitUntil) {
     const tokenData = await readUrlToken(token, env);
     const sourceUrl = tokenData.u;
     const key = await streamKey(sourceUrl);
-    if (useHlsResegmenter(env)) return proxyResegmentedPlaylist(key, sourceUrl, request, env);
     return proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, `direct:${key}`);
 }
 
@@ -2625,9 +2264,7 @@ async function buildNestedPlaylistBody(key, tokenData, request, env, waitUntil, 
         const body = await rewriteUpstreamPlaylist(fetched.text, fetched.finalUrl, request, env, key);
         const prefetchCount = Math.max(0, envInt(env, "PREFETCH_SEGMENTS", 0));
         const segmentUrls = extractPrefetchSegmentUrls(fetched.text, fetched.finalUrl, env, prefetchCount);
-        if (shouldStoreLivePlaylist(env)) {
-            rememberMapEntry(livePlaylistCache, cacheKey, { at: Date.now(), body }, MAX_LIVE_PLAYLIST_CACHE_ENTRIES);
-        }
+        rememberMapEntry(livePlaylistCache, cacheKey, { at: Date.now(), body }, MAX_LIVE_PLAYLIST_CACHE_ENTRIES);
         if (segmentUrls.length > 0) waitUntil(prefetchSegments(segmentUrls, fetched.finalUrl, env));
         return body;
     });
@@ -2638,8 +2275,8 @@ async function proxyNestedPlaylist(key, token, request, env, waitUntil) {
     const tokenData = await readUrlToken(token, env);
     const cacheKey = `uplive:${key}:${tokenData.u}`;
     const now = Date.now();
-    const freshMs = livePlaylistCacheMs(env);
-    const staleMs = livePlaylistStaleMs(env);
+    const freshMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", 2000));
+    const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 0));
     const cached = livePlaylistCache.get(cacheKey);
     if (cached && now - cached.at < freshMs) return playlistResponse(cached.body);
     try {
@@ -2655,7 +2292,7 @@ async function proxySegment(key, token, filename, request, env) {
     validateKey(key);
     const tokenData = await readUrlToken(token, env);
     const referer = tokenData.r || tokenData.u;
-    const ttlSeconds = Math.max(1, envInt(env, "SEGMENT_CACHE_SECONDS", DEFAULT_SEGMENT_CACHE_SECONDS));
+    const ttlSeconds = Math.max(1, envInt(env, "SEGMENT_CACHE_SECONDS", 30));
 
     const primary = await fetchUpstreamAsset(tokenData.u, referer, env, ttlSeconds, request);
     const fallback = (!primary || primary.status >= 400) && tokenData.f
@@ -2667,7 +2304,7 @@ async function proxySegment(key, token, filename, request, env) {
     if (!upstream.ok) return withCors(new Response(upstream.body, { status: upstream.status, headers: upstream.headers }));
 
     const headers = new Headers(upstream.headers);
-    headers.set("cache-control", `public, max-age=${ttlSeconds}, s-maxage=${ttlSeconds}`);
+    headers.set("cache-control", `public, max-age=${ttlSeconds}, s-maxage=${ttlSeconds}, stale-while-revalidate=15`);
     if (!headers.has("content-type")) headers.set("content-type", mediaTypeForPath(filename));
     headers.set("access-control-allow-origin", "*");
     headers.set("access-control-allow-methods", "GET,HEAD,OPTIONS");
@@ -3014,7 +2651,6 @@ async function handleRequest(request, env, waitUntil) {
         const sourceUrl = await findXtreamLiveUrl(env, xtreamLiveMatch[3]);
         if (!sourceUrl) throw new HttpError(404, "Live stream not found.");
         const key = await streamKey(sourceUrl);
-        if (useHlsResegmenter(env)) return proxyResegmentedPlaylist(key, sourceUrl, request, env);
         return proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, `live:${key}`);
     }
 
@@ -3078,9 +2714,6 @@ async function handleRequest(request, env, waitUntil) {
     const nestedPlaylistMatch = path.match(/^\/(?:uplive|upstream-playlist)\/([a-f0-9]{20})\/([^/]+)\.m3u8$/);
     if (nestedPlaylistMatch) return proxyNestedPlaylist(nestedPlaylistMatch[1], nestedPlaylistMatch[2], request, env, waitUntil);
 
-    const resegmentedSegmentMatch = path.match(/^\/rseg\/([a-f0-9]{20})\/([^/]+)$/);
-    if (resegmentedSegmentMatch) return proxyResegmentedSegment(resegmentedSegmentMatch[1], resegmentedSegmentMatch[2], request, env);
-
     const segmentMatch = path.match(/^\/(?:upseg|upstream-segment)\/([a-f0-9]{20})\/([^/]+)\/([^/]+)$/);
     if (segmentMatch) return proxySegment(segmentMatch[1], segmentMatch[2], segmentMatch[3], request, env);
 
@@ -3092,25 +2725,9 @@ async function handleRequest(request, env, waitUntil) {
 const app = express();
 app.use(express.raw({ type: "*/*", limit: "64kb" }));
 
-function waitForWritableDrain(res) {
-    return new Promise((resolve) => {
-        const done = () => {
-            res.off("drain", done);
-            res.off("close", done);
-            res.off("error", done);
-            resolve();
-        };
-        res.once("drain", done);
-        res.once("close", done);
-        res.once("error", done);
-    });
-}
-
 async function pipeWebResponse(webResponse, res) {
     res.status(webResponse.status);
     webResponse.headers.forEach((value, key) => res.set(key, value));
-    if (!res.getHeader("x-accel-buffering")) res.set("x-accel-buffering", "no");
-    if (typeof res.flushHeaders === "function") res.flushHeaders();
 
     if (webResponse.body) {
         const reader = webResponse.body.getReader();
@@ -3131,9 +2748,7 @@ async function pipeWebResponse(webResponse, res) {
             while (true) {
                 const { done, value } = await reader.read();
                 if (done || finished) break;
-                if (!res.write(Buffer.from(value)) && !finished) {
-                    await waitForWritableDrain(res);
-                }
+                res.write(Buffer.from(value));
             }
         } catch (error) {
             const isAborted = error?.name === "AbortError" || 
