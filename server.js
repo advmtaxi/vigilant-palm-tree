@@ -63,12 +63,15 @@ const upstreamHlsInflight = new Map();
 const livePlaylistInflight = new Map();
 const xtreamCatalogCache = new Map();
 const xtreamCatalogInflight = new Map();
+const slugIndex = new Map();
+const keyToSlugIndex = new Map();
 let channelLoadPromise = null;
 let playlistChannelLoadPromise = null;
 
 // Disk-persist cache paths (loaded on startup so first request is always instant)
 const CHANNEL_DISK_CACHE_FILE = process.env.CHANNEL_DISK_CACHE_FILE || "channel-cache.json";
 const PLAYLIST_DISK_CACHE_FILE = process.env.PLAYLIST_DISK_CACHE_FILE || "playlist-channel-cache.json";
+const CUSTOM_PLAYLISTS_FILE = process.env.CUSTOM_PLAYLISTS_FILE || "custom-playlists.json";
 
 const MAX_UPSTREAM_HLS_CACHE_ENTRIES = 500;
 const MAX_LIVE_PLAYLIST_CACHE_ENTRIES = 500;
@@ -346,6 +349,40 @@ function stripExtension(value) {
 
 function encodePathSegment(value) {
     return encodeURIComponent(String(value));
+}
+
+function slugifyChannelName(name) {
+    // Strip source suffixes like "(APIPRIMARY)", "(APIEXTRA)"
+    let clean = String(name || "Unknown")
+        .replace(/\s*\(API[A-Z]*\)\s*$/i, "")
+        .replace(/\s*\([^)]*\)\s*$/, "")
+        .trim();
+    if (!clean) clean = "Unknown";
+    // PascalCase: split on non-alphanumeric, capitalize each word
+    return clean
+        .split(/[^a-zA-Z0-9]+/)
+        .filter(Boolean)
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join("");
+}
+
+function buildSlugIndex(channels) {
+    const newSlugIndex = new Map();
+    const newKeyToSlug = new Map();
+    const slugCounts = new Map();
+    for (const channel of channels) {
+        let base = slugifyChannelName(channel.name);
+        if (!base) base = "Channel";
+        const count = (slugCounts.get(base) || 0) + 1;
+        slugCounts.set(base, count);
+        const slug = count === 1 ? base : `${base}${count}`;
+        newSlugIndex.set(slug, channel.key);
+        newKeyToSlug.set(channel.key, slug);
+    }
+    slugIndex.clear();
+    keyToSlugIndex.clear();
+    for (const [s, k] of newSlugIndex) slugIndex.set(s, k);
+    for (const [k, s] of newKeyToSlug) keyToSlugIndex.set(k, s);
 }
 
 function normalizeSourceLabel(value) {
@@ -754,6 +791,37 @@ function serializeAccessUser(user, request, env) {
     };
 }
 
+// ─── Custom Playlist Storage ─────────────────────────────────────────────────
+
+function customPlaylistsFile(env) {
+    return envString(env, "CUSTOM_PLAYLISTS_FILE", "custom-playlists.json") || "custom-playlists.json";
+}
+
+async function loadCustomPlaylists(env) {
+    try {
+        const text = await fs.readFile(customPlaylistsFile(env), "utf8");
+        const data = JSON.parse(text);
+        return Array.isArray(data?.playlists) ? data.playlists : [];
+    } catch (error) {
+        if (error && error.code === "ENOENT") return [];
+        throw error;
+    }
+}
+
+async function saveCustomPlaylists(env, playlists) {
+    const payload = { updatedAt: new Date().toISOString(), playlists };
+    await fs.writeFile(customPlaylistsFile(env), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+function randomPlaylistId(length = 8) {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    const bytes = new Uint8Array(length);
+    crypto.getRandomValues(bytes);
+    let output = "";
+    for (const byte of bytes) output += alphabet[byte % alphabet.length];
+    return output;
+}
+
 function basicAuthCredentials(request) {
     const header = request.headers.get("authorization") || "";
     const match = header.match(/^Basic\s+(.+)$/i);
@@ -993,6 +1061,7 @@ async function doRefreshChannels(env) {
         streamIndex: [...nextStreamIndex.entries()],
     });
 
+    buildSlugIndex(channels);
     console.log(`[cache] channels refreshed: ${channels.length} channels`);
     return channels;
 }
@@ -1080,6 +1149,7 @@ async function doRefreshPlaylistChannels(env) {
         streamIndex: [...nextStreamIndex.entries()],
     });
 
+    buildSlugIndex(channels);
     console.log(`[cache] playlist channels refreshed: ${channels.length} channels`);
     return channels;
 }
@@ -1167,12 +1237,16 @@ async function channelRecord(channel, request, env) {
     const directToken = sourceUrl ? await makeUrlToken({ u: sourceUrl }, env) : null;
     const directUrl = directToken ? `${cdn}/direct/${directToken}.m3u8` : `${cdn}/live/${channel.key}/index.m3u8`;
     const liveUrl = directToken ? `${cdn}/live/${channel.key}/index.m3u8?src=${encodeURIComponent(directToken)}` : `${cdn}/live/${channel.key}/index.m3u8`;
+    const slug = keyToSlugIndex.get(channel.key);
+    const streamUrl = slug ? `${cdn}/stream/${encodePathSegment(slug)}.m3u8` : null;
     return {
         key: channel.key,
         name: channel.name,
+        slug: slug || null,
         logo: channel.logo,
         category: channel.category,
         url: liveUrl,
+        stream_url: streamUrl,
         m3u8: liveUrl,
         direct_url: directUrl,
         lookup_url: `${base}/live/${channel.key}/index.m3u8`,
@@ -1582,6 +1656,109 @@ function dashboardPage() {
       padding: 28px 18px;
       color: var(--muted);
     }
+    /* Custom Playlists */
+    .section-divider {
+      border: 0;
+      border-top: 1px solid var(--line);
+      margin: 32px 0 24px;
+    }
+    .section-title {
+      font-size: 22px;
+      margin: 0 0 18px;
+      font-weight: 700;
+    }
+    .search-box {
+      position: relative;
+      margin-bottom: 14px;
+    }
+    .search-box input {
+      padding-left: 36px;
+    }
+    .search-icon {
+      position: absolute;
+      left: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 14px;
+      opacity: .5;
+      pointer-events: none;
+    }
+    .channel-list {
+      max-height: 400px;
+      overflow-y: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--input);
+    }
+    .channel-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 12px;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .channel-item:hover {
+      background: var(--panel-2);
+    }
+    .channel-item:last-child { border-bottom: 0; }
+    .channel-item input[type="checkbox"] { width: 16px; height: 16px; flex-shrink: 0; }
+    .channel-item .ch-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .channel-item .ch-cat { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+    .selected-count {
+      font-size: 13px;
+      color: var(--muted);
+      margin: 10px 0;
+    }
+    .playlist-card {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .playlist-card:last-child { border-bottom: 0; }
+    .playlist-card h3 {
+      margin: 0 0 6px;
+      font-size: 15px;
+      font-weight: 600;
+    }
+    .playlist-card .meta {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+    .playlist-card code {
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+    .playlist-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .playlist-actions button {
+      min-height: 32px;
+      padding: 6px 12px;
+      font-size: 12px;
+    }
+    .import-area {
+      margin-top: 14px;
+    }
+    .import-area textarea {
+      width: 100%;
+      min-height: 80px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--input);
+      color: var(--text);
+      padding: 10px;
+      font: inherit;
+      font-size: 12px;
+      resize: vertical;
+      outline: none;
+    }
+    .import-area textarea:focus { border-color: var(--accent); }
     @media (max-width: 860px) {
       header, .grid { display: block; }
       header > * + *, .grid > * + * { margin-top: 18px; }
@@ -1637,6 +1814,45 @@ function dashboardPage() {
       <div class="panel">
         <h2>Active links</h2>
         <div id="users"></div>
+      </div>
+    </section>
+
+    <hr class="section-divider">
+    <h2 class="section-title">Custom Playlists</h2>
+    <section class="grid">
+      <div class="panel">
+        <h2>Create playlist</h2>
+        <div class="panel-body">
+          <label>Playlist name
+            <input id="pl-name" autocomplete="off" placeholder="e.g. My Sports Channels">
+          </label>
+          <div class="search-box">
+            <span class="search-icon">&#128269;</span>
+            <input id="ch-search" placeholder="Search channels..." autocomplete="off">
+          </div>
+          <div class="selected-count" id="sel-count">0 channels selected</div>
+          <div class="channel-list" id="ch-list"></div>
+          <div style="margin-top:14px;display:flex;gap:10px">
+            <button type="button" id="create-pl-btn">Create playlist</button>
+            <button class="secondary" type="button" id="clear-sel-btn">Clear</button>
+          </div>
+          <div class="message" id="pl-message"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Your playlists</h2>
+        <div id="pl-list"></div>
+        <div class="panel-body" style="border-top:1px solid var(--line)">
+          <div style="display:flex;gap:10px;flex-wrap:wrap">
+            <button class="secondary" type="button" id="export-pl-btn">Export all</button>
+            <button class="secondary" type="button" id="show-import-btn">Import</button>
+          </div>
+          <div class="import-area" id="import-area" style="display:none">
+            <textarea id="import-json" placeholder="Paste exported JSON here..."></textarea>
+            <button type="button" id="do-import-btn" style="margin-top:8px">Import playlists</button>
+          </div>
+          <div class="message" id="pl-import-message"></div>
+        </div>
       </div>
     </section>
   </main>
@@ -1749,6 +1965,240 @@ function dashboardPage() {
 
     passwordInput.value = randomPassword();
     loadUsers().catch((error) => setMessage(error.message, true));
+
+    // ─── Custom Playlists ─────────────────────────────────────────────────
+    const plNameInput = document.querySelector("#pl-name");
+    const chSearchInput = document.querySelector("#ch-search");
+    const chList = document.querySelector("#ch-list");
+    const selCountEl = document.querySelector("#sel-count");
+    const plMessage = document.querySelector("#pl-message");
+    const plListEl = document.querySelector("#pl-list");
+    const plImportMsg = document.querySelector("#pl-import-message");
+
+    let allChannels = [];
+    const selectedKeys = new Set();
+
+    function setPlMessage(text, isError) {
+      plMessage.textContent = text;
+      plMessage.style.color = isError ? "var(--danger)" : "var(--muted)";
+    }
+
+    function updateSelectedCount() {
+      selCountEl.textContent = selectedKeys.size + " channel" + (selectedKeys.size !== 1 ? "s" : "") + " selected";
+    }
+
+    function renderChannelList(filter) {
+      const q = (filter || "").toLowerCase().trim();
+      const filtered = q
+        ? allChannels.filter(function(ch) { return (ch.name + " " + ch.category).toLowerCase().indexOf(q) >= 0; })
+        : allChannels;
+      const max = 200;
+      const shown = filtered.slice(0, max);
+      chList.innerHTML = "";
+      if (shown.length === 0) {
+        chList.innerHTML = '<div style="padding:14px;color:var(--muted);font-size:13px">No channels found.</div>';
+        return;
+      }
+      for (var i = 0; i < shown.length; i++) {
+        var ch = shown[i];
+        var div = document.createElement("div");
+        div.className = "channel-item";
+        var cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = selectedKeys.has(ch.key);
+        cb.setAttribute("data-key", ch.key);
+        cb.addEventListener("change", function(e) {
+          var k = e.target.getAttribute("data-key");
+          if (e.target.checked) selectedKeys.add(k);
+          else selectedKeys.delete(k);
+          updateSelectedCount();
+        });
+        var nameSpan = document.createElement("span");
+        nameSpan.className = "ch-name";
+        nameSpan.textContent = ch.name;
+        var catSpan = document.createElement("span");
+        catSpan.className = "ch-cat";
+        catSpan.textContent = ch.category || "";
+        div.appendChild(cb);
+        div.appendChild(nameSpan);
+        div.appendChild(catSpan);
+        (function(checkbox) {
+          div.addEventListener("click", function(e) {
+            if (e.target === checkbox) return;
+            checkbox.checked = !checkbox.checked;
+            checkbox.dispatchEvent(new Event("change"));
+          });
+        })(cb);
+        chList.appendChild(div);
+      }
+      if (filtered.length > max) {
+        var more = document.createElement("div");
+        more.style.cssText = "padding:10px;text-align:center;color:var(--muted);font-size:12px";
+        more.textContent = "+" + (filtered.length - max) + " more — refine your search";
+        chList.appendChild(more);
+      }
+    }
+
+    async function loadAllChannels() {
+      try {
+        var res = await fetch("/api/channels");
+        if (!res.ok) throw new Error("Failed to load channels");
+        var data = await res.json();
+        allChannels = data.channels || [];
+        renderChannelList();
+      } catch (err) {
+        chList.innerHTML = '<div style="padding:14px;color:var(--danger);font-size:13px">' + err.message + '</div>';
+      }
+    }
+
+    chSearchInput.addEventListener("input", function() { renderChannelList(chSearchInput.value); });
+
+    document.querySelector("#clear-sel-btn").addEventListener("click", function() {
+      selectedKeys.clear();
+      updateSelectedCount();
+      renderChannelList(chSearchInput.value);
+    });
+
+    document.querySelector("#create-pl-btn").addEventListener("click", async function() {
+      var name = plNameInput.value.trim();
+      if (!name) { setPlMessage("Enter a playlist name.", true); return; }
+      if (selectedKeys.size === 0) { setPlMessage("Select at least one channel.", true); return; }
+      setPlMessage("Creating...");
+      try {
+        var res = await fetch("/api/custom-playlists", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: name, channelKeys: Array.from(selectedKeys) }),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Create failed");
+        setPlMessage("Playlist created! API: " + data.playlist.api_url);
+        plNameInput.value = "";
+        selectedKeys.clear();
+        updateSelectedCount();
+        renderChannelList(chSearchInput.value);
+        await loadPlaylists();
+      } catch (err) {
+        setPlMessage(err.message, true);
+      }
+    });
+
+    function renderPlaylists(playlists) {
+      if (!playlists.length) {
+        plListEl.innerHTML = '<div class="empty">No custom playlists yet.</div>';
+        return;
+      }
+      plListEl.innerHTML = "";
+      for (var i = 0; i < playlists.length; i++) {
+        var pl = playlists[i];
+        var card = document.createElement("div");
+        card.className = "playlist-card";
+        var h3 = document.createElement("h3");
+        h3.textContent = pl.name;
+        var meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = pl.channelKeys.length + " channels · ID: " + pl.id;
+        var apiCode = document.createElement("code");
+        apiCode.textContent = pl.api_url;
+        var m3uCode = document.createElement("code");
+        m3uCode.textContent = pl.m3u_url;
+        m3uCode.style.marginTop = "4px";
+        var actions = document.createElement("div");
+        actions.className = "playlist-actions";
+        var copyApiBtn = document.createElement("button");
+        copyApiBtn.className = "secondary";
+        copyApiBtn.textContent = "Copy API";
+        var copyM3uBtn = document.createElement("button");
+        copyM3uBtn.className = "secondary";
+        copyM3uBtn.textContent = "Copy M3U";
+        var delBtn = document.createElement("button");
+        delBtn.className = "danger";
+        delBtn.textContent = "Delete";
+        actions.appendChild(copyApiBtn);
+        actions.appendChild(copyM3uBtn);
+        actions.appendChild(delBtn);
+        card.appendChild(h3);
+        card.appendChild(meta);
+        card.appendChild(apiCode);
+        card.appendChild(m3uCode);
+        card.appendChild(actions);
+        (function(p) {
+          copyApiBtn.addEventListener("click", function() {
+            navigator.clipboard.writeText(p.api_url).then(function() { setPlMessage("Copied API link."); });
+          });
+          copyM3uBtn.addEventListener("click", function() {
+            navigator.clipboard.writeText(p.m3u_url).then(function() { setPlMessage("Copied M3U link."); });
+          });
+          delBtn.addEventListener("click", async function() {
+            try {
+              var res = await fetch("/api/custom-playlists/delete", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ id: p.id }),
+              });
+              if (!res.ok) throw new Error("Delete failed");
+              await loadPlaylists();
+              setPlMessage("Playlist deleted.");
+            } catch (err) { setPlMessage(err.message, true); }
+          });
+        })(pl);
+        plListEl.appendChild(card);
+      }
+    }
+
+    async function loadPlaylists() {
+      try {
+        var res = await fetch("/api/custom-playlists");
+        if (!res.ok) throw new Error("Could not load playlists");
+        var data = await res.json();
+        renderPlaylists(data.playlists || []);
+      } catch (err) {
+        plListEl.innerHTML = '<div class="empty" style="color:var(--danger)">' + err.message + '</div>';
+      }
+    }
+
+    document.querySelector("#export-pl-btn").addEventListener("click", async function() {
+      try {
+        var res = await fetch("/api/custom-playlists/export");
+        if (!res.ok) throw new Error("Export failed");
+        var blob = await res.blob();
+        var a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "custom-playlists-export.json";
+        a.click();
+        URL.revokeObjectURL(a.href);
+      } catch (err) { setPlMessage(err.message, true); }
+    });
+
+    document.querySelector("#show-import-btn").addEventListener("click", function() {
+      var area = document.querySelector("#import-area");
+      area.style.display = area.style.display === "none" ? "block" : "none";
+    });
+
+    document.querySelector("#do-import-btn").addEventListener("click", async function() {
+      var raw = document.querySelector("#import-json").value.trim();
+      if (!raw) { plImportMsg.textContent = "Paste JSON first."; plImportMsg.style.color = "var(--danger)"; return; }
+      try {
+        var parsed = JSON.parse(raw);
+        var res = await fetch("/api/custom-playlists/import", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(parsed),
+        });
+        var result = await res.json();
+        if (!res.ok) throw new Error(result.error || "Import failed");
+        plImportMsg.textContent = "Imported! Added: " + result.added + ", Updated: " + result.updated;
+        plImportMsg.style.color = "var(--muted)";
+        document.querySelector("#import-json").value = "";
+        await loadPlaylists();
+      } catch (err) {
+        plImportMsg.textContent = err.message;
+        plImportMsg.style.color = "var(--danger)";
+      }
+    });
+
+    loadAllChannels();
+    loadPlaylists();
   </script>
 </body>
 </html>`;
@@ -2248,7 +2698,24 @@ async function proxyChannelPlaylist(key, request, env, waitUntil) {
         return proxyLiveFromSource(key, tokenData.u, request, env, waitUntil, `live:${key}:${srcToken}`);
     }
     const channel = await getStreamForKey(key, env);
-    return proxyLiveFromSource(key, channel.sourceUrl, request, env, waitUntil, `live:${key}`);
+    try {
+        return await proxyLiveFromSource(key, channel.sourceUrl, request, env, waitUntil, `live:${key}`);
+    } catch (firstError) {
+        // M3U8 failed — force-refresh the API once and retry
+        console.warn(`[retry] m3u8 failed for key ${key}, refreshing API and retrying once...`);
+        upstreamHlsCache.delete(key);
+        livePlaylistCache.delete(`live:${key}`);
+        try { await doRefreshChannels(env); } catch (refreshErr) {
+            console.warn(`[retry] channel refresh failed:`, refreshErr?.message);
+            throw firstError;
+        }
+        const freshSourceUrl = streamIndex.get(key) || channel.sourceUrl;
+        try {
+            return await proxyLiveFromSource(key, freshSourceUrl, request, env, waitUntil, `live:${key}`);
+        } catch {
+            throw firstError;
+        }
+    }
 }
 
 async function proxyDirectPlaylist(token, request, env, waitUntil) {
@@ -2602,6 +3069,141 @@ async function handleXtreamApi(request, env, waitUntil) {
     return json([]);
 }
 
+// ─── Custom Playlist API handlers ─────────────────────────────────────────────
+
+async function customPlaylistsPayload(request, env) {
+    if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+    const playlists = await loadCustomPlaylists(env);
+    const base = publicBase(request, env);
+    return json({
+        status: "ok",
+        count: playlists.length,
+        playlists: playlists.map((p) => ({
+            ...p,
+            api_url: `${base}/api/playlist/${p.id}`,
+            m3u_url: `${base}/api/playlist/${p.id}.m3u`,
+        })),
+    });
+}
+
+async function createCustomPlaylist(request, env) {
+    if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+    const data = await readRequestData(request);
+    const name = cleanString(data.name);
+    if (!name) throw new HttpError(400, "Playlist name is required.");
+    const channelKeys = Array.isArray(data.channelKeys) ? data.channelKeys.map(String).filter(Boolean) : [];
+    if (channelKeys.length === 0) throw new HttpError(400, "At least one channel must be selected.");
+    const playlists = await loadCustomPlaylists(env);
+    const id = randomPlaylistId(8);
+    const now = new Date().toISOString();
+    const playlist = { id, name, createdAt: now, updatedAt: now, channelKeys };
+    playlists.push(playlist);
+    await saveCustomPlaylists(env, playlists);
+    const base = publicBase(request, env);
+    return json({ status: "ok", playlist: { ...playlist, api_url: `${base}/api/playlist/${id}`, m3u_url: `${base}/api/playlist/${id}.m3u` } }, 201);
+}
+
+async function updateCustomPlaylist(request, env) {
+    if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+    const data = await readRequestData(request);
+    const id = cleanString(data.id);
+    if (!id) throw new HttpError(400, "Playlist ID is required.");
+    const playlists = await loadCustomPlaylists(env);
+    const index = playlists.findIndex((p) => p.id === id);
+    if (index < 0) throw new HttpError(404, "Playlist not found.");
+    if (data.name !== undefined) playlists[index].name = cleanString(data.name) || playlists[index].name;
+    if (Array.isArray(data.channelKeys)) playlists[index].channelKeys = data.channelKeys.map(String).filter(Boolean);
+    playlists[index].updatedAt = new Date().toISOString();
+    await saveCustomPlaylists(env, playlists);
+    const base = publicBase(request, env);
+    return json({ status: "ok", playlist: { ...playlists[index], api_url: `${base}/api/playlist/${id}`, m3u_url: `${base}/api/playlist/${id}.m3u` } });
+}
+
+async function deleteCustomPlaylist(request, env) {
+    if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+    const data = await readRequestData(request);
+    const id = cleanString(data.id);
+    if (!id) throw new HttpError(400, "Playlist ID is required.");
+    const playlists = await loadCustomPlaylists(env);
+    const kept = playlists.filter((p) => p.id !== id);
+    await saveCustomPlaylists(env, kept);
+    return json({ status: "ok", deleted: playlists.length - kept.length });
+}
+
+async function exportCustomPlaylists(request, env) {
+    if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+    const playlists = await loadCustomPlaylists(env);
+    return withCors(new Response(JSON.stringify({ exportedAt: new Date().toISOString(), playlists }, null, 2), {
+        headers: {
+            "content-type": "application/json; charset=utf-8",
+            "content-disposition": 'attachment; filename="custom-playlists-export.json"',
+            "cache-control": "no-store",
+        },
+    }));
+}
+
+async function importCustomPlaylists(request, env) {
+    if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+    const data = await readRequestData(request);
+    const incoming = Array.isArray(data.playlists) ? data.playlists : [];
+    if (incoming.length === 0) throw new HttpError(400, "No playlists found in import data.");
+    const existing = await loadCustomPlaylists(env);
+    const byId = new Map(existing.map((p) => [p.id, p]));
+    let added = 0, updated = 0;
+    for (const p of incoming) {
+        const id = cleanString(p.id);
+        if (!id) continue;
+        const name = cleanString(p.name, "Imported Playlist");
+        const channelKeys = Array.isArray(p.channelKeys) ? p.channelKeys.map(String).filter(Boolean) : [];
+        const now = new Date().toISOString();
+        if (byId.has(id)) {
+            const ex = byId.get(id);
+            ex.name = name;
+            ex.channelKeys = channelKeys;
+            ex.updatedAt = now;
+            updated++;
+        } else {
+            byId.set(id, { id, name, createdAt: p.createdAt || now, updatedAt: now, channelKeys });
+            added++;
+        }
+    }
+    const merged = [...byId.values()];
+    await saveCustomPlaylists(env, merged);
+    return json({ status: "ok", added, updated, total: merged.length });
+}
+
+async function serveCustomPlaylistJson(request, env, playlistId) {
+    const playlists = await loadCustomPlaylists(env);
+    const playlist = playlists.find((p) => p.id === playlistId);
+    if (!playlist) throw new HttpError(404, "Playlist not found.");
+    const channels = await loadChannels(env, false);
+    const wantedKeys = new Set(playlist.channelKeys);
+    const matched = channels.filter((ch) => wantedKeys.has(ch.key));
+    const records = [];
+    for (const ch of matched) records.push(await channelRecord(ch, request, env));
+    return json({ status: "ok", playlist_id: playlist.id, playlist_name: playlist.name, count: records.length, channels: records });
+}
+
+async function serveCustomPlaylistM3u(request, env, playlistId) {
+    const playlists = await loadCustomPlaylists(env);
+    const playlist = playlists.find((p) => p.id === playlistId);
+    if (!playlist) throw new HttpError(404, "Playlist not found.");
+    const channels = await loadPlaylistChannels(env, false);
+    const wantedKeys = new Set(playlist.channelKeys);
+    const matched = channels.filter((ch) => wantedKeys.has(ch.key));
+    const lines = ["#EXTM3U"];
+    for (const channel of matched) {
+        appendM3uEntry(lines, {
+            id: channel.key,
+            name: channel.name,
+            logo: channel.logo,
+            category: channel.category || "Live",
+            url: generatedLiveUrl(channel, request, env),
+        });
+    }
+    return playlistResponse(`${lines.join("\n")}\n`);
+}
+
 // ─── Main request handler ─────────────────────────────────────────────────────
 
 async function handleRequest(request, env, waitUntil) {
@@ -2609,7 +3211,11 @@ async function handleRequest(request, env, waitUntil) {
 
     const url = new URL(request.url);
     const path = url.pathname;
-    const isDashboardMutation = request.method === "POST" && (path === "/api/access-users" || path === "/api/access-users/delete");
+    const isDashboardMutation = request.method === "POST" && (
+        path === "/api/access-users" || path === "/api/access-users/delete" ||
+        path === "/api/custom-playlists" || path === "/api/custom-playlists/update" ||
+        path === "/api/custom-playlists/delete" || path === "/api/custom-playlists/import"
+    );
 
     if (request.method !== "GET" && request.method !== "HEAD" && !isDashboardMutation) {
         return json({ error: "Method not allowed." }, 405);
@@ -2631,6 +3237,19 @@ async function handleRequest(request, env, waitUntil) {
     if (path === "/api/access-users/delete" && request.method === "POST") {
         return deleteAccessUser(request, env);
     }
+
+    // ─── Custom Playlist API ───────────────────────────────────────────────────
+    if (path === "/api/custom-playlists" && request.method === "GET") return customPlaylistsPayload(request, env);
+    if (path === "/api/custom-playlists" && request.method === "POST") return createCustomPlaylist(request, env);
+    if (path === "/api/custom-playlists/update" && request.method === "POST") return updateCustomPlaylist(request, env);
+    if (path === "/api/custom-playlists/delete" && request.method === "POST") return deleteCustomPlaylist(request, env);
+    if (path === "/api/custom-playlists/export") return exportCustomPlaylists(request, env);
+    if (path === "/api/custom-playlists/import" && request.method === "POST") return importCustomPlaylists(request, env);
+
+    const playlistM3uMatch = path.match(/^\/api\/playlist\/([A-Za-z0-9]{4,16})\.m3u$/);
+    if (playlistM3uMatch) return serveCustomPlaylistM3u(request, env, playlistM3uMatch[1]);
+    const playlistJsonMatch = path.match(/^\/api\/playlist\/([A-Za-z0-9]{4,16})$/);
+    if (playlistJsonMatch) return serveCustomPlaylistJson(request, env, playlistJsonMatch[1]);
 
     if (path === "/get.php") {
         return generatedM3uResponse(request, env, waitUntil);
@@ -2708,6 +3327,15 @@ async function handleRequest(request, env, waitUntil) {
         const force = (url.searchParams.get("refresh") || "").toLowerCase();
         const refresh = force === "1" || force === "true" || force === "yes";
         return json(await tvSeriesPayload(request, env, refresh));
+    }
+
+    // ─── Named stream URL: /stream/{ChannelSlug}.m3u8 ────────────────────────
+    const streamSlugMatch = path.match(/^\/stream\/([^/]+)\.m3u8$/);
+    if (streamSlugMatch) {
+        const slug = decodeURIComponent(streamSlugMatch[1]);
+        const streamSlugKey = slugIndex.get(slug);
+        if (!streamSlugKey) throw new HttpError(404, `Stream "${slug}" not found.`);
+        return proxyChannelPlaylist(streamSlugKey, request, env, waitUntil);
     }
 
     const directPlaylistMatch = path.match(/^\/(?:direct|source|playlist)\/([^/]+)\.m3u8$/);
@@ -2845,6 +3473,7 @@ async function prewarmCaches() {
             for (const [k, v] of diskChannels.streamIndex) streamIndex.set(k, v);
         }
         console.log(`[cache] channels restored from disk: ${channelCache.channels.length} channels (age ${Math.round((Date.now() - channelCache.at) / 1000)}s)`);
+        buildSlugIndex(channelCache.channels);
     }
 
     // 2. Load playlist channel cache from disk
