@@ -197,6 +197,77 @@ function textResponse(body, status = 200, headers = {}) {
     );
 }
 
+// Logging helpers
+
+const SENSITIVE_QUERY_PARAMS = new Set([
+    "password",
+    "pass",
+    "token",
+    "auth",
+    "signature",
+    "sig",
+]);
+
+function maskSecret(value) {
+    const text = String(value ?? "");
+    if (!text) return "[empty]";
+    if (text.length <= 4) return "[redacted]";
+    return `${text.slice(0, 2)}...${text.slice(-2)}`;
+}
+
+function sanitizePathForLog(pathname) {
+    return String(pathname || "/")
+        .replace(/^(\/(?:live|movie|series)\/[^/]+\/)([^/]+)(\/)/i, (_match, prefix, password, suffix) => `${prefix}${maskSecret(password)}${suffix}`)
+        .replace(/^(\/(?:upseg|upstream-segment)\/[^/]+\/)([^/]+)(\/)/i, (_match, prefix, token, suffix) => `${prefix}${maskSecret(token)}${suffix}`)
+        .replace(/^(\/(?:direct|source|playlist)\/)([^/.]+)(\.m3u8)$/i, (_match, prefix, token, suffix) => `${prefix}${maskSecret(token)}${suffix}`);
+}
+
+function sanitizeUrlForLog(rawUrl) {
+    try {
+        const text = String(rawUrl || "/");
+        const includeOrigin = /^https?:\/\//i.test(text);
+        const parsed = new URL(text, "http://local");
+        parsed.pathname = sanitizePathForLog(parsed.pathname);
+        for (const key of [...parsed.searchParams.keys()]) {
+            if (SENSITIVE_QUERY_PARAMS.has(key.toLowerCase())) {
+                parsed.searchParams.set(key, maskSecret(parsed.searchParams.get(key)));
+            }
+        }
+        return `${includeOrigin ? parsed.origin : ""}${parsed.pathname}${parsed.search}`;
+    } catch {
+        return sanitizePathForLog(rawUrl);
+    }
+}
+
+function requestClientForLog(req) {
+    return String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "")
+        .split(",")[0]
+        .trim() || "unknown";
+}
+
+function payloadCount(payload) {
+    if (Array.isArray(payload)) return payload.length;
+    if (!payload || typeof payload !== "object") return null;
+    for (const key of ["streams", "categories", "seasons"]) {
+        if (Array.isArray(payload[key])) return payload[key].length;
+    }
+    if (payload.episodes && typeof payload.episodes === "object") {
+        return Object.values(payload.episodes).reduce((total, episodes) => total + (Array.isArray(episodes) ? episodes.length : 0), 0);
+    }
+    return null;
+}
+
+function logXtreamAction(request, action, payload, extra = {}) {
+    const count = payloadCount(payload);
+    const details = [
+        `action=${action || "auth"}`,
+        extra.categoryId ? `category=${extra.categoryId}` : "",
+        extra.id ? `id=${extra.id}` : "",
+        count === null ? "" : `count=${count}`,
+    ].filter(Boolean).join(" ");
+    console.log(`[xtream] ${request.method} ${sanitizeUrlForLog(new URL(request.url).pathname + new URL(request.url).search)} ${details}`);
+}
+
 // Crypto helpers
 
 async function sha1Hex(value) {
@@ -585,13 +656,18 @@ async function fetchXtreamApi(env, config, action, extraParams = {}) {
     const urls = upstreamUrlCandidates(xtreamApiUrl(config, action, extraParams).toString(), env);
     const attempts = await Promise.allSettled(urls.map(async (url) => {
         const response = await fetchWithTimeout(url, { headers, redirect: "follow" }, timeoutMs);
-        if (!response.ok) throw response;
+        if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText || ""}`.trim());
         return JSON.parse(await response.text());
     }));
 
     for (const attempt of attempts) {
         if (attempt.status === "fulfilled") return attempt.value;
     }
+    const failures = attempts.map((attempt, index) => {
+        const reason = attempt.status === "rejected" ? attempt.reason : null;
+        return `${sanitizeUrlForLog(urls[index])} -> ${reason?.message || reason?.status || "unknown error"}`;
+    }).join("; ");
+    console.warn(`[xtream-upstream] action=${action || "auth"} failed all upstream attempts: ${failures}`);
     return null;
 }
 
@@ -2831,11 +2907,10 @@ function xtreamServerInfo(request, env) {
     const base = publicBase(request, env);
     const parsed = new URL(base);
     const now = Math.floor(Date.now() / 1000);
-    const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
     return {
-        url: parsed.origin,
-        port: String(port),
-        https_port: String(parsed.protocol === "https:" ? port : "443"),
+        url: parsed.hostname,
+        port: parsed.port || (parsed.protocol === "https:" ? "443" : "80"),
+        https_port: parsed.protocol === "https:" ? (parsed.port || "443") : "443",
         server_protocol: parsed.protocol.replace(":", ""),
         rtmp_port: "1935",
         timezone: "UTC",
@@ -2852,15 +2927,15 @@ function xtreamUserInfoPayload(user, request, env) {
         user_info: {
             username: user.username,
             password: user.password,
-            message: "Welcome to Manus IPTV",
+            message: "",
             auth: 1,
             status: isAccessUserExpired(user) ? "Expired" : "Active",
             exp_date: expDate ? String(expDate) : null,
             is_trial: "0",
-            active_cons: "0",
+            active_cons: "1",
             created_at: user.createdAt ? String(Math.floor(new Date(user.createdAt).getTime() / 1000)) : String(now),
             max_connections: "10",
-            allowed_output_formats: ["m3u8", "ts", "rtmp"],
+            allowed_output_formats: ["m3u8", "ts", "rtmpe"],
         },
         server_info: xtreamServerInfo(request, env),
     };
@@ -2911,26 +2986,6 @@ async function panelApiPayload(request, env, user) {
     const liveCategories = await xtreamLiveCategories(env).catch(() => []);
     const vodCategories = await xtreamVodCategories(env).catch(() => []);
     const seriesCategories = await xtreamSeriesCategories(env).catch(() => []);
-
-    const available_channels = channels.map((channel, index) => {
-        const categoryName = cleanString(channel?.category, "Live");
-        const categoryId = xtreamFallbackCategoryId(categoryName);
-        return {
-            num: index + 1,
-            name: cleanString(channel?.name, "Unknown"),
-            stream_type: "live",
-            stream_id: channel?.key,
-            stream_icon: cleanString(channel?.logo),
-            epg_channel_id: "",
-            added: String(Math.floor(Date.now() / 1000)),
-            category_id: categoryId,
-            custom_sid: "",
-            tv_archive: 0,
-            direct_source: "",
-            tv_archive_duration: 0,
-        };
-    });
-
     return json({
         user_info: xtreamUserInfoPayload(user, request, env).user_info,
         server_info: xtreamServerInfo(request, env),
@@ -2939,7 +2994,13 @@ async function panelApiPayload(request, env, user) {
             movie: vodCategories,
             series: seriesCategories,
         },
-        available_channels: available_channels,
+        available_channels: channels.map((channel) => ({
+            stream_id: channel.key,
+            stream_display_name: channel.name,
+            stream_icon: channel.logo,
+            category_id: channel.category || "Live",
+            direct_source: "",
+        })),
     });
 }
 
@@ -3228,74 +3289,49 @@ async function handleXtreamApi(request, env, waitUntil) {
     // Authenticate
     const user = await resolveXtreamUser(env, username, password);
     if (!user) {
-        return json({ user_info: { username, password, auth: 0, status: "Disabled", exp_date: null, is_trial: "0", active_cons: "0", created_at: "0", max_connections: "0", allowed_output_formats: [] } });
+        const payload = { user_info: { username, password, auth: 0, status: "Disabled" } };
+        logXtreamAction(request, action || "auth_failed", payload);
+        return json(payload);
     }
 
-    if (!action) return json(xtreamUserInfoPayload(user, request, env));
-    if (action === "get_live_categories") return json(await xtreamLiveCategories(env));
-    if (action === "get_live_streams") return json(await xtreamLiveStreams(env, categoryId));
-    if (action === "get_vod_categories") return json(await xtreamVodCategories(env));
-    if (action === "get_vod_streams") return json(await xtreamVodStreams(env, categoryId));
-    if (action === "get_vod_info") {
+    let payload;
+    let logExtra = {};
+    if (!action) {
+        payload = xtreamUserInfoPayload(user, request, env);
+    } else if (action === "get_live_categories") {
+        payload = await xtreamLiveCategories(env);
+    } else if (action === "get_live_streams") {
+        payload = await xtreamLiveStreams(env, categoryId);
+        logExtra = { categoryId };
+    } else if (action === "get_vod_categories") {
+        payload = await xtreamVodCategories(env);
+    } else if (action === "get_vod_streams") {
+        payload = await xtreamVodStreams(env, categoryId);
+        logExtra = { categoryId };
+    } else if (action === "get_vod_info") {
         const vodId = cleanString(url.searchParams.get("vod_id") || url.searchParams.get("movie_id") || url.searchParams.get("stream_id"));
-        return json(await xtreamVodInfoPayload(env, vodId));
-    }
-    if (action === "get_series_categories") return json(await xtreamSeriesCategories(env));
-    if (action === "get_series") return json(await xtreamSeriesList(env, categoryId));
-    if (action === "get_series_info") {
+        payload = await xtreamVodInfoPayload(env, vodId);
+        logExtra = { id: vodId };
+    } else if (action === "get_series_categories") {
+        payload = await xtreamSeriesCategories(env);
+    } else if (action === "get_series") {
+        payload = await xtreamSeriesList(env, categoryId);
+        logExtra = { categoryId };
+    } else if (action === "get_series_info") {
         const seriesId = cleanString(url.searchParams.get("series_id"));
-        return json(await xtreamSeriesInfoPayload(env, seriesId));
-    }
-    if (action === "get_short_epg" || action === "get_simple_data_table") return json(xtreamEmptyEpgPayload());
-    if (action === "get_all_channels") return json(await xtreamLiveStreams(env, categoryId));
-    return json([]);
-}
-
-async function handleEnigma2Api(request, env) {
-    const url = new URL(request.url);
-    const username = cleanString(url.searchParams.get("username"));
-    const password = cleanString(url.searchParams.get("password"));
-    const type = cleanString(url.searchParams.get("type"));
-
-    const user = await resolveXtreamUser(env, username, password);
-    if (!user) return textResponse("Invalid credentials.", 403);
-
-    const base = publicBase(request, env);
-    const authParams = `username=${username}&password=${password}`;
-
-    if (!type) {
-        const xml = `<?xml version="1.0" encoding="utf-8"?>
-<items>
-  <playlist_name>Manus IPTV</playlist_name>
-  <category>
-    <category_id>1</category_id>
-    <category_title>Manus IPTV</category_title>
-  </category>
-  <channel>
-    <title>${btoa("Live Streams")}</title>
-    <description>${btoa("Live Streams Category")}</description>
-    <category_id>0</category_id>
-    <playlist_url><![CDATA[${base}/enigma2.php?${authParams}&type=get_live_categories]]></playlist_url>
-  </channel>
-  <channel>
-    <title>${btoa("Vod")}</title>
-    <description>${btoa("Video On Demand Category")}</description>
-    <category_id>1</category_id>
-    <playlist_url><![CDATA[${base}/enigma2.php?${authParams}&type=get_vod_categories]]></playlist_url>
-  </channel>
-  <channel>
-    <title>${btoa("TV Series")}</title>
-    <description>${btoa("TV Series Category")}</description>
-    <category_id>2</category_id>
-    <playlist_url><![CDATA[${base}/enigma2.php?${authParams}&type=get_series_categories]]></playlist_url>
-  </channel>
-</items>`;
-        return withCors(new Response(xml, { headers: { "content-type": "application/xml; charset=utf-8" } }));
+        payload = await xtreamSeriesInfoPayload(env, seriesId);
+        logExtra = { id: seriesId };
+    } else if (action === "get_short_epg" || action === "get_simple_data_table") {
+        payload = xtreamEmptyEpgPayload();
+    } else if (action === "get_all_channels") {
+        payload = await xtreamLiveStreams(env, categoryId);
+        logExtra = { categoryId };
+    } else {
+        payload = [];
     }
 
-    // Stub for categories/streams in Enigma2 format
-    const xml = `<?xml version="1.0" encoding="utf-8"?><items><playlist_name>Manus IPTV</playlist_name></items>`;
-    return withCors(new Response(xml, { headers: { "content-type": "application/xml; charset=utf-8" } }));
+    logXtreamAction(request, action, payload, logExtra);
+    return json(payload);
 }
 
 // ─── Custom Playlist API handlers ─────────────────────────────────────────────
@@ -3494,23 +3530,13 @@ async function handleRequest(request, env, waitUntil) {
         const username = cleanString(url.searchParams.get("username"));
         const password = cleanString(url.searchParams.get("password"));
         const user = await resolveXtreamUser(env, username, password);
-        if (!user) return json({ user_info: { username, password, auth: 0, status: "Disabled", exp_date: null, is_trial: "0", active_cons: "0", created_at: "0", max_connections: "0", allowed_output_formats: [] } });
+        if (!user) return json({ user_info: { username, password, auth: 0, status: "Disabled" } });
         return panelApiPayload(request, env, user);
-    }
-
-    if (path === "/enigma2.php") {
-        return handleEnigma2Api(request, env);
     }
 
     // Xtream EPG stub — apps need this endpoint to exist even if EPG is empty
     if (path === "/xmltv.php") {
-        const url = new URL(request.url);
-        const username = cleanString(url.searchParams.get("username"));
-        const password = cleanString(url.searchParams.get("password"));
-        const user = await resolveXtreamUser(env, username, password);
-        if (!user) return textResponse("Invalid credentials.", 403);
-
-        return withCors(new Response('<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE tv SYSTEM "xmltv.dtd"><tv generator-info-name="Manus IPTV" generator-info-url="' + publicBase(request, env) + '/"></tv>', {
+        return withCors(new Response('<?xml version="1.0" encoding="UTF-8"?><tv></tv>', {
             headers: { "content-type": "application/xml; charset=utf-8", "cache-control": "no-store" },
         }));
     }
@@ -3604,6 +3630,31 @@ async function handleRequest(request, env, waitUntil) {
 // Express server
 
 const app = express();
+let requestLogSeq = 0;
+
+app.use((req, res, next) => {
+    const id = (++requestLogSeq).toString(36).padStart(4, "0");
+    const startedAt = Date.now();
+    const url = sanitizeUrlForLog(req.originalUrl);
+    const client = requestClientForLog(req);
+    const userAgent = String(req.headers["user-agent"] || "").slice(0, 140);
+    const uaText = userAgent ? ` ua="${userAgent}"` : "";
+    console.log(`[request:${id}] -> ${req.method} ${url} from=${client}${uaText}`);
+
+    let logged = false;
+    const logDone = (event) => {
+        if (logged) return;
+        logged = true;
+        const elapsedMs = Date.now() - startedAt;
+        const closed = event === "close" && !res.writableEnded ? " closed" : "";
+        console.log(`[request:${id}] <- ${res.statusCode || 0} ${req.method} ${url} ${elapsedMs}ms${closed}`);
+    };
+
+    res.on("finish", () => logDone("finish"));
+    res.on("close", () => logDone("close"));
+    next();
+});
+
 app.use(express.raw({ type: "*/*", limit: "64kb" }));
 
 async function pipeWebResponse(webResponse, res) {
