@@ -2865,6 +2865,69 @@ function xtreamUserInfoPayload(user, request, env) {
     };
 }
 
+async function xtreamVodInfoPayload(env, vodId) {
+    const id = cleanString(vodId);
+    if (!id) return { info: {}, movie_data: {} };
+    for (const source of buildProviderPlaylistSources(env)) {
+        const catalog = await loadXtreamCatalog(env, source, "movies", false).catch(() => null);
+        if (!catalog) continue;
+        const item = catalog.itemsById.get(id);
+        if (!item) continue;
+        const ext = cleanString(item.container_extension, "mp4");
+        return {
+            info: {
+                movie_image: mediaLogo(item),
+                tmdb_id: cleanString(item.tmdb_id),
+                backdrop_path: Array.isArray(item.backdrop_path) ? item.backdrop_path : [],
+                youtube_trailer: cleanString(item.youtube_trailer),
+                genre: cleanString(item.genre),
+                plot: cleanString(item.plot),
+                cast: cleanString(item.cast),
+                rating: String(mediaRating(item) ?? ""),
+                director: cleanString(item.director),
+                releasedate: cleanString(item.releasedate ?? item.releaseDate ?? item.release_date),
+                duration_secs: Number.parseInt(cleanString(item.duration_secs), 10) || 0,
+                duration: cleanString(item.duration),
+            },
+            movie_data: {
+                stream_id: id,
+                name: cleanString(item.name, "Unknown"),
+                added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
+                category_id: cleanString(item.category_id),
+                container_extension: ext,
+            },
+        };
+    }
+    return { info: {}, movie_data: { stream_id: id } };
+}
+
+function xtreamEmptyEpgPayload() {
+    return { epg_listings: [] };
+}
+
+async function panelApiPayload(request, env, user) {
+    const channels = await loadPlaylistChannels(env, false).catch(() => []);
+    const liveCategories = await xtreamLiveCategories(env).catch(() => []);
+    const vodCategories = await xtreamVodCategories(env).catch(() => []);
+    const seriesCategories = await xtreamSeriesCategories(env).catch(() => []);
+    return json({
+        user_info: xtreamUserInfoPayload(user, request, env).user_info,
+        server_info: xtreamServerInfo(request, env),
+        categories: {
+            live: liveCategories,
+            movie: vodCategories,
+            series: seriesCategories,
+        },
+        available_channels: channels.map((channel) => ({
+            stream_id: channel.key,
+            stream_display_name: channel.name,
+            stream_icon: channel.logo,
+            category_id: channel.category || "Live",
+            direct_source: "",
+        })),
+    });
+}
+
 function aggregateXtreamCategories(catalogs) {
     const seen = new Set();
     const result = [];
@@ -3158,12 +3221,18 @@ async function handleXtreamApi(request, env, waitUntil) {
     if (action === "get_live_streams") return json(await xtreamLiveStreams(env, categoryId));
     if (action === "get_vod_categories") return json(await xtreamVodCategories(env));
     if (action === "get_vod_streams") return json(await xtreamVodStreams(env, categoryId));
+    if (action === "get_vod_info") {
+        const vodId = cleanString(url.searchParams.get("vod_id") || url.searchParams.get("movie_id") || url.searchParams.get("stream_id"));
+        return json(await xtreamVodInfoPayload(env, vodId));
+    }
     if (action === "get_series_categories") return json(await xtreamSeriesCategories(env));
     if (action === "get_series") return json(await xtreamSeriesList(env, categoryId));
     if (action === "get_series_info") {
         const seriesId = cleanString(url.searchParams.get("series_id"));
         return json(await xtreamSeriesInfoPayload(env, seriesId));
     }
+    if (action === "get_short_epg" || action === "get_simple_data_table") return json(xtreamEmptyEpgPayload());
+    if (action === "get_all_channels") return json(await xtreamLiveStreams(env, categoryId));
     return json([]);
 }
 
@@ -3356,6 +3425,15 @@ async function handleRequest(request, env, waitUntil) {
     // ─── Xtream Codes API (/player_api.php) ─────────────────────────────────────
     if (path === "/player_api.php" || path === "/player_api") {
         return handleXtreamApi(request, env, waitUntil);
+    }
+
+    if (path === "/panel_api.php" || path === "/panel_api") {
+        const url = new URL(request.url);
+        const username = cleanString(url.searchParams.get("username"));
+        const password = cleanString(url.searchParams.get("password"));
+        const user = await resolveXtreamUser(env, username, password);
+        if (!user) return json({ user_info: { username, password, auth: 0, status: "Disabled" } });
+        return panelApiPayload(request, env, user);
     }
 
     // Xtream EPG stub — apps need this endpoint to exist even if EPG is empty
