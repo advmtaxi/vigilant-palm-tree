@@ -21,7 +21,7 @@ const KEY_RE = /^[a-f0-9]{20}$/;
 const DEFAULT_PROVIDER_BASE_URL = "";
 // Generic user-agent — override with FETCH_USER_AGENT env var.
 const DEFAULT_FETCH_USER_AGENT = "Mozilla/5.0 (SmartTV; Linux) AppleWebKit/537.36";
-const APP_BUILD_ID = "dqvod-get-all-categories-live-streams-2026-06-14";
+const APP_BUILD_ID = "dqvod-get-all-categories-live-categories-2026-06-14";
 
 // Credentials come from env vars only: PROVIDER_USERNAME, PROVIDER_PASSWORD.
 // Nothing is hardcoded here.
@@ -3270,6 +3270,7 @@ async function xtreamSystemApiPayload(request, env, user, action = "") {
     }
 
     if (action === "get_live_categories") return { ...base, categories: await xtreamLiveCategories(env) };
+    if (action === "get_all_categories") return { ...base, categories: await xtreamLiveCategories(env) };
     if (action === "get_vod_categories") return { ...base, categories: await xtreamVodCategories(env) };
     if (action === "get_series_categories") return { ...base, categories: await xtreamSeriesCategories(env) };
     if (action === "get_live_streams") return { ...base, streams: await xtreamLiveStreams(env, cleanString(url.searchParams.get("category_id"))) };
@@ -3390,8 +3391,8 @@ async function handleXtreamApi(request, env, waitUntil) {
     if (!action) {
         payload = xtreamUserInfoPayload(user, request, env);
     } else if (action === "get_all_categories") {
-        payload = await xtreamLiveStreams(env, categoryId);
-        logExtra = { categoryId, mode: "dqvod_live_streams" };
+        payload = await xtreamLiveCategories(env);
+        logExtra = { mode: "dqvod_live_categories" };
     } else if (action === "get_live_categories") {
         payload = await xtreamLiveCategories(env);
     } else if (action === "get_live_streams") {
@@ -3617,8 +3618,8 @@ async function handleRequest(request, env, waitUntil) {
     if (path === "/__version") {
         return json({
             build: APP_BUILD_ID,
-            xtream_compatibility: "get_all_categories returns live streams",
-            updated_at: "2026-06-14T00:27:07+02:00",
+            xtream_compatibility: "get_all_categories returns live categories",
+            updated_at: "2026-06-14T00:35:00+02:00",
         });
     }
 
@@ -3948,6 +3949,6 @@ app.listen(PORT, "0.0.0.0", () => {
     console.log(`running on port ${PORT}`);
     console.log(`Public base: ${process.env.WORKER_PUBLIC_BASE || "(auto from request)"}`);
     console.log(`Build: ${APP_BUILD_ID}`);
-    console.log("Xtream compatibility: get_all_categories -> live streams");
+    console.log("Xtream compatibility: get_all_categories -> live categories");
     void prewarmCaches();
 });
