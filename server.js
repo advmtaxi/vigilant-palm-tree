@@ -2880,10 +2880,68 @@ function aggregateXtreamCategories(catalogs) {
     return result;
 }
 
+function xtreamFallbackCategoryId(name) {
+    const text = normalizeSearchText(name).replace(/\s+/g, "_");
+    return text || "all";
+}
+
+function localXtreamLiveCategories(channels) {
+    const categories = new Map();
+    for (const channel of channels) {
+        const categoryName = cleanString(channel?.category, "Live");
+        const categoryId = xtreamFallbackCategoryId(categoryName);
+        if (!categories.has(categoryId)) {
+            categories.set(categoryId, {
+                category_id: categoryId,
+                category_name: categoryName,
+                parent_id: 0,
+            });
+        }
+    }
+    if (categories.size === 0) {
+        categories.set("all", { category_id: "all", category_name: "All", parent_id: 0 });
+    }
+    return [...categories.values()];
+}
+
+function localXtreamLiveStreams(channels, categoryId = "") {
+    const wantedCategoryId = cleanString(categoryId);
+    const result = [];
+    let num = 1;
+    for (const channel of channels) {
+        const categoryName = cleanString(channel?.category, "Live");
+        const liveCategoryId = xtreamFallbackCategoryId(categoryName);
+        if (wantedCategoryId && wantedCategoryId !== "0" && wantedCategoryId !== liveCategoryId) continue;
+        result.push({
+            num: num++,
+            name: cleanString(channel?.name, "Unknown"),
+            stream_type: "live",
+            stream_id: channel?.key,
+            stream_icon: cleanString(channel?.logo),
+            epg_channel_id: "",
+            added: String(Math.floor(Date.now() / 1000)),
+            category_id: liveCategoryId,
+            custom_sid: "",
+            tv_archive: 0,
+            direct_source: "",
+            tv_archive_duration: 0,
+        });
+    }
+    return result;
+}
+
 async function xtreamLiveCategories(env) {
     const sources = buildProviderPlaylistSources(env);
     const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "live", false).catch(() => null)));
-    return aggregateXtreamCategories(catalogs);
+    const liveCategories = aggregateXtreamCategories(catalogs);
+    if (liveCategories.length > 1 || (liveCategories.length === 1 && liveCategories[0]?.category_id !== "1")) {
+        return liveCategories;
+    }
+
+    const channels = await loadPlaylistChannels(env, false).catch(() => []);
+    if (channels.length > 0) return localXtreamLiveCategories(channels);
+
+    return liveCategories;
 }
 
 async function xtreamLiveStreams(env, categoryId = "") {
@@ -2916,7 +2974,11 @@ async function xtreamLiveStreams(env, categoryId = "") {
             });
         }
     }
-    return result;
+    if (result.length > 0) return result;
+
+    const channels = await loadPlaylistChannels(env, false).catch(() => []);
+    if (channels.length === 0) return result;
+    return localXtreamLiveStreams(channels, wantedCategoryId);
 }
 
 async function xtreamVodCategories(env) {
@@ -3041,6 +3103,8 @@ async function requireXtreamAuth(username, password) {
 
 // Look up live source URL from catalogs by stream_id
 async function findXtreamLiveUrl(env, streamId) {
+    const cachedSourceUrl = streamIndex.get(String(streamId));
+    if (cachedSourceUrl) return cachedSourceUrl;
     for (const source of buildProviderPlaylistSources(env)) {
         const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
         if (!catalog) continue;
@@ -3303,7 +3367,7 @@ async function handleRequest(request, env, waitUntil) {
 
     // ─── Xtream live stream proxy: /live/{user}/{pass}/{stream_id}.{ext} ─────────
     // (Only when stream_id is numeric — hex-key URLs are handled below)
-    const xtreamLiveMatch = path.match(/^\/live\/([^/]+)\/([^/]+)\/([0-9]+)\.(m3u8|ts|mp4|mpeg)$/);
+    const xtreamLiveMatch = path.match(/^\/live\/([^/]+)\/([^/]+)\/([A-Za-z0-9_-]{4,64})\.(m3u8|ts|mp4|mpeg)$/);
     if (xtreamLiveMatch) {
         await requireXtreamAuth(xtreamLiveMatch[1], xtreamLiveMatch[2]);
         const sourceUrl = await findXtreamLiveUrl(env, xtreamLiveMatch[3]);
