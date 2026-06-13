@@ -2831,10 +2831,11 @@ function xtreamServerInfo(request, env) {
     const base = publicBase(request, env);
     const parsed = new URL(base);
     const now = Math.floor(Date.now() / 1000);
+    const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
     return {
-        url: parsed.hostname,
-        port: parsed.port || (parsed.protocol === "https:" ? "443" : "80"),
-        https_port: parsed.protocol === "https:" ? (parsed.port || "443") : "443",
+        url: parsed.origin,
+        port: String(port),
+        https_port: String(parsed.protocol === "https:" ? port : "443"),
         server_protocol: parsed.protocol.replace(":", ""),
         rtmp_port: "1935",
         timezone: "UTC",
@@ -2851,15 +2852,15 @@ function xtreamUserInfoPayload(user, request, env) {
         user_info: {
             username: user.username,
             password: user.password,
-            message: "",
+            message: "Welcome to Manus IPTV",
             auth: 1,
             status: isAccessUserExpired(user) ? "Expired" : "Active",
             exp_date: expDate ? String(expDate) : null,
             is_trial: "0",
-            active_cons: "1",
+            active_cons: "0",
             created_at: user.createdAt ? String(Math.floor(new Date(user.createdAt).getTime() / 1000)) : String(now),
             max_connections: "10",
-            allowed_output_formats: ["m3u8", "ts", "rtmpe"],
+            allowed_output_formats: ["m3u8", "ts", "rtmp"],
         },
         server_info: xtreamServerInfo(request, env),
     };
@@ -2910,6 +2911,26 @@ async function panelApiPayload(request, env, user) {
     const liveCategories = await xtreamLiveCategories(env).catch(() => []);
     const vodCategories = await xtreamVodCategories(env).catch(() => []);
     const seriesCategories = await xtreamSeriesCategories(env).catch(() => []);
+
+    const available_channels = channels.map((channel, index) => {
+        const categoryName = cleanString(channel?.category, "Live");
+        const categoryId = xtreamFallbackCategoryId(categoryName);
+        return {
+            num: index + 1,
+            name: cleanString(channel?.name, "Unknown"),
+            stream_type: "live",
+            stream_id: channel?.key,
+            stream_icon: cleanString(channel?.logo),
+            epg_channel_id: "",
+            added: String(Math.floor(Date.now() / 1000)),
+            category_id: categoryId,
+            custom_sid: "",
+            tv_archive: 0,
+            direct_source: "",
+            tv_archive_duration: 0,
+        };
+    });
+
     return json({
         user_info: xtreamUserInfoPayload(user, request, env).user_info,
         server_info: xtreamServerInfo(request, env),
@@ -2918,13 +2939,7 @@ async function panelApiPayload(request, env, user) {
             movie: vodCategories,
             series: seriesCategories,
         },
-        available_channels: channels.map((channel) => ({
-            stream_id: channel.key,
-            stream_display_name: channel.name,
-            stream_icon: channel.logo,
-            category_id: channel.category || "Live",
-            direct_source: "",
-        })),
+        available_channels: available_channels,
     });
 }
 
@@ -3213,7 +3228,7 @@ async function handleXtreamApi(request, env, waitUntil) {
     // Authenticate
     const user = await resolveXtreamUser(env, username, password);
     if (!user) {
-        return json({ user_info: { username, password, auth: 0, status: "Disabled" } });
+        return json({ user_info: { username, password, auth: 0, status: "Disabled", exp_date: null, is_trial: "0", active_cons: "0", created_at: "0", max_connections: "0", allowed_output_formats: [] } });
     }
 
     if (!action) return json(xtreamUserInfoPayload(user, request, env));
@@ -3234,6 +3249,53 @@ async function handleXtreamApi(request, env, waitUntil) {
     if (action === "get_short_epg" || action === "get_simple_data_table") return json(xtreamEmptyEpgPayload());
     if (action === "get_all_channels") return json(await xtreamLiveStreams(env, categoryId));
     return json([]);
+}
+
+async function handleEnigma2Api(request, env) {
+    const url = new URL(request.url);
+    const username = cleanString(url.searchParams.get("username"));
+    const password = cleanString(url.searchParams.get("password"));
+    const type = cleanString(url.searchParams.get("type"));
+
+    const user = await resolveXtreamUser(env, username, password);
+    if (!user) return textResponse("Invalid credentials.", 403);
+
+    const base = publicBase(request, env);
+    const authParams = `username=${username}&password=${password}`;
+
+    if (!type) {
+        const xml = `<?xml version="1.0" encoding="utf-8"?>
+<items>
+  <playlist_name>Manus IPTV</playlist_name>
+  <category>
+    <category_id>1</category_id>
+    <category_title>Manus IPTV</category_title>
+  </category>
+  <channel>
+    <title>${btoa("Live Streams")}</title>
+    <description>${btoa("Live Streams Category")}</description>
+    <category_id>0</category_id>
+    <playlist_url><![CDATA[${base}/enigma2.php?${authParams}&type=get_live_categories]]></playlist_url>
+  </channel>
+  <channel>
+    <title>${btoa("Vod")}</title>
+    <description>${btoa("Video On Demand Category")}</description>
+    <category_id>1</category_id>
+    <playlist_url><![CDATA[${base}/enigma2.php?${authParams}&type=get_vod_categories]]></playlist_url>
+  </channel>
+  <channel>
+    <title>${btoa("TV Series")}</title>
+    <description>${btoa("TV Series Category")}</description>
+    <category_id>2</category_id>
+    <playlist_url><![CDATA[${base}/enigma2.php?${authParams}&type=get_series_categories]]></playlist_url>
+  </channel>
+</items>`;
+        return withCors(new Response(xml, { headers: { "content-type": "application/xml; charset=utf-8" } }));
+    }
+
+    // Stub for categories/streams in Enigma2 format
+    const xml = `<?xml version="1.0" encoding="utf-8"?><items><playlist_name>Manus IPTV</playlist_name></items>`;
+    return withCors(new Response(xml, { headers: { "content-type": "application/xml; charset=utf-8" } }));
 }
 
 // ─── Custom Playlist API handlers ─────────────────────────────────────────────
@@ -3432,13 +3494,23 @@ async function handleRequest(request, env, waitUntil) {
         const username = cleanString(url.searchParams.get("username"));
         const password = cleanString(url.searchParams.get("password"));
         const user = await resolveXtreamUser(env, username, password);
-        if (!user) return json({ user_info: { username, password, auth: 0, status: "Disabled" } });
+        if (!user) return json({ user_info: { username, password, auth: 0, status: "Disabled", exp_date: null, is_trial: "0", active_cons: "0", created_at: "0", max_connections: "0", allowed_output_formats: [] } });
         return panelApiPayload(request, env, user);
+    }
+
+    if (path === "/enigma2.php") {
+        return handleEnigma2Api(request, env);
     }
 
     // Xtream EPG stub — apps need this endpoint to exist even if EPG is empty
     if (path === "/xmltv.php") {
-        return withCors(new Response('<?xml version="1.0" encoding="UTF-8"?><tv></tv>', {
+        const url = new URL(request.url);
+        const username = cleanString(url.searchParams.get("username"));
+        const password = cleanString(url.searchParams.get("password"));
+        const user = await resolveXtreamUser(env, username, password);
+        if (!user) return textResponse("Invalid credentials.", 403);
+
+        return withCors(new Response('<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE tv SYSTEM "xmltv.dtd"><tv generator-info-name="Manus IPTV" generator-info-url="' + publicBase(request, env) + '/"></tv>', {
             headers: { "content-type": "application/xml; charset=utf-8", "cache-control": "no-store" },
         }));
     }
