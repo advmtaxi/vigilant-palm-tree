@@ -853,6 +853,35 @@ function dashboardAuthResponse() {
     });
 }
 
+function providerXtreamCredentials(env) {
+    const username = envString(env, "PROVIDER_USERNAME") || envString(env, "IPTV_USERNAME");
+    const password = envString(env, "PROVIDER_PASSWORD") || envString(env, "IPTV_PASSWORD");
+    if (!username || !password) return null;
+    return { username, password };
+}
+
+async function resolveXtreamUser(env, username, password) {
+    const users = await loadAccessUsers(env);
+    const user = users.find((entry) => entry.username === username && entry.password === password);
+    if (user && !user.disabled && !isAccessUserExpired(user)) return user;
+
+    const provider = providerXtreamCredentials(env);
+    if (provider && provider.username === username && provider.password === password) {
+        return {
+            username,
+            password,
+            createdAt: new Date().toISOString(),
+            expiresAt: null,
+            disabled: false,
+            includeLive: true,
+            includeMovies: true,
+            includeSeries: true,
+        };
+    }
+
+    return null;
+}
+
 async function readRequestData(request) {
     const text = await request.text();
     if (!text.trim()) return {};
@@ -2857,10 +2886,11 @@ async function xtreamLiveCategories(env) {
     return aggregateXtreamCategories(catalogs);
 }
 
-async function xtreamLiveStreams(env) {
+async function xtreamLiveStreams(env, categoryId = "") {
     const sources = buildProviderPlaylistSources(env);
     const result = [];
     const seenIds = new Set();
+    const wantedCategoryId = cleanString(categoryId);
     let num = 1;
     for (const source of sources) {
         const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
@@ -2868,6 +2898,7 @@ async function xtreamLiveStreams(env) {
         for (const item of catalog.items) {
             const id = itemId(item, "live");
             if (!id || seenIds.has(id)) continue;
+            if (wantedCategoryId && wantedCategoryId !== "0" && cleanString(item.category_id) !== wantedCategoryId) continue;
             seenIds.add(id);
             result.push({
                 num: num++,
@@ -2894,10 +2925,11 @@ async function xtreamVodCategories(env) {
     return aggregateXtreamCategories(catalogs);
 }
 
-async function xtreamVodStreams(env) {
+async function xtreamVodStreams(env, categoryId = "") {
     const sources = buildProviderPlaylistSources(env);
     const result = [];
     const seenIds = new Set();
+    const wantedCategoryId = cleanString(categoryId);
     let num = 1;
     for (const source of sources) {
         const catalog = await loadXtreamCatalog(env, source, "movies", false).catch(() => null);
@@ -2905,6 +2937,7 @@ async function xtreamVodStreams(env) {
         for (const item of catalog.items) {
             const id = itemId(item, "movies");
             if (!id || seenIds.has(id)) continue;
+            if (wantedCategoryId && wantedCategoryId !== "0" && cleanString(item.category_id) !== wantedCategoryId) continue;
             seenIds.add(id);
             const ext = cleanString(item.container_extension, "mp4");
             const upstreamUrl = xtreamMediaUrl(catalog.config, "movie", String(id), ext);
@@ -2934,10 +2967,11 @@ async function xtreamSeriesCategories(env) {
     return aggregateXtreamCategories(catalogs);
 }
 
-async function xtreamSeriesList(env) {
+async function xtreamSeriesList(env, categoryId = "") {
     const sources = buildProviderPlaylistSources(env);
     const result = [];
     const seenIds = new Set();
+    const wantedCategoryId = cleanString(categoryId);
     let num = 1;
     for (const source of sources) {
         const catalog = await loadXtreamCatalog(env, source, "series", false).catch(() => null);
@@ -2945,6 +2979,7 @@ async function xtreamSeriesList(env) {
         for (const item of catalog.items) {
             const id = itemId(item, "series");
             if (!id || seenIds.has(id)) continue;
+            if (wantedCategoryId && wantedCategoryId !== "0" && cleanString(item.category_id) !== wantedCategoryId) continue;
             seenIds.add(id);
             result.push({
                 num: num++,
@@ -2999,9 +3034,8 @@ async function xtreamSeriesInfoPayload(env, seriesId) {
 
 // Auth helper reused by stream URL handlers
 async function requireXtreamAuth(username, password) {
-    const users = await loadAccessUsers(process.env);
-    const user = users.find((u) => u.username === username && u.password === password);
-    if (!user || user.disabled || isAccessUserExpired(user)) throw new HttpError(403, "Invalid credentials.");
+    const user = await resolveXtreamUser(process.env, username, password);
+    if (!user) throw new HttpError(403, "Invalid credentials.");
     return user;
 }
 
@@ -3047,21 +3081,21 @@ async function handleXtreamApi(request, env, waitUntil) {
     const username = cleanString(url.searchParams.get("username"));
     const password = cleanString(url.searchParams.get("password"));
     const action = cleanString(url.searchParams.get("action"));
+    const categoryId = cleanString(url.searchParams.get("category_id"));
 
     // Authenticate
-    const users = await loadAccessUsers(env);
-    const user = users.find((u) => u.username === username && u.password === password);
-    if (!user || user.disabled || isAccessUserExpired(user)) {
+    const user = await resolveXtreamUser(env, username, password);
+    if (!user) {
         return json({ user_info: { username, password, auth: 0, status: "Disabled" } });
     }
 
     if (!action) return json(xtreamUserInfoPayload(user, request, env));
     if (action === "get_live_categories") return json(await xtreamLiveCategories(env));
-    if (action === "get_live_streams") return json(await xtreamLiveStreams(env));
+    if (action === "get_live_streams") return json(await xtreamLiveStreams(env, categoryId));
     if (action === "get_vod_categories") return json(await xtreamVodCategories(env));
-    if (action === "get_vod_streams") return json(await xtreamVodStreams(env));
+    if (action === "get_vod_streams") return json(await xtreamVodStreams(env, categoryId));
     if (action === "get_series_categories") return json(await xtreamSeriesCategories(env));
-    if (action === "get_series") return json(await xtreamSeriesList(env));
+    if (action === "get_series") return json(await xtreamSeriesList(env, categoryId));
     if (action === "get_series_info") {
         const seriesId = cleanString(url.searchParams.get("series_id"));
         return json(await xtreamSeriesInfoPayload(env, seriesId));
