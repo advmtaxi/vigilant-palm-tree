@@ -21,7 +21,7 @@ const KEY_RE = /^[a-f0-9]{20}$/;
 const DEFAULT_PROVIDER_BASE_URL = "";
 // Generic user-agent — override with FETCH_USER_AGENT env var.
 const DEFAULT_FETCH_USER_AGENT = "Mozilla/5.0 (SmartTV; Linux) AppleWebKit/537.36";
-const APP_BUILD_ID = "dqvod-get-all-categories-envelope-2026-06-14";
+const APP_BUILD_ID = "dqvod-live-stream-url-fields-2026-06-14";
 
 // Credentials come from env vars only: PROVIDER_USERNAME, PROVIDER_PASSWORD.
 // Nothing is hardcoded here.
@@ -3061,7 +3061,13 @@ function localXtreamLiveCategories(channels) {
     return [...categories.values()];
 }
 
-function localXtreamLiveStreams(channels, categoryId = "") {
+function xtreamLivePlaybackUrl(request, env, user, streamId) {
+    if (!request || !user || !streamId) return "";
+    const base = publicBase(request, env);
+    return `${base}/live/${encodePathSegment(user.username)}/${encodePathSegment(user.password)}/${encodePathSegment(streamId)}.m3u8`;
+}
+
+function localXtreamLiveStreams(channels, categoryId = "", request = null, env = process.env, user = null) {
     const wantedCategoryId = cleanString(categoryId);
     const result = [];
     let num = 1;
@@ -3069,6 +3075,7 @@ function localXtreamLiveStreams(channels, categoryId = "") {
         const categoryName = cleanString(channel?.category, "Live");
         const liveCategoryId = xtreamFallbackCategoryId(categoryName);
         if (wantedCategoryId && wantedCategoryId !== "0" && wantedCategoryId !== liveCategoryId) continue;
+        const streamUrl = xtreamLivePlaybackUrl(request, env, user, channel?.key);
         result.push({
             num: num++,
             name: cleanString(channel?.name, "Unknown"),
@@ -3080,7 +3087,10 @@ function localXtreamLiveStreams(channels, categoryId = "") {
             category_id: liveCategoryId,
             custom_sid: "",
             tv_archive: 0,
-            direct_source: "",
+            direct_source: streamUrl,
+            stream_url: streamUrl,
+            url: streamUrl,
+            container_extension: "m3u8",
             tv_archive_duration: 0,
         });
     }
@@ -3101,7 +3111,7 @@ async function xtreamLiveCategories(env) {
     return liveCategories;
 }
 
-async function xtreamLiveStreams(env, categoryId = "") {
+async function xtreamLiveStreams(env, categoryId = "", request = null, user = null) {
     const sources = buildProviderPlaylistSources(env);
     const result = [];
     const seenIds = new Set();
@@ -3115,6 +3125,7 @@ async function xtreamLiveStreams(env, categoryId = "") {
             if (!id || seenIds.has(id)) continue;
             if (wantedCategoryId && wantedCategoryId !== "0" && cleanString(item.category_id) !== wantedCategoryId) continue;
             seenIds.add(id);
+            const streamUrl = xtreamLivePlaybackUrl(request, env, user, id);
             result.push({
                 num: num++,
                 name: cleanString(item.name, "Unknown"),
@@ -3126,7 +3137,10 @@ async function xtreamLiveStreams(env, categoryId = "") {
                 category_id: cleanString(item.category_id),
                 custom_sid: "",
                 tv_archive: 0,
-                direct_source: "",
+                direct_source: streamUrl,
+                stream_url: streamUrl,
+                url: streamUrl,
+                container_extension: "m3u8",
                 tv_archive_duration: 0,
             });
         }
@@ -3135,7 +3149,7 @@ async function xtreamLiveStreams(env, categoryId = "") {
 
     const channels = await loadPlaylistChannels(env, false).catch(() => []);
     if (channels.length === 0) return result;
-    return localXtreamLiveStreams(channels, wantedCategoryId);
+    return localXtreamLiveStreams(channels, wantedCategoryId, request, env, user);
 }
 
 async function xtreamVodCategories(env) {
@@ -3289,7 +3303,7 @@ async function xtreamSystemApiPayload(request, env, user, action = "") {
     if (action === "get_all_categories") return xtreamAllCategoriesPayload(request, env, user);
     if (action === "get_vod_categories") return { ...base, categories: await xtreamVodCategories(env) };
     if (action === "get_series_categories") return { ...base, categories: await xtreamSeriesCategories(env) };
-    if (action === "get_live_streams") return { ...base, streams: await xtreamLiveStreams(env, cleanString(url.searchParams.get("category_id"))) };
+    if (action === "get_live_streams") return { ...base, streams: await xtreamLiveStreams(env, cleanString(url.searchParams.get("category_id")), request, user) };
     if (action === "get_vod_streams") return { ...base, streams: await xtreamVodStreams(env, cleanString(url.searchParams.get("category_id"))) };
     if (action === "get_series") return { ...base, streams: await xtreamSeriesList(env, cleanString(url.searchParams.get("category_id"))) };
 
@@ -3326,7 +3340,7 @@ function xtreamPortalHtml(request, env, user) {
 
 async function enigma2XmlPayload(request, env, user, action = "") {
     const url = new URL(request.url);
-    const channels = await xtreamLiveStreams(env, cleanString(url.searchParams.get("category_id"))).catch(() => []);
+    const channels = await xtreamLiveStreams(env, cleanString(url.searchParams.get("category_id")), request, user).catch(() => []);
     const base = publicBase(request, env);
 
     const bouquetItems = channels.map((channel) => {
@@ -3412,7 +3426,7 @@ async function handleXtreamApi(request, env, waitUntil) {
     } else if (action === "get_live_categories") {
         payload = await xtreamLiveCategories(env);
     } else if (action === "get_live_streams") {
-        payload = await xtreamLiveStreams(env, categoryId);
+        payload = await xtreamLiveStreams(env, categoryId, request, user);
         logExtra = { categoryId };
     } else if (action === "get_vod_categories") {
         payload = await xtreamVodCategories(env);
@@ -3435,7 +3449,7 @@ async function handleXtreamApi(request, env, waitUntil) {
     } else if (action === "get_short_epg" || action === "get_simple_data_table") {
         payload = xtreamEmptyEpgPayload();
     } else if (action === "get_all_channels" || action === "get_all_streams" || action === "get_all_live_streams") {
-        payload = await xtreamLiveStreams(env, categoryId);
+        payload = await xtreamLiveStreams(env, categoryId, request, user);
         logExtra = { categoryId };
     } else {
         console.warn(`[xtream] unsupported action=${action}; returning empty list`);
