@@ -21,6 +21,7 @@ const KEY_RE = /^[a-f0-9]{20}$/;
 const DEFAULT_PROVIDER_BASE_URL = "";
 // Generic user-agent — override with FETCH_USER_AGENT env var.
 const DEFAULT_FETCH_USER_AGENT = "Mozilla/5.0 (SmartTV; Linux) AppleWebKit/537.36";
+const APP_BUILD_ID = "dqvod-get-all-categories-live-streams-2026-06-14";
 
 // Credentials come from env vars only: PROVIDER_USERNAME, PROVIDER_PASSWORD.
 // Nothing is hardcoded here.
@@ -261,6 +262,7 @@ function logXtreamAction(request, action, payload, extra = {}) {
     const count = payloadCount(payload);
     const details = [
         `action=${action || "auth"}`,
+        extra.mode ? `mode=${extra.mode}` : "",
         extra.categoryId ? `category=${extra.categoryId}` : "",
         extra.id ? `id=${extra.id}` : "",
         count === null ? "" : `count=${count}`,
@@ -3233,6 +3235,95 @@ async function xtreamSeriesInfoPayload(env, seriesId) {
     return { seasons: [], info: {}, episodes: {} };
 }
 
+function escapeXml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&apos;");
+}
+
+function xtreamSuccessEnvelope(user, request, env) {
+    return {
+        status: "ok",
+        user_info: xtreamUserInfoPayload(user, request, env).user_info,
+        server_info: xtreamServerInfo(request, env),
+    };
+}
+
+async function xtreamSystemApiPayload(request, env, user, action = "") {
+    const base = xtreamSuccessEnvelope(user, request, env);
+    const url = new URL(request.url);
+
+    if (action === "get_main_info" || action === "get_version" || action === "get_settings") {
+        return {
+            ...base,
+            system_info: {
+                project: "xtream-compatible",
+                endpoint: url.pathname,
+                live_categories: (await xtreamLiveCategories(env).catch(() => [])).length,
+                movie_categories: (await xtreamVodCategories(env).catch(() => [])).length,
+                series_categories: (await xtreamSeriesCategories(env).catch(() => [])).length,
+            },
+        };
+    }
+
+    if (action === "get_live_categories") return { ...base, categories: await xtreamLiveCategories(env) };
+    if (action === "get_vod_categories") return { ...base, categories: await xtreamVodCategories(env) };
+    if (action === "get_series_categories") return { ...base, categories: await xtreamSeriesCategories(env) };
+    if (action === "get_live_streams") return { ...base, streams: await xtreamLiveStreams(env, cleanString(url.searchParams.get("category_id"))) };
+    if (action === "get_vod_streams") return { ...base, streams: await xtreamVodStreams(env, cleanString(url.searchParams.get("category_id"))) };
+    if (action === "get_series") return { ...base, streams: await xtreamSeriesList(env, cleanString(url.searchParams.get("category_id"))) };
+
+    return base;
+}
+
+function xtreamPortalHtml(request, env, user) {
+    const base = publicBase(request, env);
+    const login = encodeURIComponent(`${user.username}:${user.password}`);
+    return htmlResponse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Xtream Portal</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 32px; background: #0f1115; color: #f5f7fb; }
+    .card { max-width: 760px; margin: 0 auto; background: #181b22; border: 1px solid #313746; border-radius: 10px; padding: 24px; }
+    a { color: #4fc3a1; }
+    code { display: block; white-space: pre-wrap; background: #11141a; padding: 12px; border-radius: 8px; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Xtream Portal</h1>
+    <p>This server exposes Xtream-compatible endpoints for receivers and apps that probe portal URLs first.</p>
+    <p><a href="${base}/player_api.php?username=${encodeURIComponent(user.username)}&password=${encodeURIComponent(user.password)}">player_api.php</a></p>
+    <code>${base}/get.php?username=${encodeURIComponent(user.username)}&password=${encodeURIComponent(user.password)}&type=m3u_plus</code>
+    <p>Login: <code>${login}</code></p>
+  </div>
+</body>
+</html>`);
+}
+
+async function enigma2XmlPayload(request, env, user, action = "") {
+    const url = new URL(request.url);
+    const channels = await xtreamLiveStreams(env, cleanString(url.searchParams.get("category_id"))).catch(() => []);
+    const base = publicBase(request, env);
+
+    const bouquetItems = channels.map((channel) => {
+        const streamUrl = `${base}/live/${encodeURIComponent(user.username)}/${encodeURIComponent(user.password)}/${encodeURIComponent(channel.stream_id)}.m3u8`;
+        return `    <service>\n      <name>${escapeXml(channel.name)}</name>\n      <stream_id>${escapeXml(channel.stream_id)}</stream_id>\n      <stream_url>${escapeXml(streamUrl)}</stream_url>\n      <category>${escapeXml(channel.category_id || "Live")}</category>\n    </service>`;
+    }).join("\n");
+
+    const header = `<?xml version="1.0" encoding="UTF-8"?>\n<enigma2 action="${escapeXml(action || "getservices")}">`;
+    const body = bouquetItems || "    <service />";
+    return withCors(new Response(`${header}\n  <user>${escapeXml(user.username)}</user>\n  <services>\n${body}\n  </services>\n</enigma2>\n`, {
+        headers: { "content-type": "application/xml; charset=utf-8", "cache-control": "no-store" },
+    }));
+}
+
 // Auth helper reused by stream URL handlers
 async function requireXtreamAuth(username, password) {
     const user = await resolveXtreamUser(process.env, username, password);
@@ -3298,6 +3389,9 @@ async function handleXtreamApi(request, env, waitUntil) {
     let logExtra = {};
     if (!action) {
         payload = xtreamUserInfoPayload(user, request, env);
+    } else if (action === "get_all_categories") {
+        payload = await xtreamLiveStreams(env, categoryId);
+        logExtra = { categoryId, mode: "dqvod_live_streams" };
     } else if (action === "get_live_categories") {
         payload = await xtreamLiveCategories(env);
     } else if (action === "get_live_streams") {
@@ -3323,15 +3417,49 @@ async function handleXtreamApi(request, env, waitUntil) {
         logExtra = { id: seriesId };
     } else if (action === "get_short_epg" || action === "get_simple_data_table") {
         payload = xtreamEmptyEpgPayload();
-    } else if (action === "get_all_channels") {
+    } else if (action === "get_all_channels" || action === "get_all_streams" || action === "get_all_live_streams") {
         payload = await xtreamLiveStreams(env, categoryId);
         logExtra = { categoryId };
     } else {
+        console.warn(`[xtream] unsupported action=${action}; returning empty list`);
         payload = [];
     }
 
     logXtreamAction(request, action, payload, logExtra);
     return json(payload);
+}
+
+async function handleSystemApi(request, env) {
+    const url = new URL(request.url);
+    const username = cleanString(url.searchParams.get("username"));
+    const password = cleanString(url.searchParams.get("password"));
+    const action = cleanString(url.searchParams.get("action"));
+    const user = await resolveXtreamUser(env, username, password);
+    if (!user) return json({ user_info: { username, password, auth: 0, status: "Disabled" } });
+    return json(await xtreamSystemApiPayload(request, env, user, action));
+}
+
+async function handlePortalApi(request, env) {
+    const url = new URL(request.url);
+    const username = cleanString(url.searchParams.get("username"));
+    const password = cleanString(url.searchParams.get("password"));
+    const action = cleanString(url.searchParams.get("action"));
+    const user = await resolveXtreamUser(env, username, password);
+    if (!user) return json({ user_info: { username, password, auth: 0, status: "Disabled" } });
+    if (action) return json(await xtreamSystemApiPayload(request, env, user, action));
+    return xtreamPortalHtml(request, env, user);
+}
+
+async function handleEnigma2Api(request, env) {
+    const url = new URL(request.url);
+    const username = cleanString(url.searchParams.get("username"));
+    const password = cleanString(url.searchParams.get("password"));
+    const action = cleanString(url.searchParams.get("action"));
+    const user = await resolveXtreamUser(env, username, password);
+    if (!user) return withCors(new Response("<?xml version=\"1.0\" encoding=\"UTF-8\"?><enigma2><auth>0</auth></enigma2>", {
+        headers: { "content-type": "application/xml; charset=utf-8", "cache-control": "no-store" },
+    }));
+    return enigma2XmlPayload(request, env, user, action);
 }
 
 // ─── Custom Playlist API handlers ─────────────────────────────────────────────
@@ -3486,6 +3614,14 @@ async function handleRequest(request, env, waitUntil) {
         return json({ error: "Method not allowed." }, 405);
     }
 
+    if (path === "/__version") {
+        return json({
+            build: APP_BUILD_ID,
+            xtream_compatibility: "get_all_categories returns live streams",
+            updated_at: "2026-06-14T00:27:07+02:00",
+        });
+    }
+
     if (path === "/") {
         if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
         return htmlResponse(dashboardPage());
@@ -3523,6 +3659,22 @@ async function handleRequest(request, env, waitUntil) {
     // ─── Xtream Codes API (/player_api.php) ─────────────────────────────────────
     if (path === "/player_api.php" || path === "/player_api") {
         return handleXtreamApi(request, env, waitUntil);
+    }
+
+    if (path === "/api.php") {
+        return handleXtreamApi(request, env, waitUntil);
+    }
+
+    if (path === "/system_api.php" || path === "/system_api") {
+        return handleSystemApi(request, env);
+    }
+
+    if (path === "/portal.php") {
+        return handlePortalApi(request, env);
+    }
+
+    if (path === "/enigma2.php") {
+        return handleEnigma2Api(request, env);
     }
 
     if (path === "/panel_api.php" || path === "/panel_api") {
@@ -3660,6 +3812,7 @@ app.use(express.raw({ type: "*/*", limit: "64kb" }));
 async function pipeWebResponse(webResponse, res) {
     res.status(webResponse.status);
     webResponse.headers.forEach((value, key) => res.set(key, value));
+    res.set("x-app-build", APP_BUILD_ID);
     
     // Force Express to send headers immediately so the player doesn't sit pending
     res.flushHeaders();
@@ -3794,5 +3947,7 @@ async function prewarmCaches() {
 app.listen(PORT, "0.0.0.0", () => {
     console.log(`running on port ${PORT}`);
     console.log(`Public base: ${process.env.WORKER_PUBLIC_BASE || "(auto from request)"}`);
+    console.log(`Build: ${APP_BUILD_ID}`);
+    console.log("Xtream compatibility: get_all_categories -> live streams");
     void prewarmCaches();
 });
