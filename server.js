@@ -3754,7 +3754,23 @@ async function handleRequest(request, env, waitUntil) {
         if (key === streamId) key = await streamKey(sourceUrl);
         
         if (!path.toLowerCase().endsWith(".m3u8")) {
-            return new Response(null, { status: 302, headers: { "Location": sourceUrl, "Access-Control-Allow-Origin": "*" } });
+            try {
+                const headers = new Headers();
+                headers.set("user-agent", envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT);
+                if (request.headers.get("range")) headers.set("range", request.headers.get("range"));
+                if (request.headers.get("if-range")) headers.set("if-range", request.headers.get("if-range"));
+
+                const upstreamRes = await fetch(sourceUrl, { method: request.method, headers, redirect: "follow" });
+                
+                const proxyHeaders = new Headers(upstreamRes.headers);
+                proxyHeaders.set("access-control-allow-origin", "*");
+                if (proxyHeaders.has("transfer-encoding")) proxyHeaders.delete("content-length");
+                
+                return new Response(upstreamRes.body, { status: upstreamRes.status, headers: proxyHeaders });
+            } catch (err) {
+                console.error(`[stream] Failed to proxy native stream ${sourceUrl}: ${err.message}`);
+                throw new HttpError(502, "Upstream stream fetch failed.");
+            }
         }
         return proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, `live:${key}`);
     }
