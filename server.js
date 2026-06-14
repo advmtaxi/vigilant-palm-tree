@@ -2919,11 +2919,23 @@ function xtreamServerInfo(request, env) {
     const base = publicBase(request, env);
     const parsed = new URL(base);
     const now = Math.floor(Date.now() / 1000);
+    
+    // Many IPTV apps hardcode 'http://' when building stream URLs.
+    // If we return '443' in the 'port' field, the app will request 'http://domain:443',
+    // which causes the connection to be immediately dropped by the CDN/Proxy (HTTP on HTTPS port).
+    // So we must always provide a valid HTTP port in 'port', and HTTPS in 'https_port'.
+    let httpPort = "80";
+    let httpsPort = "443";
+    if (parsed.port) {
+        if (parsed.protocol === "https:") httpsPort = parsed.port;
+        else httpPort = parsed.port;
+    }
+
     return {
         url: parsed.hostname,
-        port: parsed.port || (parsed.protocol === "https:" ? "443" : "80"),
-        https_port: parsed.protocol === "https:" ? (parsed.port || "443") : "443",
-        server_protocol: parsed.protocol.replace(":", ""),
+        port: httpPort,
+        https_port: httpsPort,
+        server_protocol: "http", // Always tell standard apps to use http (they will use port 80)
         rtmp_port: "1935",
         timezone: "UTC",
         timestamp_now: now,
