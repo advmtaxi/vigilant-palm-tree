@@ -66,6 +66,7 @@ const xtreamCatalogCache = new Map();
 const xtreamCatalogInflight = new Map();
 const slugIndex = new Map();
 const keyToSlugIndex = new Map();
+const xtreamLocalNumericIndex = new Map();
 let channelLoadPromise = null;
 let playlistChannelLoadPromise = null;
 
@@ -2881,7 +2882,7 @@ async function proxySegment(key, token, filename, request, env) {
     const headers = new Headers(upstream.headers);
     headers.set("cache-control", `public, max-age=${ttlSeconds}, s-maxage=${ttlSeconds}, stale-while-revalidate=15`);
     if (!headers.has("content-type")) headers.set("content-type", mediaTypeForPath(filename));
-    
+
     // Explicitly declare partial content support here
     headers.set("accept-ranges", "bytes");
 
@@ -3042,11 +3043,20 @@ function xtreamFallbackCategoryId(name) {
     return text || "all";
 }
 
+function stringToNumericId(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+        hash = ((hash << 5) - hash) + str.charCodeAt(i);
+        hash |= 0;
+    }
+    return Math.abs(hash) || 1;
+}
+
 function localXtreamLiveCategories(channels) {
     const categories = new Map();
     for (const channel of channels) {
         const categoryName = cleanString(channel?.category, "Live");
-        const categoryId = xtreamFallbackCategoryId(categoryName);
+        const categoryId = String(stringToNumericId(xtreamFallbackCategoryId(categoryName)));
         if (!categories.has(categoryId)) {
             categories.set(categoryId, {
                 category_id: categoryId,
@@ -3056,7 +3066,7 @@ function localXtreamLiveCategories(channels) {
         }
     }
     if (categories.size === 0) {
-        categories.set("all", { category_id: "all", category_name: "All", parent_id: 0 });
+        categories.set("1", { category_id: "1", category_name: "All", parent_id: 0 });
     }
     return [...categories.values()];
 }
@@ -3073,14 +3083,18 @@ function localXtreamLiveStreams(channels, categoryId = "", request = null, env =
     let num = 1;
     for (const channel of channels) {
         const categoryName = cleanString(channel?.category, "Live");
-        const liveCategoryId = xtreamFallbackCategoryId(categoryName);
+        const liveCategoryId = String(stringToNumericId(xtreamFallbackCategoryId(categoryName)));
         if (wantedCategoryId && wantedCategoryId !== "0" && wantedCategoryId !== liveCategoryId) continue;
-        const streamUrl = xtreamLivePlaybackUrl(request, env, user, channel?.key);
+        
+        const numericStreamId = String(parseInt(channel.key.slice(0, 8), 16) || 1);
+        xtreamLocalNumericIndex.set(numericStreamId, channel.key);
+        
+        const streamUrl = xtreamLivePlaybackUrl(request, env, user, numericStreamId);
         result.push({
             num: num++,
             name: cleanString(channel?.name, "Unknown"),
             stream_type: "live",
-            stream_id: channel?.key,
+            stream_id: numericStreamId,
             stream_icon: cleanString(channel?.logo),
             epg_channel_id: "",
             added: String(Math.floor(Date.now() / 1000)),
@@ -3090,7 +3104,7 @@ function localXtreamLiveStreams(channels, categoryId = "", request = null, env =
             direct_source: streamUrl,
             stream_url: streamUrl,
             url: streamUrl,
-            container_extension: "m3u8",
+            container_extension: "ts",
             tv_archive_duration: 0,
         });
     }
@@ -3724,19 +3738,34 @@ async function handleRequest(request, env, waitUntil) {
         }));
     }
 
+    // ─── Xtream short URL proxy: /{user}/{pass}/{stream_id} OR /{user}/{pass}/{stream_id}.{ext}
+    const xtreamShortMatch = path.match(/^\/([^/]+)\/([^/]+)\/([0-9]+)(?:\.(?:m3u8|ts|mp4|mpeg))?$/);
+    if (xtreamShortMatch) {
+        await requireXtreamAuth(xtreamShortMatch[1], xtreamShortMatch[2]);
+        const streamId = xtreamShortMatch[3];
+        let key = xtreamLocalNumericIndex.get(streamId) || streamId;
+        let sourceUrl = await findXtreamLiveUrl(env, key);
+        if (!sourceUrl && streamIndex.has(key)) sourceUrl = streamIndex.get(key);
+        if (!sourceUrl) throw new HttpError(404, "Live stream not found.");
+        if (key === streamId) key = await streamKey(sourceUrl);
+        return proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, `live:${key}`);
+    }
+
     // ─── Xtream live stream proxy: /live/{user}/{pass}/{stream_id}.{ext} ─────────
-    // (Only when stream_id is numeric — hex-key URLs are handled below)
-    const xtreamLiveMatch = path.match(/^\/live\/([^/]+)\/([^/]+)\/([A-Za-z0-9_-]{4,64})\.(m3u8|ts|mp4|mpeg)$/);
+    const xtreamLiveMatch = path.match(/^\/live\/([^/]+)\/([^/]+)\/([A-Za-z0-9_-]+)(?:\.(?:m3u8|ts|mp4|mpeg))?$/);
     if (xtreamLiveMatch) {
         await requireXtreamAuth(xtreamLiveMatch[1], xtreamLiveMatch[2]);
-        const sourceUrl = await findXtreamLiveUrl(env, xtreamLiveMatch[3]);
+        const streamId = xtreamLiveMatch[3];
+        let key = xtreamLocalNumericIndex.get(streamId) || streamId;
+        let sourceUrl = await findXtreamLiveUrl(env, key);
+        if (!sourceUrl && streamIndex.has(key)) sourceUrl = streamIndex.get(key);
         if (!sourceUrl) throw new HttpError(404, "Live stream not found.");
-        const key = await streamKey(sourceUrl);
+        if (key === streamId) key = await streamKey(sourceUrl);
         return proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, `live:${key}`);
     }
 
     // ─── Xtream movie: /movie/{user}/{pass}/{stream_id}.{ext} ────────────────────
-    const xtreamMovieMatch = path.match(/^\/movie\/([^/]+)\/([^/]+)\/([0-9]+)\.([^/]+)$/);
+    const xtreamMovieMatch = path.match(/^\/movie\/([^/]+)\/([^/]+)\/([0-9]+)(?:\.([^/]+))?$/);
     if (xtreamMovieMatch) {
         await requireXtreamAuth(xtreamMovieMatch[1], xtreamMovieMatch[2]);
         const movieUrl = await findXtreamMovieUrl(env, xtreamMovieMatch[3]);
@@ -3745,7 +3774,7 @@ async function handleRequest(request, env, waitUntil) {
         // eliminates "unsafe URL" warnings in IPTV apps.
         const key = await streamKey(movieUrl);
         const token = await makeUrlToken({ u: movieUrl }, env);
-        const filename = `${xtreamMovieMatch[3]}.${xtreamMovieMatch[4]}`;
+        const filename = `${xtreamMovieMatch[3]}.${xtreamMovieMatch[4] || "mp4"}`;
         return withCors(new Response(null, {
             status: 302,
             headers: { location: `${publicBase(request, env)}/upseg/${key}/${token}/${filename}` },
@@ -3753,7 +3782,7 @@ async function handleRequest(request, env, waitUntil) {
     }
 
     // ─── Xtream series episode: /series/{user}/{pass}/{episode_id}.{ext} ─────────
-    const xtreamSeriesMatch = path.match(/^\/series\/([^/]+)\/([^/]+)\/([0-9]+)\.([^/]+)$/);
+    const xtreamSeriesMatch = path.match(/^\/series\/([^/]+)\/([^/]+)\/([0-9]+)(?:\.([^/]+))?$/);
     if (xtreamSeriesMatch) {
         await requireXtreamAuth(xtreamSeriesMatch[1], xtreamSeriesMatch[2]);
         const episodeUrl = await findXtreamEpisodeUrl(xtreamSeriesMatch[3]);
@@ -3761,7 +3790,7 @@ async function handleRequest(request, env, waitUntil) {
         // Proxy through our own /upseg/ endpoint — hides upstream credentials.
         const key = await streamKey(episodeUrl);
         const token = await makeUrlToken({ u: episodeUrl }, env);
-        const filename = `${xtreamSeriesMatch[3]}.${xtreamSeriesMatch[4]}`;
+        const filename = `${xtreamSeriesMatch[3]}.${xtreamSeriesMatch[4] || "mp4"}`;
         return withCors(new Response(null, {
             status: 302,
             headers: { location: `${publicBase(request, env)}/upseg/${key}/${token}/${filename}` },
@@ -3844,7 +3873,7 @@ async function pipeWebResponse(webResponse, res) {
     res.status(webResponse.status);
     webResponse.headers.forEach((value, key) => res.set(key, value));
     res.set("x-app-build", APP_BUILD_ID);
-    
+
     // Force Express to send headers immediately so the player doesn't sit pending
     res.flushHeaders();
 
@@ -3863,11 +3892,11 @@ async function pipeWebResponse(webResponse, res) {
         res.on("close", cleanup);
         res.on("finish", cleanup);
         res.on("error", cleanup);
-        
+
         nodeStream.on("error", (error) => {
-            const isAborted = error?.name === "AbortError" || 
-                              error?.code === "UND_ERR_SOCKET" ||
-                              error?.message?.includes("ECONNRESET");
+            const isAborted = error?.name === "AbortError" ||
+                error?.code === "UND_ERR_SOCKET" ||
+                error?.message?.includes("ECONNRESET");
             if (!isAborted) {
                 console.error("[stream] Upstream read error:", error.message);
             }
@@ -3912,11 +3941,11 @@ app.use(async (req, res) => {
     } catch (error) {
         const status = error instanceof HttpError ? error.status : 500;
         const message = error instanceof HttpError ? error.message : "Unexpected error.";
-        const isAborted = error?.name === "AbortError" || 
-                          error?.message?.includes("terminated") || 
-                          error?.code === "UND_ERR_SOCKET" ||
-                          error?.message?.includes("other side closed") ||
-                          error?.message?.includes("ECONNRESET");
+        const isAborted = error?.name === "AbortError" ||
+            error?.message?.includes("terminated") ||
+            error?.code === "UND_ERR_SOCKET" ||
+            error?.message?.includes("other side closed") ||
+            error?.message?.includes("ECONNRESET");
         if (isAborted) {
             if (res.headersSent) {
                 console.log(`[server] Connection closed by client during streaming: ${req.method} ${req.originalUrl}`);
