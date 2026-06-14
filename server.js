@@ -271,7 +271,7 @@ function logXtreamAction(request, action, payload, extra = {}) {
     ].filter(Boolean).join(" ");
     console.log(`[xtream] ${request.method} ${sanitizeUrlForLog(new URL(request.url).pathname + new URL(request.url).search)} ${details}`);
     
-    if (process.env.DEBUG_API === "true") {
+    if (true) {
         console.log(`[xtream-debug] Payload:`, JSON.stringify(payload, null, 2).slice(0, 5000));
     }
 }
