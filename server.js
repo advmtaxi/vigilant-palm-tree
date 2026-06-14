@@ -225,6 +225,7 @@ function sanitizePathForLog(pathname) {
 }
 
 function sanitizeUrlForLog(rawUrl) {
+    if (process.env.DEBUG_API === "true") return String(rawUrl || "/");
     try {
         const text = String(rawUrl || "/");
         const includeOrigin = /^https?:\/\//i.test(text);
@@ -269,6 +270,10 @@ function logXtreamAction(request, action, payload, extra = {}) {
         count === null ? "" : `count=${count}`,
     ].filter(Boolean).join(" ");
     console.log(`[xtream] ${request.method} ${sanitizeUrlForLog(new URL(request.url).pathname + new URL(request.url).search)} ${details}`);
+    
+    if (process.env.DEBUG_API === "true") {
+        console.log(`[xtream-debug] Payload:`, JSON.stringify(payload, null, 2).slice(0, 5000));
+    }
 }
 
 // Crypto helpers
@@ -3698,6 +3703,9 @@ async function handleRequest(request, env, waitUntil) {
     if (playlistJsonMatch) return serveCustomPlaylistJson(request, env, playlistJsonMatch[1]);
 
     if (path === "/get.php") {
+        if (process.env.DEBUG_API === "true") {
+            console.log(`[xtream-debug] get.php request: ${request.url}`);
+        }
         return generatedM3uResponse(request, env, waitUntil);
     }
 
