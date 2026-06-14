@@ -698,21 +698,25 @@ function catalogCategory(catalog, item) {
     );
 }
 
-async function loadXtreamCatalog(env, playlistSource, catalogKind, force = false) {
+async function loadXtreamCatalog(env, playlistSource, catalogKind, force = false, fetchItems = true) {
     const config = xtreamConfigFromPlaylistUrl(playlistSource.url);
     const setup = XTREAM_CATALOGS[catalogKind];
     if (!config || !setup) return null;
 
-    const cacheKey = `catalog:${catalogKind}:${xtreamCacheKey(config)}`;
+    const cacheKey = `catalog:${catalogKind}:${fetchItems}:${xtreamCacheKey(config)}`;
     const ttlMs = envInt(env, "XTREAM_METADATA_CACHE_SECONDS", 300) * 1000;
     const cached = xtreamCatalogCache.get(cacheKey);
     if (!force && cached && Date.now() - cached.at < ttlMs) return cached;
 
     return withInflight(xtreamCatalogInflight, cacheKey, async () => {
-        const [categories, items] = await Promise.all([
-            fetchXtreamApi(env, config, setup.categoriesAction),
-            fetchXtreamApi(env, config, setup.itemsAction),
-        ]);
+        const promises = [fetchXtreamApi(env, config, setup.categoriesAction)];
+        if (fetchItems) {
+            promises.push(fetchXtreamApi(env, config, setup.itemsAction));
+        }
+        
+        const results = await Promise.all(promises);
+        const categories = results[0];
+        const items = fetchItems ? results[1] : [];
 
         const categoriesById = indexCategories(categories);
         const catalogItems = Array.isArray(items) ? items : [];
@@ -3116,7 +3120,7 @@ function localXtreamLiveStreams(channels, categoryId = "", request = null, env =
 
 async function xtreamLiveCategories(env) {
     const sources = buildProviderPlaylistSources(env);
-    const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "live", false).catch(() => null)));
+    const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "live", false, false).catch(() => null)));
     const liveCategories = aggregateXtreamCategories(catalogs);
     if (liveCategories.length > 1 || (liveCategories.length === 1 && liveCategories[0]?.category_id !== "1")) {
         return liveCategories;
@@ -3169,8 +3173,9 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
 
 async function xtreamVodCategories(env) {
     const sources = buildProviderPlaylistSources(env);
-    const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "movies", false).catch(() => null)));
-    return aggregateXtreamCategories(catalogs);
+    const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "movies", false, false).catch(() => null)));
+    const returnVal = aggregateXtreamCategories(catalogs);
+    return returnVal;
 }
 
 async function xtreamVodStreams(env, categoryId = "") {
@@ -3211,7 +3216,7 @@ async function xtreamVodStreams(env, categoryId = "") {
 
 async function xtreamSeriesCategories(env) {
     const sources = buildProviderPlaylistSources(env);
-    const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "series", false).catch(() => null)));
+    const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "series", false, false).catch(() => null)));
     return aggregateXtreamCategories(catalogs);
 }
 
