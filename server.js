@@ -3079,7 +3079,7 @@ function localXtreamLiveCategories(channels) {
 function xtreamLivePlaybackUrl(request, env, user, streamId) {
     if (!request || !user || !streamId) return "";
     const base = publicBase(request, env);
-    return `${base}/live/${encodePathSegment(user.username)}/${encodePathSegment(user.password)}/${encodePathSegment(streamId)}.m3u8`;
+    return `${base}/live/${encodePathSegment(user.username)}/${encodePathSegment(user.password)}/${encodePathSegment(streamId)}.ts`;
 }
 
 function localXtreamLiveStreams(channels, categoryId = "", request = null, env = process.env, user = null) {
@@ -3106,7 +3106,10 @@ function localXtreamLiveStreams(channels, categoryId = "", request = null, env =
             category_id: liveCategoryId,
             custom_sid: "",
             tv_archive: 0,
-            direct_source: "",
+            direct_source: streamUrl,
+            stream_url: streamUrl,
+            url: streamUrl,
+            container_extension: "ts",
             tv_archive_duration: 0,
         });
     }
@@ -3141,6 +3144,7 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
             if (!id || seenIds.has(id)) continue;
             if (wantedCategoryId && wantedCategoryId !== "0" && cleanString(item.category_id) !== wantedCategoryId) continue;
             seenIds.add(id);
+            const streamUrl = xtreamLivePlaybackUrl(request, env, user, id);
             result.push({
                 num: num++,
                 name: cleanString(item.name, "Unknown"),
@@ -3152,7 +3156,10 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
                 category_id: cleanString(item.category_id),
                 custom_sid: "",
                 tv_archive: 0,
-                direct_source: "",
+                direct_source: streamUrl,
+                stream_url: streamUrl,
+                url: streamUrl,
+                container_extension: "ts",
                 tv_archive_duration: 0,
             });
         }
