@@ -3106,10 +3106,7 @@ function localXtreamLiveStreams(channels, categoryId = "", request = null, env =
             category_id: liveCategoryId,
             custom_sid: "",
             tv_archive: 0,
-            direct_source: streamUrl,
-            stream_url: streamUrl,
-            url: streamUrl,
-            container_extension: "ts",
+            direct_source: "",
             tv_archive_duration: 0,
         });
     }
@@ -3144,7 +3141,6 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
             if (!id || seenIds.has(id)) continue;
             if (wantedCategoryId && wantedCategoryId !== "0" && cleanString(item.category_id) !== wantedCategoryId) continue;
             seenIds.add(id);
-            const streamUrl = xtreamLivePlaybackUrl(request, env, user, id);
             result.push({
                 num: num++,
                 name: cleanString(item.name, "Unknown"),
@@ -3156,10 +3152,7 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
                 category_id: cleanString(item.category_id),
                 custom_sid: "",
                 tv_archive: 0,
-                direct_source: streamUrl,
-                stream_url: streamUrl,
-                url: streamUrl,
-                container_extension: "m3u8",
+                direct_source: "",
                 tv_archive_duration: 0,
             });
         }
