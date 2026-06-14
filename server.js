@@ -3752,6 +3752,10 @@ async function handleRequest(request, env, waitUntil) {
         if (!sourceUrl && streamIndex.has(key)) sourceUrl = streamIndex.get(key);
         if (!sourceUrl) throw new HttpError(404, "Live stream not found.");
         if (key === streamId) key = await streamKey(sourceUrl);
+        
+        if (!path.toLowerCase().endsWith(".m3u8")) {
+            return new Response(null, { status: 302, headers: { "Location": sourceUrl, "Access-Control-Allow-Origin": "*" } });
+        }
         return proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, `live:${key}`);
     }
 
