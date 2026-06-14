@@ -2341,8 +2341,8 @@ function generatedPlaylistCacheKey(account, includes) {
     ].join("|");
 }
 
-function generatedLiveUrl(channel, request, env) {
-    return `${streamBase(request, env)}/live/${channel.key}/index.m3u8`;
+function generatedLiveUrl(channel, account, request, env) {
+    return `${publicBase(request, env)}/live/${encodePathSegment(account.username)}/${encodePathSegment(account.password)}/${channel.key}.ts`;
 }
 
 async function m3uSeriesEpisodeRecords(request, env, force = false) {
@@ -2399,7 +2399,7 @@ async function generatedM3uBody(account, request, env) {
                 name: channel.name,
                 logo: channel.logo,
                 category: channel.category || "Live",
-                url: generatedLiveUrl(channel, request, env),
+                url: generatedLiveUrl(channel, account, request, env),
             });
         }
     }
@@ -3641,7 +3641,7 @@ async function serveCustomPlaylistM3u(request, env, playlistId) {
             name: channel.name,
             logo: channel.logo,
             category: channel.category || "Live",
-            url: generatedLiveUrl(channel, request, env),
+            url: generatedLiveUrl(channel, { username: "user", password: "password" }, request, env),
         });
     }
     return playlistResponse(`${lines.join("\n")}\n`);
