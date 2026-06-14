@@ -2974,7 +2974,7 @@ async function xtreamVodInfoPayload(env, vodId) {
                 duration: cleanString(item.duration),
             },
             movie_data: {
-                stream_id: id,
+                stream_id: Number(id),
                 name: cleanString(item.name, "Unknown"),
                 added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
                 category_id: cleanString(item.category_id),
@@ -2982,7 +2982,7 @@ async function xtreamVodInfoPayload(env, vodId) {
             },
         };
     }
-    return { info: {}, movie_data: { stream_id: id } };
+    return { info: {}, movie_data: { stream_id: Number(id) } };
 }
 
 function xtreamEmptyEpgPayload() {
@@ -3099,7 +3099,7 @@ function localXtreamLiveStreams(channels, categoryId = "", request = null, env =
             num: num++,
             name: cleanString(channel?.name, "Unknown"),
             stream_type: "live",
-            stream_id: numericStreamId,
+            stream_id: Number(numericStreamId),
             stream_icon: cleanString(channel?.logo),
             epg_channel_id: "",
             added: String(Math.floor(Date.now() / 1000)),
@@ -3149,7 +3149,7 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
                 num: num++,
                 name: cleanString(item.name, "Unknown"),
                 stream_type: "live",
-                stream_id: id,
+                stream_id: Number(id),
                 stream_icon: mediaLogo(item),
                 epg_channel_id: cleanString(item.epg_channel_id),
                 added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
@@ -3198,7 +3198,7 @@ async function xtreamVodStreams(env, categoryId = "") {
                 num: num++,
                 name: cleanString(item.name, "Unknown"),
                 stream_type: "movie",
-                stream_id: id,
+                stream_id: Number(id),
                 stream_icon: mediaLogo(item),
                 rating: String(mediaRating(item) ?? ""),
                 rating_5based: String(mediaRating(item) ?? ""),
@@ -3236,7 +3236,7 @@ async function xtreamSeriesList(env, categoryId = "") {
             result.push({
                 num: num++,
                 name: cleanString(item.name, "Unknown"),
-                series_id: id,
+                series_id: Number(id),
                 cover: mediaLogo(item),
                 plot: cleanString(item.plot),
                 cast: cleanString(item.cast),
@@ -3274,7 +3274,7 @@ async function xtreamSeriesInfoPayload(env, seriesId) {
                             const upUrl = directEpisodeUrl(config, ep);
                             if (upUrl) xtreamEpisodeUrlIndex.set(String(epId), upUrl); // populate index
                         }
-                        return { ...ep, id: epId, stream_id: epId };
+                        return { ...ep, id: Number(epId) || epId, stream_id: Number(epId) || epId };
                     })
                     : [];
             }
