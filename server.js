@@ -270,7 +270,7 @@ function logXtreamAction(request, action, payload, extra = {}) {
         count === null ? "" : `count=${count}`,
     ].filter(Boolean).join(" ");
     console.log(`[xtream] ${request.method} ${sanitizeUrlForLog(new URL(request.url).pathname + new URL(request.url).search)} ${details}`);
-    
+
     if (true) {
         console.log(`[xtream-debug] Payload:`, JSON.stringify(payload, null, 2).slice(0, 5000));
     }
@@ -713,7 +713,7 @@ async function loadXtreamCatalog(env, playlistSource, catalogKind, force = false
         if (fetchItems) {
             promises.push(fetchXtreamApi(env, config, setup.itemsAction));
         }
-        
+
         const results = await Promise.all(promises);
         const categories = results[0];
         const items = fetchItems ? results[1] : [];
@@ -899,6 +899,28 @@ async function loadCustomPlaylists(env) {
 async function saveCustomPlaylists(env, playlists) {
     const payload = { updatedAt: new Date().toISOString(), playlists };
     await fs.writeFile(customPlaylistsFile(env), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+// ─── Custom Categories Storage ───────────────────────────────────────────────
+
+function customCategoriesFile(env) {
+    return envString(env, "CUSTOM_CATEGORIES_FILE", "custom-categories.json") || "custom-categories.json";
+}
+
+async function loadCustomCategories(env) {
+    try {
+        const text = await fs.readFile(customCategoriesFile(env), "utf8");
+        const data = JSON.parse(text);
+        return Array.isArray(data?.categories) ? data.categories : [];
+    } catch (error) {
+        if (error && error.code === "ENOENT") return [];
+        throw error;
+    }
+}
+
+async function saveCustomCategories(env, categories) {
+    const payload = { updatedAt: new Date().toISOString(), categories };
+    await fs.writeFile(customCategoriesFile(env), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
 function randomPlaylistId(length = 8) {
@@ -1876,6 +1898,19 @@ function dashboardPage() {
       outline: none;
     }
     .import-area textarea:focus { border-color: var(--accent); }
+    
+    /* IPTV Categories */
+    .draggable { cursor: grab; }
+    .draggable:active { cursor: grabbing; }
+    .drag-over { border: 2px dashed var(--accent); }
+    .cat-list, .cat-ch-list { max-height: 350px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--input); margin-bottom: 14px; }
+    .cat-item, .cat-ch-item { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid var(--line); font-size: 13px; background: var(--input); }
+    .cat-item:last-child, .cat-ch-item:last-child { border-bottom: 0; }
+    .cat-item.active { background: var(--panel-2); border-left: 3px solid var(--accent); }
+    .cat-item { cursor: pointer; }
+    .cat-actions { margin-left: auto; display: flex; gap: 8px; }
+    .drag-handle { color: var(--muted); cursor: grab; padding: 0 5px; user-select: none; }
+
     @media (max-width: 860px) {
       header, .grid { display: block; }
       header > * + *, .grid > * + * { margin-top: 18px; }
@@ -1972,6 +2007,42 @@ function dashboardPage() {
         </div>
       </div>
     </section>
+
+    <hr class="section-divider">
+    <h2 class="section-title">IPTV Categories Manager</h2>
+    <p class="subtle" style="margin-bottom:18px">Create custom categories and arrange them to completely override the default IPTV provider layout.</p>
+    <section class="grid">
+      <div class="panel">
+        <h2>Categories (Drag to reorder)</h2>
+        <div class="panel-body">
+          <div style="display:flex;gap:10px;margin-bottom:14px">
+            <input id="new-cat-name" placeholder="New Category Name" autocomplete="off" style="flex:1">
+            <button type="button" id="add-cat-btn">Add</button>
+          </div>
+          <div class="cat-list" id="cat-list"></div>
+          <button class="secondary" type="button" id="save-categories-btn" style="width:100%">Save Categories & Order</button>
+          <div class="message" id="cat-message"></div>
+        </div>
+      </div>
+      
+      <div class="panel">
+        <h2>Category Channels <span id="active-cat-name" style="font-weight:normal;color:var(--muted)"></span></h2>
+        <div class="panel-body" id="cat-channels-panel" style="display:none">
+          <div class="search-box">
+            <span class="search-icon">&#128269;</span>
+            <input id="cat-ch-search" placeholder="Search to add channels..." autocomplete="off">
+          </div>
+          <div class="channel-list" id="cat-ch-search-list" style="display:none; position:absolute; z-index:10; max-height:250px; background:var(--panel-2); width:calc(100% - 36px); box-shadow:0 4px 12px rgba(0,0,0,0.5)"></div>
+          
+          <div style="margin-top:14px; margin-bottom:8px; font-size:13px; color:var(--muted)">Assigned Channels (Drag to reorder): <span id="cat-ch-count">0</span></div>
+          <div class="cat-ch-list" id="active-cat-ch-list"></div>
+        </div>
+        <div class="panel-body" id="cat-channels-empty">
+          <div class="empty">Select a category to manage its channels.</div>
+        </div>
+      </div>
+    </section>
+
   </main>
 
   <script>
@@ -2314,8 +2385,207 @@ function dashboardPage() {
       }
     });
 
+    // ─── IPTV Categories ─────────────────────────────────────────────────
+    let customCategories = [];
+    let activeCategoryId = null;
+
+    const catListEl = document.getElementById("cat-list");
+    const activeCatChListEl = document.getElementById("active-cat-ch-list");
+    const catChSearchListEl = document.getElementById("cat-ch-search-list");
+    const catChSearchInput = document.getElementById("cat-ch-search");
+
+    function renderCategories() {
+      catListEl.innerHTML = "";
+      if (customCategories.length === 0) {
+          catListEl.innerHTML = '<div class="empty">No custom categories defined.</div>';
+      }
+      customCategories.forEach((cat, index) => {
+        const div = document.createElement("div");
+        div.className = "cat-item draggable" + (activeCategoryId === cat.id ? " active" : "");
+        div.draggable = true;
+        div.dataset.index = index;
+        div.innerHTML = `
+          <span class="drag-handle">☰</span>
+          <span style="flex:1;overflow:hidden;text-overflow:ellipsis">${cat.name} <small style="color:var(--muted)">(${cat.channelKeys.length})</small></span>
+          <div class="cat-actions">
+            <button type="button" class="danger" style="padding:2px 6px;min-height:0;font-size:11px">Delete</button>
+          </div>
+        `;
+        
+        div.addEventListener("click", (e) => {
+          if (e.target.tagName === "BUTTON") return;
+          activeCategoryId = cat.id;
+          renderCategories();
+          renderActiveCategory();
+        });
+        
+        div.querySelector("button").addEventListener("click", () => {
+          customCategories = customCategories.filter(c => c.id !== cat.id);
+          if (activeCategoryId === cat.id) activeCategoryId = null;
+          renderCategories();
+          renderActiveCategory();
+        });
+        
+        // Drag events for category
+        div.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/plain", index); div.style.opacity = "0.5"; });
+        div.addEventListener("dragend", () => { div.style.opacity = "1"; });
+        div.addEventListener("dragover", (e) => { e.preventDefault(); div.classList.add("drag-over"); });
+        div.addEventListener("dragleave", () => { div.classList.remove("drag-over"); });
+        div.addEventListener("drop", (e) => {
+          e.preventDefault();
+          div.classList.remove("drag-over");
+          const fromIndex = parseInt(e.dataTransfer.getData("text/plain"));
+          const toIndex = index;
+          if (fromIndex !== toIndex) {
+            const moved = customCategories.splice(fromIndex, 1)[0];
+            customCategories.splice(toIndex, 0, moved);
+            renderCategories();
+          }
+        });
+        
+        catListEl.appendChild(div);
+      });
+    }
+
+    function renderActiveCategory() {
+      const cat = customCategories.find(c => c.id === activeCategoryId);
+      if (!cat) {
+        document.getElementById("cat-channels-panel").style.display = "none";
+        document.getElementById("cat-channels-empty").style.display = "block";
+        document.getElementById("active-cat-name").textContent = "";
+        return;
+      }
+      
+      document.getElementById("cat-channels-panel").style.display = "block";
+      document.getElementById("cat-channels-empty").style.display = "none";
+      document.getElementById("active-cat-name").textContent = " - " + cat.name;
+      document.getElementById("cat-ch-count").textContent = cat.channelKeys.length;
+      
+      activeCatChListEl.innerHTML = "";
+      if (cat.channelKeys.length === 0) {
+          activeCatChListEl.innerHTML = '<div class="empty">No channels assigned.</div>';
+      }
+      cat.channelKeys.forEach((key, index) => {
+        const ch = allChannels.find(c => c.key === key);
+        if (!ch) return;
+        const div = document.createElement("div");
+        div.className = "cat-ch-item draggable";
+        div.draggable = true;
+        div.dataset.index = index;
+        div.innerHTML = `
+          <span class="drag-handle">☰</span>
+          <span style="flex:1;overflow:hidden;text-overflow:ellipsis">${ch.name}</span>
+          <button type="button" class="danger" style="padding:2px 6px;min-height:0;font-size:11px">Remove</button>
+        `;
+        
+        div.querySelector("button").addEventListener("click", () => {
+          cat.channelKeys.splice(index, 1);
+          renderCategories();
+          renderActiveCategory();
+        });
+        
+        div.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/plain", index); div.style.opacity = "0.5"; });
+        div.addEventListener("dragend", () => { div.style.opacity = "1"; });
+        div.addEventListener("dragover", (e) => { e.preventDefault(); div.classList.add("drag-over"); });
+        div.addEventListener("dragleave", () => { div.classList.remove("drag-over"); });
+        div.addEventListener("drop", (e) => {
+          e.preventDefault();
+          div.classList.remove("drag-over");
+          const fromIndex = parseInt(e.dataTransfer.getData("text/plain"));
+          const toIndex = index;
+          if (fromIndex !== toIndex) {
+            const moved = cat.channelKeys.splice(fromIndex, 1)[0];
+            cat.channelKeys.splice(toIndex, 0, moved);
+            renderActiveCategory();
+          }
+        });
+        
+        activeCatChListEl.appendChild(div);
+      });
+    }
+
+    document.getElementById("add-cat-btn").addEventListener("click", () => {
+      const name = document.getElementById("new-cat-name").value.trim();
+      if (!name) return;
+      const newId = String(Date.now()) + Math.floor(Math.random()*1000);
+      customCategories.push({ id: newId, name, order: customCategories.length + 1, channelKeys: [] });
+      document.getElementById("new-cat-name").value = "";
+      renderCategories();
+    });
+
+    document.getElementById("save-categories-btn").addEventListener("click", async () => {
+      document.getElementById("cat-message").textContent = "Saving...";
+      try {
+        const res = await fetch("/api/custom-categories/save", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ categories: customCategories })
+        });
+        if (!res.ok) throw new Error("Save failed");
+        document.getElementById("cat-message").textContent = "Saved successfully!";
+        document.getElementById("cat-message").style.color = "var(--muted)";
+        setTimeout(() => document.getElementById("cat-message").textContent = "", 3000);
+        await loadCategories();
+      } catch(err) {
+        document.getElementById("cat-message").textContent = err.message;
+        document.getElementById("cat-message").style.color = "var(--danger)";
+      }
+    });
+
+    catChSearchInput.addEventListener("input", () => {
+      const q = catChSearchInput.value.toLowerCase().trim();
+      if (!q) {
+        catChSearchListEl.style.display = "none";
+        return;
+      }
+      const filtered = allChannels.filter(ch => (ch.name + " " + ch.category).toLowerCase().indexOf(q) >= 0).slice(0, 50);
+      catChSearchListEl.innerHTML = "";
+      if (filtered.length === 0) {
+        catChSearchListEl.innerHTML = '<div style="padding:10px;font-size:13px;color:var(--muted)">No channels found.</div>';
+      } else {
+        filtered.forEach(ch => {
+          const div = document.createElement("div");
+          div.className = "channel-item";
+          div.innerHTML = `<span style="flex:1">${ch.name}</span> <span class="ch-cat">${ch.category||""}</span> <button class="secondary" type="button" style="padding:2px 6px;min-height:0;font-size:11px">Add</button>`;
+          div.querySelector("button").addEventListener("click", () => {
+            const cat = customCategories.find(c => c.id === activeCategoryId);
+            if (cat && !cat.channelKeys.includes(ch.key)) {
+              cat.channelKeys.push(ch.key);
+              renderCategories();
+              renderActiveCategory();
+            }
+            catChSearchInput.value = "";
+            catChSearchListEl.style.display = "none";
+          });
+          catChSearchListEl.appendChild(div);
+        });
+      }
+      catChSearchListEl.style.display = "block";
+    });
+
+    document.addEventListener("click", (e) => {
+      if (!catChSearchInput.contains(e.target) && !catChSearchListEl.contains(e.target)) {
+        catChSearchListEl.style.display = "none";
+      }
+    });
+
+    async function loadCategories() {
+      try {
+        const res = await fetch("/api/custom-categories");
+        if (!res.ok) throw new Error("Could not load categories");
+        const data = await res.json();
+        customCategories = (data.categories || []).sort((a,b) => a.order - b.order);
+        renderCategories();
+        renderActiveCategory();
+      } catch (err) {
+        document.getElementById("cat-message").textContent = err.message;
+        document.getElementById("cat-message").style.color = "var(--danger)";
+      }
+    }
+
     loadAllChannels();
     loadPlaylists();
+    loadCategories();
   </script>
 </body>
 </html>`;
@@ -2919,7 +3189,7 @@ function xtreamServerInfo(request, env) {
     const base = publicBase(request, env);
     const parsed = new URL(base);
     const now = Math.floor(Date.now() / 1000);
-    
+
     // Many IPTV apps hardcode 'http://' when building stream URLs.
     // If we return '443' in the 'port' field, the app will request 'http://domain:443',
     // which causes the connection to be immediately dropped by the CDN/Proxy (HTTP on HTTPS port).
@@ -3106,10 +3376,10 @@ function localXtreamLiveStreams(channels, categoryId = "", request = null, env =
         const categoryName = cleanString(channel?.category, "Live");
         const liveCategoryId = String(stringToNumericId(xtreamFallbackCategoryId(categoryName)));
         if (wantedCategoryId && wantedCategoryId !== "0" && wantedCategoryId !== liveCategoryId) continue;
-        
+
         const numericStreamId = String(parseInt(channel.key.slice(0, 8), 16) || 1);
         xtreamLocalNumericIndex.set(numericStreamId, channel.key);
-        
+
         const streamUrl = xtreamLivePlaybackUrl(request, env, user, numericStreamId);
         result.push({
             num: num++,
@@ -3131,6 +3401,19 @@ function localXtreamLiveStreams(channels, categoryId = "", request = null, env =
 }
 
 async function xtreamLiveCategories(env) {
+    const custom = await loadCustomCategories(env);
+    if (custom && custom.length > 0) {
+        return custom.map(c => ({
+            category_id: c.id,
+            category_name: c.name,
+            parent_id: 0
+        })).sort((a, b) => {
+            const oa = custom.find(x => x.id === a.category_id)?.order || 0;
+            const ob = custom.find(x => x.id === b.category_id)?.order || 0;
+            return oa - ob;
+        });
+    }
+
     const sources = buildProviderPlaylistSources(env);
     const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "live", false, false).catch(() => null)));
     const liveCategories = aggregateXtreamCategories(catalogs);
@@ -3145,10 +3428,52 @@ async function xtreamLiveCategories(env) {
 }
 
 async function xtreamLiveStreams(env, categoryId = "", request = null, user = null) {
+    const custom = await loadCustomCategories(env);
+    const wantedCategoryId = cleanString(categoryId);
+    
+    if (custom && custom.length > 0) {
+        const channels = await loadPlaylistChannels(env, false).catch(() => []);
+        const result = [];
+        let num = 1;
+        
+        const channelMap = new Map();
+        for (const ch of channels) channelMap.set(ch.key, ch);
+        
+        const sortedCategories = [...custom].sort((a, b) => a.order - b.order);
+        
+        for (const cat of sortedCategories) {
+            if (wantedCategoryId && wantedCategoryId !== "0" && cat.id !== wantedCategoryId) continue;
+            
+            for (const key of cat.channelKeys) {
+                const channel = channelMap.get(key);
+                if (!channel) continue;
+                
+                const numericStreamId = String(parseInt(channel.key.slice(0, 8), 16) || 1);
+                xtreamLocalNumericIndex.set(numericStreamId, channel.key);
+                
+                result.push({
+                    num: num++,
+                    name: cleanString(channel?.name, "Unknown"),
+                    stream_type: "live",
+                    stream_id: Number(numericStreamId),
+                    stream_icon: cleanString(channel?.logo),
+                    epg_channel_id: null,
+                    added: String(Math.floor(Date.now() / 1000)),
+                    is_adult: "0",
+                    category_id: cat.id,
+                    custom_sid: "",
+                    tv_archive: 0,
+                    direct_source: "",
+                    tv_archive_duration: 0,
+                });
+            }
+        }
+        return result;
+    }
+
     const sources = buildProviderPlaylistSources(env);
     const result = [];
     const seenIds = new Set();
-    const wantedCategoryId = cleanString(categoryId);
     let num = 1;
     for (const source of sources) {
         const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
@@ -3525,6 +3850,48 @@ async function handleEnigma2Api(request, env) {
     return enigma2XmlPayload(request, env, user, action);
 }
 
+// ─── Custom Categories API handlers ─────────────────────────────────────────────
+
+async function customCategoriesPayload(request, env) {
+    if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+    const categories = await loadCustomCategories(env);
+    return json({ status: "ok", count: categories.length, categories });
+}
+
+async function saveCustomCategoriesHandler(request, env) {
+    if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+    const data = await readRequestData(request);
+    const incoming = Array.isArray(data.categories) ? data.categories : [];
+    
+    let maxId = 0;
+    const existing = await loadCustomCategories(env);
+    for (const c of existing) {
+        const n = parseInt(c.id, 10);
+        if (!isNaN(n) && n > maxId) maxId = n;
+    }
+    
+    const categoriesToSave = [];
+    let order = 1;
+    for (const c of incoming) {
+        const name = cleanString(c.name);
+        if (!name) continue;
+        let id = cleanString(c.id);
+        if (!id || isNaN(parseInt(id, 10))) {
+            maxId++;
+            id = String(maxId);
+        }
+        categoriesToSave.push({
+            id: String(parseInt(id, 10)),
+            name,
+            order: order++,
+            channelKeys: Array.isArray(c.channelKeys) ? c.channelKeys.map(String).filter(Boolean) : []
+        });
+    }
+    
+    await saveCustomCategories(env, categoriesToSave);
+    return json({ status: "ok", count: categoriesToSave.length, categories: categoriesToSave });
+}
+
 // ─── Custom Playlist API handlers ─────────────────────────────────────────────
 
 async function customPlaylistsPayload(request, env) {
@@ -3670,7 +4037,8 @@ async function handleRequest(request, env, waitUntil) {
     const isDashboardMutation = request.method === "POST" && (
         path === "/api/access-users" || path === "/api/access-users/delete" ||
         path === "/api/custom-playlists" || path === "/api/custom-playlists/update" ||
-        path === "/api/custom-playlists/delete" || path === "/api/custom-playlists/import"
+        path === "/api/custom-playlists/delete" || path === "/api/custom-playlists/import" ||
+        path === "/api/custom-categories/save"
     );
 
     if (request.method !== "GET" && request.method !== "HEAD" && !isDashboardMutation) {
@@ -3701,6 +4069,10 @@ async function handleRequest(request, env, waitUntil) {
     if (path === "/api/access-users/delete" && request.method === "POST") {
         return deleteAccessUser(request, env);
     }
+
+    // ─── Custom Categories API ─────────────────────────────────────────────────
+    if (path === "/api/custom-categories" && request.method === "GET") return customCategoriesPayload(request, env);
+    if (path === "/api/custom-categories/save" && request.method === "POST") return saveCustomCategoriesHandler(request, env);
 
     // ─── Custom Playlist API ───────────────────────────────────────────────────
     if (path === "/api/custom-playlists" && request.method === "GET") return customPlaylistsPayload(request, env);
@@ -3769,7 +4141,7 @@ async function handleRequest(request, env, waitUntil) {
         if (!sourceUrl && streamIndex.has(key)) sourceUrl = streamIndex.get(key);
         if (!sourceUrl) throw new HttpError(404, "Live stream not found.");
         if (key === streamId) key = await streamKey(sourceUrl);
-        
+
         if (!path.toLowerCase().endsWith(".m3u8")) {
             try {
                 const headers = new Headers();
@@ -3778,11 +4150,11 @@ async function handleRequest(request, env, waitUntil) {
                 if (request.headers.get("if-range")) headers.set("if-range", request.headers.get("if-range"));
 
                 const upstreamRes = await fetch(sourceUrl, { method: request.method, headers, redirect: "follow" });
-                
+
                 const proxyHeaders = new Headers(upstreamRes.headers);
                 proxyHeaders.set("access-control-allow-origin", "*");
                 if (proxyHeaders.has("transfer-encoding")) proxyHeaders.delete("content-length");
-                
+
                 return new Response(upstreamRes.body, { status: upstreamRes.status, headers: proxyHeaders });
             } catch (err) {
                 console.error(`[stream] Failed to proxy native stream ${sourceUrl}: ${err.message}`);
@@ -3802,7 +4174,7 @@ async function handleRequest(request, env, waitUntil) {
         if (!sourceUrl && streamIndex.has(key)) sourceUrl = streamIndex.get(key);
         if (!sourceUrl) throw new HttpError(404, "Live stream not found.");
         if (key === streamId) key = await streamKey(sourceUrl);
-        
+
         if (!path.toLowerCase().endsWith(".m3u8")) {
             try {
                 const headers = new Headers();
@@ -3811,11 +4183,11 @@ async function handleRequest(request, env, waitUntil) {
                 if (request.headers.get("if-range")) headers.set("if-range", request.headers.get("if-range"));
 
                 const upstreamRes = await fetch(sourceUrl, { method: request.method, headers, redirect: "follow" });
-                
+
                 const proxyHeaders = new Headers(upstreamRes.headers);
                 proxyHeaders.set("access-control-allow-origin", "*");
                 if (proxyHeaders.has("transfer-encoding")) proxyHeaders.delete("content-length");
-                
+
                 return new Response(upstreamRes.body, { status: upstreamRes.status, headers: proxyHeaders });
             } catch (err) {
                 console.error(`[stream] Failed to proxy native stream ${sourceUrl}: ${err.message}`);
