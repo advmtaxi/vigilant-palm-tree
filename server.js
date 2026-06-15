@@ -2404,13 +2404,11 @@ function dashboardPage() {
         div.className = "cat-item draggable" + (activeCategoryId === cat.id ? " active" : "");
         div.draggable = true;
         div.dataset.index = index;
-        div.innerHTML = `
-          <span class="drag-handle">☰</span>
-          <span style="flex:1;overflow:hidden;text-overflow:ellipsis">${cat.name} <small style="color:var(--muted)">(${cat.channelKeys.length})</small></span>
-          <div class="cat-actions">
-            <button type="button" class="danger" style="padding:2px 6px;min-height:0;font-size:11px">Delete</button>
-          </div>
-        `;
+        div.innerHTML = '<span class="drag-handle">☰</span>' +
+          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis">' + cat.name + ' <small style="color:var(--muted)">(' + cat.channelKeys.length + ')</small></span>' +
+          '<div class="cat-actions">' +
+            '<button type="button" class="danger" style="padding:2px 6px;min-height:0;font-size:11px">Delete</button>' +
+          '</div>';
         
         div.addEventListener("click", (e) => {
           if (e.target.tagName === "BUTTON") return;
@@ -2472,11 +2470,9 @@ function dashboardPage() {
         div.className = "cat-ch-item draggable";
         div.draggable = true;
         div.dataset.index = index;
-        div.innerHTML = `
-          <span class="drag-handle">☰</span>
-          <span style="flex:1;overflow:hidden;text-overflow:ellipsis">${ch.name}</span>
-          <button type="button" class="danger" style="padding:2px 6px;min-height:0;font-size:11px">Remove</button>
-        `;
+        div.innerHTML = '<span class="drag-handle">☰</span>' +
+          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis">' + ch.name + '</span>' +
+          '<button type="button" class="danger" style="padding:2px 6px;min-height:0;font-size:11px">Remove</button>';
         
         div.querySelector("button").addEventListener("click", () => {
           cat.channelKeys.splice(index, 1);
@@ -2546,7 +2542,7 @@ function dashboardPage() {
         filtered.forEach(ch => {
           const div = document.createElement("div");
           div.className = "channel-item";
-          div.innerHTML = `<span style="flex:1">${ch.name}</span> <span class="ch-cat">${ch.category||""}</span> <button class="secondary" type="button" style="padding:2px 6px;min-height:0;font-size:11px">Add</button>`;
+          div.innerHTML = '<span style="flex:1">' + ch.name + '</span> <span class="ch-cat">' + (ch.category||"") + '</span> <button class="secondary" type="button" style="padding:2px 6px;min-height:0;font-size:11px">Add</button>';
           div.querySelector("button").addEventListener("click", () => {
             const cat = customCategories.find(c => c.id === activeCategoryId);
             if (cat && !cat.channelKeys.includes(ch.key)) {
