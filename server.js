@@ -2174,6 +2174,7 @@ function dashboardPage() {
 
     let allChannels = [];
     const selectedKeys = new Set();
+    let lastCheckedIndex = null;
 
     function setPlMessage(text, isError) {
       plMessage.textContent = text;
@@ -2196,7 +2197,7 @@ function dashboardPage() {
         chList.innerHTML = '<div style="padding:14px;color:var(--muted);font-size:13px">No channels found.</div>';
         return;
       }
-      for (var i = 0; i < shown.length; i++) {
+      for (let i = 0; i < shown.length; i++) {
         var ch = shown[i];
         var div = document.createElement("div");
         div.className = "channel-item";
@@ -2204,10 +2205,25 @@ function dashboardPage() {
         cb.type = "checkbox";
         cb.checked = selectedKeys.has(ch.key);
         cb.setAttribute("data-key", ch.key);
-        cb.addEventListener("change", function(e) {
-          var k = e.target.getAttribute("data-key");
-          if (e.target.checked) selectedKeys.add(k);
-          else selectedKeys.delete(k);
+        cb.addEventListener("click", function(e) {
+          if (e.shiftKey && lastCheckedIndex !== null) {
+            let start = Math.min(i, lastCheckedIndex);
+            let end = Math.max(i, lastCheckedIndex);
+            for (let j = start; j <= end; j++) {
+              const rowCb = chList.children[j].querySelector("input[type='checkbox']");
+              if (rowCb) {
+                rowCb.checked = cb.checked;
+                const k = rowCb.getAttribute("data-key");
+                if (cb.checked) selectedKeys.add(k);
+                else selectedKeys.delete(k);
+              }
+            }
+          } else {
+            var k = e.target.getAttribute("data-key");
+            if (e.target.checked) selectedKeys.add(k);
+            else selectedKeys.delete(k);
+          }
+          lastCheckedIndex = i;
           updateSelectedCount();
         });
         var nameSpan = document.createElement("span");
@@ -2637,6 +2653,25 @@ function dashboardPage() {
       if (filtered.length === 0) {
         catChSearchListEl.innerHTML = '<div style="padding:10px;font-size:13px;color:var(--muted)">No channels found.</div>';
       } else {
+        const addAllBtn = document.createElement("button");
+        addAllBtn.type = "button";
+        addAllBtn.className = "secondary";
+        addAllBtn.style.cssText = "width:100%; padding:6px; margin-bottom:4px; font-weight:bold";
+        addAllBtn.textContent = "Add All " + filtered.length + " Channels";
+        addAllBtn.addEventListener("click", () => {
+          const cat = customCategories.find(c => c.id === activeCategoryId);
+          if (cat) {
+            filtered.forEach(ch => {
+              if (!cat.channelKeys.includes(ch.key)) cat.channelKeys.push(ch.key);
+            });
+            renderCategories();
+            renderActiveCategory();
+          }
+          catChSearchInput.value = "";
+          catChSearchListEl.style.display = "none";
+        });
+        catChSearchListEl.appendChild(addAllBtn);
+
         filtered.forEach(ch => {
           const div = document.createElement("div");
           div.className = "channel-item";
@@ -2649,8 +2684,6 @@ function dashboardPage() {
               renderCategories();
               renderActiveCategory();
             }
-            catChSearchInput.value = "";
-            catChSearchListEl.style.display = "none";
           });
           catChSearchListEl.appendChild(div);
         });
