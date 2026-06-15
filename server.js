@@ -2021,7 +2021,15 @@ function dashboardPage() {
           </div>
           <div class="cat-list" id="cat-list"></div>
           <button class="secondary" type="button" id="auto-cat-btn" style="width:100%;margin-bottom:8px">Auto-Import from Channels</button>
-          <button class="secondary" type="button" id="save-categories-btn" style="width:100%">Save Categories & Order</button>
+          <div style="display:flex;gap:10px;margin-bottom:8px">
+            <button class="secondary" type="button" id="export-cat-btn" style="flex:1">Export</button>
+            <button class="secondary" type="button" id="show-import-cat-btn" style="flex:1">Import</button>
+          </div>
+          <div class="import-area" id="import-cat-area" style="display:none;margin-bottom:8px">
+            <textarea id="import-cat-json" placeholder="Paste exported JSON here..."></textarea>
+            <button type="button" id="do-import-cat-btn" style="margin-top:8px;width:100%">Import Categories JSON</button>
+          </div>
+          <button type="button" id="save-categories-btn" style="width:100%">Save Categories & Order</button>
           <div class="message" id="cat-message"></div>
         </div>
       </div>
@@ -2558,6 +2566,45 @@ function dashboardPage() {
       renderActiveCategory();
       document.getElementById("cat-message").textContent = "Imported! Don't forget to Save.";
       document.getElementById("cat-message").style.color = "var(--muted)";
+    });
+
+    document.getElementById("export-cat-btn").addEventListener("click", () => {
+      const data = JSON.stringify({ categories: customCategories }, null, 2);
+      const blob = new Blob([data], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "custom-categories-export.json";
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    document.getElementById("show-import-cat-btn").addEventListener("click", () => {
+      const area = document.getElementById("import-cat-area");
+      area.style.display = area.style.display === "none" ? "block" : "none";
+    });
+
+    document.getElementById("do-import-cat-btn").addEventListener("click", () => {
+      const raw = document.getElementById("import-cat-json").value.trim();
+      if (!raw) {
+        document.getElementById("cat-message").textContent = "Paste JSON first.";
+        document.getElementById("cat-message").style.color = "var(--danger)";
+        return;
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed.categories)) throw new Error("Invalid format: expected 'categories' array");
+        customCategories = parsed.categories;
+        document.getElementById("import-cat-json").value = "";
+        document.getElementById("import-cat-area").style.display = "none";
+        renderCategories();
+        renderActiveCategory();
+        document.getElementById("cat-message").textContent = "Imported successfully! Please click Save to apply.";
+        document.getElementById("cat-message").style.color = "var(--muted)";
+      } catch (err) {
+        document.getElementById("cat-message").textContent = "Error parsing JSON: " + err.message;
+        document.getElementById("cat-message").style.color = "var(--danger)";
+      }
     });
 
     document.getElementById("save-categories-btn").addEventListener("click", async () => {
