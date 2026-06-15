@@ -2033,7 +2033,7 @@ function dashboardPage() {
             <span class="search-icon">&#128269;</span>
             <input id="cat-ch-search" placeholder="Search to add channels..." autocomplete="off">
           </div>
-          <div class="channel-list" id="cat-ch-search-list" style="display:none; position:absolute; z-index:10; max-height:250px; background:var(--panel-2); width:calc(100% - 36px); box-shadow:0 4px 12px rgba(0,0,0,0.5)"></div>
+          <div class="channel-list" id="cat-ch-search-list" style="display:none; position:absolute; z-index:10; max-height:250px; overflow-y:auto; background:var(--panel-2); width:calc(100% - 36px); box-shadow:0 4px 12px rgba(0,0,0,0.5)"></div>
           
           <div style="margin-top:14px; margin-bottom:8px; font-size:13px; color:var(--muted)">Assigned Channels (Drag to reorder): <span id="cat-ch-count">0</span></div>
           <div class="cat-ch-list" id="active-cat-ch-list"></div>
@@ -2406,9 +2406,11 @@ function dashboardPage() {
         div.draggable = true;
         div.dataset.index = index;
         div.innerHTML = '<span class="drag-handle">☰</span>' +
-          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis">' + cat.name + ' <small style="color:var(--muted)">(' + cat.channelKeys.length + ')</small></span>' +
+          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis">' + escapeXml(cat.name) + ' <small style="color:var(--muted)">(' + cat.channelKeys.length + ')</small></span>' +
           '<div class="cat-actions">' +
-            '<button type="button" class="danger" style="padding:2px 6px;min-height:0;font-size:11px">Delete</button>' +
+            '<button type="button" class="secondary to-top-btn" style="padding:2px 6px;min-height:0;font-size:11px">Top</button>' +
+            '<button type="button" class="secondary rename-btn" style="padding:2px 6px;min-height:0;font-size:11px">Rename</button>' +
+            '<button type="button" class="danger delete-btn" style="padding:2px 6px;min-height:0;font-size:11px">Delete</button>' +
           '</div>';
         
         div.addEventListener("click", (e) => {
@@ -2418,11 +2420,29 @@ function dashboardPage() {
           renderActiveCategory();
         });
         
-        div.querySelector("button").addEventListener("click", () => {
+        div.querySelector(".delete-btn").addEventListener("click", (e) => {
+          e.stopPropagation();
           customCategories = customCategories.filter(c => c.id !== cat.id);
           if (activeCategoryId === cat.id) activeCategoryId = null;
           renderCategories();
           renderActiveCategory();
+        });
+
+        div.querySelector(".to-top-btn").addEventListener("click", (e) => {
+          e.stopPropagation();
+          const moved = customCategories.splice(index, 1)[0];
+          customCategories.unshift(moved);
+          renderCategories();
+        });
+        
+        div.querySelector(".rename-btn").addEventListener("click", (e) => {
+          e.stopPropagation();
+          const newName = prompt("Rename category:", cat.name);
+          if (newName && newName.trim()) {
+            cat.name = newName.trim();
+            renderCategories();
+            renderActiveCategory();
+          }
         });
         
         // Drag events for category
@@ -2505,7 +2525,7 @@ function dashboardPage() {
       const name = document.getElementById("new-cat-name").value.trim();
       if (!name) return;
       const newId = String(Date.now()) + Math.floor(Math.random()*1000);
-      customCategories.push({ id: newId, name, order: customCategories.length + 1, channelKeys: [] });
+      customCategories.unshift({ id: newId, name, order: 0, channelKeys: [] });
       document.getElementById("new-cat-name").value = "";
       renderCategories();
     });
@@ -2573,8 +2593,9 @@ function dashboardPage() {
         filtered.forEach(ch => {
           const div = document.createElement("div");
           div.className = "channel-item";
+          div.style.cursor = "pointer";
           div.innerHTML = '<span style="flex:1">' + ch.name + '</span> <span class="ch-cat">' + (ch.category||"") + '</span> <button class="secondary" type="button" style="padding:2px 6px;min-height:0;font-size:11px">Add</button>';
-          div.querySelector("button").addEventListener("click", () => {
+          div.addEventListener("click", () => {
             const cat = customCategories.find(c => c.id === activeCategoryId);
             if (cat && !cat.channelKeys.includes(ch.key)) {
               cat.channelKeys.push(ch.key);
