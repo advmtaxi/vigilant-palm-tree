@@ -2238,7 +2238,7 @@ function dashboardPage() {
 
     async function loadAllChannels() {
       try {
-        var res = await fetch("/api/channels");
+        var res = await fetch("/api/all-channels");
         if (!res.ok) throw new Error("Failed to load channels");
         var data = await res.json();
         allChannels = data.channels || [];
@@ -2414,7 +2414,7 @@ function dashboardPage() {
         div.draggable = true;
         div.dataset.index = index;
         div.innerHTML = '<span class="drag-handle">☰</span>' +
-          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis">' + escapeXml(cat.name) + ' <small style="color:var(--muted)">(' + cat.channelKeys.length + ')</small></span>' +
+          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis">' + cat.name + ' <small style="color:var(--muted)">(' + cat.channelKeys.length + ')</small></span>' +
           '<div class="cat-actions">' +
             '<button type="button" class="secondary to-top-btn" style="padding:2px 6px;min-height:0;font-size:11px">Top</button>' +
             '<button type="button" class="secondary rename-btn" style="padding:2px 6px;min-height:0;font-size:11px">Rename</button>' +
@@ -3114,8 +3114,6 @@ async function fetchUpstreamAsset(url, referer, env, ttlSeconds, request) {
     try {
         const headers = {
             "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
-            "accept-encoding": "identity",
-            "connection": "keep-alive",
             referer,
         };
         if (request && request.headers.get("range")) headers.range = request.headers.get("range");
@@ -3536,66 +3534,120 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
     const wantedCategoryId = cleanString(categoryId);
     
     if (custom && custom.length > 0) {
+        const channelMap = new Map();
         const channels = await loadPlaylistChannels(env, false).catch(() => []);
+        for (const ch of channels) channelMap.set(ch.key, { ...ch, is_xtream: false });
+        
+        const sources = buildProviderPlaylistSources(env);
+        for (const source of sources) {
+            const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
+            if (catalog) {
+                for (const item of catalog.items) {
+                    const id = itemId(item, "live");
+                    if (id) {
+                        channelMap.set(id, {
+                            key: id,
+                            name: cleanString(item.name, "Unknown"),
+                            logo: mediaLogo(item),
+                            category: cleanString(item.category_id),
+                            is_xtream: true,
+                            xtream_item: item
+                        });
+                    }
+                }
+            }
+        }
+
         const result = [];
         let num = 1;
-        
-        const channelMap = new Map();
-        for (const ch of channels) channelMap.set(ch.key, ch);
         
         const sortedCategories = [...custom].sort((a, b) => a.order - b.order);
         const mappedKeys = new Set();
         
         for (const cat of sortedCategories) {
             for (const key of cat.channelKeys) mappedKeys.add(key);
-            
             if (wantedCategoryId && wantedCategoryId !== "0" && cat.id !== wantedCategoryId) continue;
-            
             for (const key of cat.channelKeys) {
                 const channel = channelMap.get(key);
                 if (!channel) continue;
-                
-                const numericStreamId = String(parseInt(channel.key.slice(0, 8), 16) || 1);
-                xtreamLocalNumericIndex.set(numericStreamId, channel.key);
-                
-                result.push({
-                    num: num++,
-                    name: cleanString(channel?.name, "Unknown"),
-                    stream_type: "live",
-                    stream_id: Number(numericStreamId),
-                    stream_icon: cleanString(channel?.logo),
-                    epg_channel_id: null,
-                    added: String(Math.floor(Date.now() / 1000)),
-                    is_adult: "0",
-                    category_id: cat.id,
-                    custom_sid: "",
-                    tv_archive: 0,
-                    direct_source: "",
-                    tv_archive_duration: 0,
-                });
-            }
-        }
-        
-        if (wantedCategoryId === "999999" || (!wantedCategoryId || wantedCategoryId === "0")) {
-            for (const channel of channels) {
-                if (!mappedKeys.has(channel.key)) {
+                if (!channel.is_xtream) {
                     const numericStreamId = String(parseInt(channel.key.slice(0, 8), 16) || 1);
                     xtreamLocalNumericIndex.set(numericStreamId, channel.key);
                     result.push({
                         num: num++,
-                        name: cleanString(channel?.name, "Unknown"),
+                        name: channel.name,
                         stream_type: "live",
                         stream_id: Number(numericStreamId),
-                        stream_icon: cleanString(channel?.logo),
+                        stream_icon: channel.logo,
                         epg_channel_id: null,
                         added: String(Math.floor(Date.now() / 1000)),
                         is_adult: "0",
-                        category_id: "999999",
+                        category_id: cat.id,
                         custom_sid: "",
                         tv_archive: 0,
                         direct_source: "",
                         tv_archive_duration: 0,
                     });
+                } else {
+                    const item = channel.xtream_item;
+                    result.push({
+                        num: num++,
+                        name: channel.name,
+                        stream_type: "live",
+                        stream_id: Number(channel.key),
+                        stream_icon: channel.logo,
+                        epg_channel_id: null,
+                        added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
+                        is_adult: "0",
+                        category_id: cat.id,
+                        custom_sid: "",
+                        tv_archive: 0,
+                        direct_source: "",
+                        tv_archive_duration: 0,
+                    });
+                }
+            }
+        }
+        
+        if (wantedCategoryId === "999999" || (!wantedCategoryId || wantedCategoryId === "0")) {
+            for (const channel of channelMap.values()) {
+                if (!mappedKeys.has(channel.key)) {
+                    if (!channel.is_xtream) {
+                        const numericStreamId = String(parseInt(channel.key.slice(0, 8), 16) || 1);
+                        xtreamLocalNumericIndex.set(numericStreamId, channel.key);
+                        result.push({
+                            num: num++,
+                            name: channel.name,
+                            stream_type: "live",
+                            stream_id: Number(numericStreamId),
+                            stream_icon: channel.logo,
+                            epg_channel_id: null,
+                            added: String(Math.floor(Date.now() / 1000)),
+                            is_adult: "0",
+                            category_id: "999999",
+                            custom_sid: "",
+                            tv_archive: 0,
+                            direct_source: "",
+                            tv_archive_duration: 0,
+                        });
+                    } else {
+                        const item = channel.xtream_item;
+                        result.push({
+                            num: num++,
+                            name: channel.name,
+                            stream_type: "live",
+                            stream_id: Number(channel.key),
+                            stream_icon: channel.logo,
+                            epg_channel_id: null,
+                            added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
+                            is_adult: "0",
+                            category_id: "999999",
+                            custom_sid: "",
+                            tv_archive: 0,
+                            direct_source: "",
+                            tv_archive_duration: 0,
+                        });
+                    }
                 }
             }
         }
@@ -4359,6 +4411,29 @@ async function handleRequest(request, env, waitUntil) {
             status: 302,
             headers: { location: `${publicBase(request, env)}/upseg/${key}/${token}/${filename}` },
         }));
+    }
+
+    if (path === "/api/all-channels") {
+        const channelMap = new Map();
+        const channels = await loadPlaylistChannels(env, false).catch(() => []);
+        for (const ch of channels) channelMap.set(ch.key, { key: ch.key, name: ch.name, category: ch.category, logo: ch.logo });
+        
+        const sources = buildProviderPlaylistSources(env);
+        for (const source of sources) {
+            const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
+            if (catalog) {
+                const catMap = new Map();
+                for (const [catId, catName] of catalog.categoriesById.entries()) catMap.set(catId, catName);
+                for (const item of catalog.items) {
+                    const id = itemId(item, "live");
+                    if (id) {
+                        const catName = catMap.get(cleanString(item.category_id)) || cleanString(item.category_id);
+                        channelMap.set(id, { key: id, name: cleanString(item.name, "Unknown"), category: catName, logo: mediaLogo(item) });
+                    }
+                }
+            }
+        }
+        return json({ status: "ok", channels: Array.from(channelMap.values()) });
     }
 
     if (path === "/api/channels" || path === "/api/channels.json" || path === "/channels") {
