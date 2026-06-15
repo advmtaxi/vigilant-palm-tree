@@ -657,25 +657,35 @@ function xtreamApiUrl(config, action, extraParams = {}) {
 
 async function fetchXtreamApi(env, config, action, extraParams = {}) {
     const timeoutMs = envInt(env, "XTREAM_API_TIMEOUT_MS", 4000);
+    const maxRetries = envInt(env, "XTREAM_API_RETRIES", 2);
     const headers = {
         "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
         accept: "application/json, text/plain, */*",
     };
     const urls = upstreamUrlCandidates(xtreamApiUrl(config, action, extraParams).toString(), env);
-    const attempts = await Promise.allSettled(urls.map(async (url) => {
-        const response = await fetchWithTimeout(url, { headers, redirect: "follow" }, timeoutMs);
-        if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText || ""}`.trim());
-        return JSON.parse(await response.text());
-    }));
+    const allFailures = [];
 
-    for (const attempt of attempts) {
-        if (attempt.status === "fulfilled") return attempt.value;
+    for (const url of urls) {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                const response = await fetchWithTimeout(url, { headers, redirect: "follow" }, timeoutMs);
+                if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText || ""}`.trim());
+                const text = await response.text();
+                const parsed = JSON.parse(text);
+                if (attempt > 0) console.log(`[xtream-upstream] action=${action || "auth"} succeeded on retry ${attempt} for ${sanitizeUrlForLog(url)}`);
+                return parsed;
+            } catch (err) {
+                const errMsg = `${sanitizeUrlForLog(url)} attempt ${attempt + 1}/${maxRetries + 1} -> ${err?.message || "unknown error"}`;
+                allFailures.push(errMsg);
+                if (attempt < maxRetries) {
+                    const delayMs = 300 * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5);
+                    console.warn(`[xtream-upstream] action=${action || "auth"} ${errMsg}. Retrying in ${Math.round(delayMs)}ms...`);
+                    await new Promise((resolve) => setTimeout(resolve, delayMs));
+                }
+            }
+        }
     }
-    const failures = attempts.map((attempt, index) => {
-        const reason = attempt.status === "rejected" ? attempt.reason : null;
-        return `${sanitizeUrlForLog(urls[index])} -> ${reason?.message || reason?.status || "unknown error"}`;
-    }).join("; ");
-    console.warn(`[xtream-upstream] action=${action || "auth"} failed all upstream attempts: ${failures}`);
+    console.error(`[xtream-upstream] action=${action || "auth"} FAILED all ${urls.length} URLs x ${maxRetries + 1} retries: ${allFailures.join("; ")}`);
     return null;
 }
 
@@ -1117,6 +1127,7 @@ async function doRefreshChannels(env) {
     const playlistSources = buildProviderPlaylistSources(env);
     if (playlistSources.length === 0) throw new HttpError(500, "No IPTV playlist sources configured.");
 
+    const maxSourceRetries = envInt(env, "SOURCE_LOAD_RETRIES", 2);
     const channels = [];
     const nextStreamIndex = new Map();
     const seenKeys = new Set();
@@ -1124,22 +1135,60 @@ async function doRefreshChannels(env) {
     let playlistOkCount = 0;
     let lastStatus = null;
 
+    console.log(`[cache] refreshing channels from ${playlistSources.length} source(s): ${playlistSources.map((s) => s.label).join(", ")}`);
+
     const sourceResults = await Promise.all(playlistSources.map(async (playlistSource) => {
         let response = null;
-        const liveCatalog = await loadXtreamCatalog(env, playlistSource, "live", false).catch(() => null);
-        try {
-            response = await fetchProviderPlaylist(env, playlistSource.url);
-        } catch {
-            response = null;
+        let liveCatalog = null;
+
+        // Retry Xtream catalog loading
+        for (let attempt = 0; attempt <= maxSourceRetries; attempt++) {
+            try {
+                liveCatalog = await loadXtreamCatalog(env, playlistSource, "live", attempt > 0);
+                if (liveCatalog) break;
+            } catch (err) {
+                console.warn(`[cache] Xtream catalog load for ${playlistSource.label} attempt ${attempt + 1}/${maxSourceRetries + 1} failed: ${err?.message || err}`);
+                if (attempt < maxSourceRetries) {
+                    const delayMs = 500 * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5);
+                    await new Promise((resolve) => setTimeout(resolve, delayMs));
+                }
+            }
         }
+
+        // Retry playlist fetch
+        for (let attempt = 0; attempt <= maxSourceRetries; attempt++) {
+            try {
+                response = await fetchProviderPlaylist(env, playlistSource.url);
+                if (response && response.ok) {
+                    if (attempt > 0) console.log(`[cache] playlist fetch for ${playlistSource.label} succeeded on retry ${attempt}`);
+                    break;
+                }
+                if (response && !response.ok) {
+                    console.warn(`[cache] playlist fetch for ${playlistSource.label} attempt ${attempt + 1}/${maxSourceRetries + 1} returned HTTP ${response.status}`);
+                }
+            } catch (err) {
+                console.warn(`[cache] playlist fetch for ${playlistSource.label} attempt ${attempt + 1}/${maxSourceRetries + 1} failed: ${err?.message || err}`);
+                response = null;
+            }
+            if (attempt < maxSourceRetries && (!response || !response.ok)) {
+                const delayMs = 500 * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5);
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+        }
+
         return { playlistSource, response, liveCatalog };
     }));
 
     for (const { playlistSource, response, liveCatalog } of sourceResults) {
-        if (!response && !liveCatalog) { lastStatus = "network error"; continue; }
+        if (!response && !liveCatalog) {
+            console.error(`[cache] source ${playlistSource.label} COMPLETELY FAILED after all retries`);
+            lastStatus = "network error";
+            continue;
+        }
 
         if (response && response.ok) {
             try {
+                let sourceChannelCount = 0;
                 await parseM3uChannels(response, async (channel) => {
                     if (seenKeys.has(channel.key)) return;
                     const xtreamItem = channel.streamId ? liveCatalog?.itemsById?.get(channel.streamId) : null;
@@ -1149,11 +1198,13 @@ async function doRefreshChannels(env) {
                     seenKeys.add(channel.key);
                     nextStreamIndex.set(channel.key, channel.sourceUrl);
                     channels.push({ key: channel.key, name: withSourceSuffix(name, playlistSource.label), logo, category });
+                    sourceChannelCount++;
                 });
                 successCount += 1;
                 playlistOkCount += 1;
+                console.log(`[cache] source ${playlistSource.label} loaded ${sourceChannelCount} channels via playlist`);
             } catch (err) {
-                console.warn(`[cache] failed to parse M3U channels from source ${playlistSource.label}:`, err?.message || err);
+                console.error(`[cache] FAILED to parse M3U from source ${playlistSource.label}: ${err?.message || err}`);
                 lastStatus = "parse error";
             }
             continue;
@@ -1163,21 +1214,29 @@ async function doRefreshChannels(env) {
             const xtreamChannels = await channelsFromXtreamCatalog(playlistSource, liveCatalog);
             if (xtreamChannels.length > 0) {
                 successCount += 1;
+                let sourceChannelCount = 0;
                 for (const channel of xtreamChannels) {
                     if (seenKeys.has(channel.key)) continue;
                     seenKeys.add(channel.key);
                     nextStreamIndex.set(channel.key, channel.sourceUrl);
                     channels.push({ key: channel.key, name: channel.name, logo: channel.logo, category: channel.category });
+                    sourceChannelCount++;
                 }
+                console.log(`[cache] source ${playlistSource.label} loaded ${sourceChannelCount} channels via Xtream fallback`);
                 continue;
             }
         }
 
         lastStatus = response ? response.status : "network error";
+        console.warn(`[cache] source ${playlistSource.label} produced no channels (status: ${lastStatus})`);
     }
 
     if (successCount === 0) {
-        if (channelCache.channels.length > 0) return channelCache.channels; // serve stale
+        console.error(`[cache] ALL ${playlistSources.length} IPTV sources FAILED. Last status: ${lastStatus}`);
+        if (channelCache.channels.length > 0) {
+            console.warn(`[cache] serving ${channelCache.channels.length} stale cached channels`);
+            return channelCache.channels;
+        }
         throw new HttpError(502, `All IPTV playlist sources failed${lastStatus ? ` (last status: ${lastStatus})` : ""}.`);
     }
 
@@ -1201,7 +1260,7 @@ async function doRefreshChannels(env) {
     });
 
     buildSlugIndex(channels);
-    console.log(`[cache] channels refreshed: ${channels.length} channels`);
+    console.log(`[cache] channels refreshed: ${channels.length} total channels from ${successCount}/${playlistSources.length} sources`);
     return channels;
 }
 
@@ -2881,42 +2940,89 @@ async function generatedM3uResponse(request, env, waitUntil = (promise) => promi
 
 async function fetchProviderPlaylist(env, url) {
     const timeoutMs = envInt(env, "PLAYLIST_FETCH_TIMEOUT_MS", 12000);
+    const maxRetries = envInt(env, "PLAYLIST_FETCH_RETRIES", 2);
     const headers = {
         "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
         accept: "application/x-mpegURL, application/vnd.apple.mpegurl, text/plain, */*",
     };
 
     let firstBadResponse = null;
-    for (const candidateUrl of upstreamUrlCandidates(url, env)) {
-        try {
-            const response = await fetchWithTimeout(candidateUrl, { headers, redirect: "follow" }, timeoutMs);
-            if (response.ok) return response;
-            if (!firstBadResponse) firstBadResponse = response;
-        } catch {
-            // try next candidate
+    const candidates = upstreamUrlCandidates(url, env);
+    const allFailures = [];
+
+    for (const candidateUrl of candidates) {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                const response = await fetchWithTimeout(candidateUrl, { headers, redirect: "follow" }, timeoutMs);
+                if (response.ok) {
+                    if (attempt > 0 || candidates.indexOf(candidateUrl) > 0) {
+                        console.log(`[playlist-fetch] succeeded on candidate ${candidates.indexOf(candidateUrl) + 1}/${candidates.length} attempt ${attempt + 1}`);
+                    }
+                    return response;
+                }
+                const failMsg = `${sanitizeUrlForLog(candidateUrl)} -> HTTP ${response.status}`;
+                allFailures.push(failMsg);
+                console.warn(`[playlist-fetch] ${failMsg} (attempt ${attempt + 1}/${maxRetries + 1})`);
+                if (!firstBadResponse) firstBadResponse = response;
+                // Don't retry 4xx client errors
+                if (response.status >= 400 && response.status < 500) break;
+            } catch (err) {
+                const failMsg = `${sanitizeUrlForLog(candidateUrl)} -> ${err?.code === "TIMEOUT" ? "TIMEOUT" : err?.message || "network error"}`;
+                allFailures.push(failMsg);
+                console.warn(`[playlist-fetch] ${failMsg} (attempt ${attempt + 1}/${maxRetries + 1})`);
+            }
+            if (attempt < maxRetries) {
+                const delayMs = 500 * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5);
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
         }
     }
+    if (allFailures.length > 0) {
+        console.error(`[playlist-fetch] ALL candidates FAILED for ${sanitizeUrlForLog(url)}: ${allFailures.join("; ")}`);
+    }
     if (firstBadResponse) return firstBadResponse;
-    throw new Error("Provider playlist fetch failed.");
+    throw new Error(`Provider playlist fetch failed after ${candidates.length} URLs x ${maxRetries + 1} retries.`);
 }
 
-// ─── FIXED: fetchHls now uses fetchWithTimeout so it can't hang forever
+// ─── FIXED: fetchHls with retry, logging, and timeout protection
 async function fetchHls(url, env, referer) {
-    try {
-        const timeoutMs = envInt(env, "HLS_FETCH_TIMEOUT_MS", 6000);
-        const headers = {
-            accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
-            "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
-        };
-        if (referer) headers.referer = referer;
-        const response = await fetchWithTimeout(url, { headers, redirect: "follow" }, timeoutMs);
-        if (!response.ok) return null;
-        const text = await response.text();
-        if (!text.includes("#EXTM3U")) return null;
-        return { finalUrl: response.url, text };
-    } catch {
-        return null;
+    const timeoutMs = envInt(env, "HLS_FETCH_TIMEOUT_MS", 6000);
+    const maxRetries = envInt(env, "HLS_FETCH_RETRIES", 1);
+    const headers = {
+        accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
+        "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
+    };
+    if (referer) headers.referer = referer;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            const response = await fetchWithTimeout(url, { headers, redirect: "follow" }, timeoutMs);
+            if (!response.ok) {
+                console.warn(`[hls-fetch] ${sanitizeUrlForLog(url)} returned HTTP ${response.status} (attempt ${attempt + 1}/${maxRetries + 1})`);
+                if (response.status >= 500 && attempt < maxRetries) {
+                    const delayMs = 300 * Math.pow(2, attempt);
+                    await new Promise((resolve) => setTimeout(resolve, delayMs));
+                    continue;
+                }
+                return null;
+            }
+            const text = await response.text();
+            if (!text.includes("#EXTM3U")) {
+                console.warn(`[hls-fetch] ${sanitizeUrlForLog(url)} response is not a valid M3U8 (missing #EXTM3U header)`);
+                return null;
+            }
+            if (attempt > 0) console.log(`[hls-fetch] ${sanitizeUrlForLog(url)} succeeded on retry ${attempt}`);
+            return { finalUrl: response.url, text };
+        } catch (err) {
+            const isTimeout = err?.code === "TIMEOUT";
+            console.warn(`[hls-fetch] ${sanitizeUrlForLog(url)} ${isTimeout ? "TIMED OUT" : "FAILED"}: ${err?.message || err} (attempt ${attempt + 1}/${maxRetries + 1})`);
+            if (attempt < maxRetries) {
+                const delayMs = 300 * Math.pow(2, attempt);
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+        }
     }
+    return null;
 }
 
 // HTTPS fallback / URL candidates
@@ -2996,15 +3102,22 @@ async function findUpstreamHls(key, sourceUrl, env) {
                 rememberMapEntry(upstreamHlsCache, key, { url: fetched.finalUrl, at: Date.now() }, MAX_UPSTREAM_HLS_CACHE_ENTRIES);
                 return { url: fetched.finalUrl, text: fetched.text };
             }
+            console.warn(`[hls-discovery] cached URL for key ${key} no longer works, scanning candidates...`);
         }
-        for (const candidate of upstreamHlsCandidates(sourceUrl, env)) {
+        const candidates = upstreamHlsCandidates(sourceUrl, env);
+        for (let i = 0; i < candidates.length; i++) {
+            const candidate = candidates[i];
             const fetched = await fetchHls(candidate, env);
             if (fetched) {
+                console.log(`[hls-discovery] key ${key} resolved via candidate ${i + 1}/${candidates.length}`);
                 rememberMapEntry(upstreamHlsCache, key, { url: fetched.finalUrl, at: Date.now() }, MAX_UPSTREAM_HLS_CACHE_ENTRIES);
                 return { url: fetched.finalUrl, text: fetched.text };
             }
         }
-        rememberMapEntry(upstreamHlsCache, key, { url: null, at: Date.now() }, MAX_UPSTREAM_HLS_CACHE_ENTRIES);
+        // Use a short negative TTL so we retry sooner instead of caching failure for the full TTL
+        const negTtlMs = Math.min(ttlMs, envInt(env, "HLS_NEGATIVE_CACHE_SECONDS", 5) * 1000);
+        rememberMapEntry(upstreamHlsCache, key, { url: null, at: Date.now() - ttlMs + negTtlMs }, MAX_UPSTREAM_HLS_CACHE_ENTRIES);
+        console.error(`[hls-discovery] key ${key} FAILED: none of ${candidates.length} candidates returned valid M3U8 for ${sanitizeUrlForLog(sourceUrl)}`);
         return null;
     });
 }
@@ -3213,24 +3326,76 @@ async function proxyChannelPlaylist(key, request, env, waitUntil) {
         return proxyLiveFromSource(key, tokenData.u, request, env, waitUntil, `live:${key}:${srcToken}`);
     }
     const channel = await getStreamForKey(key, env);
-    try {
-        return await proxyLiveFromSource(key, channel.sourceUrl, request, env, waitUntil, `live:${key}`);
-    } catch (firstError) {
-        // M3U8 failed — force-refresh the API once and retry
-        console.warn(`[retry] m3u8 failed for key ${key}, refreshing API and retrying once...`);
-        upstreamHlsCache.delete(key);
-        livePlaylistCache.delete(`live:${key}`);
-        try { await doRefreshChannels(env); } catch (refreshErr) {
-            console.warn(`[retry] channel refresh failed:`, refreshErr?.message);
-            throw firstError;
-        }
-        const freshSourceUrl = streamIndex.get(key) || channel.sourceUrl;
+    const maxStreamRetries = envInt(env, "STREAM_PLAY_RETRIES", 2);
+
+    // ── Tier 1: retry the current source URL with backoff ───────────────
+    for (let attempt = 0; attempt <= maxStreamRetries; attempt++) {
         try {
-            return await proxyLiveFromSource(key, freshSourceUrl, request, env, waitUntil, `live:${key}`);
-        } catch {
-            throw firstError;
+            const result = await proxyLiveFromSource(key, channel.sourceUrl, request, env, waitUntil, `live:${key}`);
+            if (attempt > 0) console.log(`[stream-retry] key ${key} succeeded on attempt ${attempt + 1}`);
+            return result;
+        } catch (err) {
+            console.warn(`[stream-retry] key ${key} attempt ${attempt + 1}/${maxStreamRetries + 1} failed: ${err?.message || err}`);
+            upstreamHlsCache.delete(key);
+            livePlaylistCache.delete(`live:${key}`);
+            if (attempt < maxStreamRetries) {
+                const delayMs = 300 * Math.pow(2, attempt);
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
         }
     }
+
+    // ── Tier 2: refresh channels and try the (possibly updated) source URL
+    console.warn(`[stream-retry] key ${key} exhausted retries. Refreshing channel list...`);
+    try { await doRefreshChannels(env); } catch (refreshErr) {
+        console.error(`[stream-retry] channel refresh failed: ${refreshErr?.message}`);
+    }
+    const freshSourceUrl = streamIndex.get(key);
+    if (freshSourceUrl && freshSourceUrl !== channel.sourceUrl) {
+        console.log(`[stream-retry] key ${key} source URL changed after refresh, trying new URL...`);
+        upstreamHlsCache.delete(key);
+        livePlaylistCache.delete(`live:${key}`);
+        try {
+            return await proxyLiveFromSource(key, freshSourceUrl, request, env, waitUntil, `live:${key}`);
+        } catch (err) {
+            console.error(`[stream-retry] key ${key} also failed with refreshed URL: ${err?.message}`);
+        }
+    }
+
+    // ── Tier 3: scan ALL provider sources for the same channel key ──────
+    const allSources = buildProviderPlaylistSources(env);
+    if (allSources.length > 1) {
+        console.warn(`[stream-retry] key ${key} trying ${allSources.length} alternative IPTV sources...`);
+        for (const source of allSources) {
+            try {
+                const catalog = await loadXtreamCatalog(env, source, "live", true).catch(() => null);
+                if (!catalog) continue;
+                for (const item of catalog.items) {
+                    const id = itemId(item, "live");
+                    if (!id) continue;
+                    const ext = cleanString(item.container_extension, "ts");
+                    const candidateUrl = xtreamMediaUrl(catalog.config, "live", id, ext);
+                    const candidateKey = await streamKey(candidateUrl);
+                    if (candidateKey === key) {
+                        console.log(`[stream-retry] key ${key} found in source ${source.label}, attempting...`);
+                        upstreamHlsCache.delete(key);
+                        livePlaylistCache.delete(`live:${key}`);
+                        streamIndex.set(key, candidateUrl);
+                        try {
+                            return await proxyLiveFromSource(key, candidateUrl, request, env, waitUntil, `live:${key}`);
+                        } catch (sourceErr) {
+                            console.warn(`[stream-retry] key ${key} failed from source ${source.label}: ${sourceErr?.message}`);
+                        }
+                    }
+                }
+            } catch (scanErr) {
+                console.warn(`[stream-retry] scanning source ${source.label} failed: ${scanErr?.message}`);
+            }
+        }
+    }
+
+    console.error(`[stream-retry] key ${key} EXHAUSTED ALL OPTIONS. Stream unavailable.`);
+    throw new HttpError(502, "Upstream HLS unavailable after all retries and source rotation.");
 }
 
 async function proxyDirectPlaylist(token, request, env, waitUntil) {
@@ -3540,7 +3705,7 @@ async function xtreamLiveCategories(env) {
             const ob = custom.find(x => x.id === b.category_id)?.order || 0;
             return oa - ob;
         });
-        
+
         result.push({
             category_id: "999999",
             category_name: "Uncategorized",
@@ -3565,12 +3730,12 @@ async function xtreamLiveCategories(env) {
 async function xtreamLiveStreams(env, categoryId = "", request = null, user = null) {
     const custom = await loadCustomCategories(env);
     const wantedCategoryId = cleanString(categoryId);
-    
+
     if (custom && custom.length > 0) {
         const channelMap = new Map();
         const channels = await loadPlaylistChannels(env, false).catch(() => []);
         for (const ch of channels) channelMap.set(ch.key, { ...ch, is_xtream: false });
-        
+
         const sources = buildProviderPlaylistSources(env);
         for (const source of sources) {
             const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
@@ -3593,10 +3758,10 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
 
         const result = [];
         let num = 1;
-        
+
         const sortedCategories = [...custom].sort((a, b) => a.order - b.order);
         const mappedKeys = new Set();
-        
+
         for (const cat of sortedCategories) {
             for (const key of cat.channelKeys) mappedKeys.add(key);
             if (wantedCategoryId && wantedCategoryId !== "0" && cat.id !== wantedCategoryId) continue;
@@ -3641,7 +3806,7 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
                 }
             }
         }
-        
+
         if (wantedCategoryId === "999999" || (!wantedCategoryId || wantedCategoryId === "0")) {
             for (const channel of channelMap.values()) {
                 if (!mappedKeys.has(channel.key)) {
@@ -4078,14 +4243,14 @@ async function saveCustomCategoriesHandler(request, env) {
     if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
     const data = await readRequestData(request);
     const incoming = Array.isArray(data.categories) ? data.categories : [];
-    
+
     let maxId = 0;
     const existing = await loadCustomCategories(env);
     for (const c of existing) {
         const n = parseInt(c.id, 10);
         if (!isNaN(n) && n > maxId) maxId = n;
     }
-    
+
     const categoriesToSave = [];
     let order = 1;
     for (const c of incoming) {
@@ -4103,7 +4268,7 @@ async function saveCustomCategoriesHandler(request, env) {
             channelKeys: Array.isArray(c.channelKeys) ? c.channelKeys.map(String).filter(Boolean) : []
         });
     }
-    
+
     await saveCustomCategories(env, categoriesToSave);
     return json({ status: "ok", count: categoriesToSave.length, categories: categoriesToSave });
 }
@@ -4450,7 +4615,7 @@ async function handleRequest(request, env, waitUntil) {
         const channelMap = new Map();
         const channels = await loadPlaylistChannels(env, false).catch(() => []);
         for (const ch of channels) channelMap.set(ch.key, { key: ch.key, name: ch.name, category: ch.category, logo: ch.logo });
-        
+
         const sources = buildProviderPlaylistSources(env);
         for (const source of sources) {
             const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
