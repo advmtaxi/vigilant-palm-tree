@@ -2020,6 +2020,7 @@ function dashboardPage() {
             <button type="button" id="add-cat-btn">Add</button>
           </div>
           <div class="cat-list" id="cat-list"></div>
+          <button class="secondary" type="button" id="auto-cat-btn" style="width:100%;margin-bottom:8px">Auto-Import from Channels</button>
           <button class="secondary" type="button" id="save-categories-btn" style="width:100%">Save Categories & Order</button>
           <div class="message" id="cat-message"></div>
         </div>
@@ -2507,6 +2508,36 @@ function dashboardPage() {
       customCategories.push({ id: newId, name, order: customCategories.length + 1, channelKeys: [] });
       document.getElementById("new-cat-name").value = "";
       renderCategories();
+    });
+
+    document.getElementById("auto-cat-btn").addEventListener("click", () => {
+      if (allChannels.length === 0) {
+        document.getElementById("cat-message").textContent = "Wait for channels to load first.";
+        return;
+      }
+      if (customCategories.length > 0 && !confirm("This will clear your current custom categories and rebuild them. Continue?")) return;
+      
+      const catMap = new Map();
+      allChannels.forEach(ch => {
+        const cName = ch.category || "Uncategorized";
+        if (!catMap.has(cName)) catMap.set(cName, []);
+        catMap.get(cName).push(ch.key);
+      });
+      
+      customCategories = [];
+      let order = 1;
+      catMap.forEach((keys, name) => {
+        customCategories.push({
+          id: String(Date.now()) + Math.floor(Math.random()*1000) + order,
+          name: name,
+          order: order++,
+          channelKeys: keys
+        });
+      });
+      renderCategories();
+      renderActiveCategory();
+      document.getElementById("cat-message").textContent = "Imported! Don't forget to Save.";
+      document.getElementById("cat-message").style.color = "var(--muted)";
     });
 
     document.getElementById("save-categories-btn").addEventListener("click", async () => {
@@ -3015,6 +3046,8 @@ async function fetchUpstreamAsset(url, referer, env, ttlSeconds, request) {
     try {
         const headers = {
             "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
+            "accept-encoding": "identity",
+            "connection": "keep-alive",
             referer,
         };
         if (request && request.headers.get("range")) headers.range = request.headers.get("range");
@@ -3399,7 +3432,7 @@ function localXtreamLiveStreams(channels, categoryId = "", request = null, env =
 async function xtreamLiveCategories(env) {
     const custom = await loadCustomCategories(env);
     if (custom && custom.length > 0) {
-        return custom.map(c => ({
+        const result = custom.map(c => ({
             category_id: c.id,
             category_name: c.name,
             parent_id: 0
@@ -3408,6 +3441,13 @@ async function xtreamLiveCategories(env) {
             const ob = custom.find(x => x.id === b.category_id)?.order || 0;
             return oa - ob;
         });
+        
+        result.push({
+            category_id: "999999",
+            category_name: "Uncategorized",
+            parent_id: 0
+        });
+        return result;
     }
 
     const sources = buildProviderPlaylistSources(env);
@@ -3436,8 +3476,11 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
         for (const ch of channels) channelMap.set(ch.key, ch);
         
         const sortedCategories = [...custom].sort((a, b) => a.order - b.order);
+        const mappedKeys = new Set();
         
         for (const cat of sortedCategories) {
+            for (const key of cat.channelKeys) mappedKeys.add(key);
+            
             if (wantedCategoryId && wantedCategoryId !== "0" && cat.id !== wantedCategoryId) continue;
             
             for (const key of cat.channelKeys) {
@@ -3462,6 +3505,30 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
                     direct_source: "",
                     tv_archive_duration: 0,
                 });
+            }
+        }
+        
+        if (wantedCategoryId === "999999" || (!wantedCategoryId || wantedCategoryId === "0")) {
+            for (const channel of channels) {
+                if (!mappedKeys.has(channel.key)) {
+                    const numericStreamId = String(parseInt(channel.key.slice(0, 8), 16) || 1);
+                    xtreamLocalNumericIndex.set(numericStreamId, channel.key);
+                    result.push({
+                        num: num++,
+                        name: cleanString(channel?.name, "Unknown"),
+                        stream_type: "live",
+                        stream_id: Number(numericStreamId),
+                        stream_icon: cleanString(channel?.logo),
+                        epg_channel_id: null,
+                        added: String(Math.floor(Date.now() / 1000)),
+                        is_adult: "0",
+                        category_id: "999999",
+                        custom_sid: "",
+                        tv_archive: 0,
+                        direct_source: "",
+                        tv_archive_duration: 0,
+                    });
+                }
             }
         }
         return result;
