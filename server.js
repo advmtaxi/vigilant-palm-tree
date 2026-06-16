@@ -3327,20 +3327,43 @@ function countUpstreamSegments(text) {
     return count;
 }
 
-function buildLoadingPlaylistBody(env) {
-    const videoUrl = envString(env, "LOADING_VIDEO_URL", LOADING_VIDEO_URL);
-    // Single MP4 file, full duration (~240s). No #EXT-X-ENDLIST so the player
-    // keeps polling the M3U8 URL — next poll will get the real live stream
-    // once the upstream is ready.
+function buildLoadingPlaylistBody(request, env) {
+    // Point to our own /loading.mp4 proxy so CORS is handled properly.
+    // The MP4 is ~4:08 (248s). No #EXT-X-ENDLIST → player keeps polling.
+    const base = publicBase(request, env);
     return [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
-        "#EXT-X-TARGETDURATION:240",
+        "#EXT-X-TARGETDURATION:248",
         "#EXT-X-MEDIA-SEQUENCE:0",
-        "#EXTINF:240.0,",
-        videoUrl,
+        "#EXTINF:248.0,",
+        `${base}/loading.mp4`,
         "",
     ].join("\n");
+}
+
+// Proxy the loading MP4 through our server with CORS headers
+let loadingVideoCache = null; // { fetchedAt, response: { body, headers, status } }
+
+async function proxyLoadingVideo(env, request) {
+    const videoUrl = envString(env, "LOADING_VIDEO_URL", LOADING_VIDEO_URL);
+    const headers = {
+        "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
+    };
+    // Forward range requests so players can seek
+    if (request.headers.get("range")) headers.range = request.headers.get("range");
+
+    const upstream = await fetch(videoUrl, { method: request.method, headers, redirect: "follow" });
+
+    const respHeaders = new Headers(upstream.headers);
+    respHeaders.set("access-control-allow-origin", "*");
+    respHeaders.set("access-control-allow-methods", "GET, HEAD, OPTIONS");
+    respHeaders.set("access-control-expose-headers", "Content-Length, Content-Range, Accept-Ranges");
+    respHeaders.set("cache-control", "public, max-age=3600, s-maxage=3600");
+    if (!respHeaders.has("content-type")) respHeaders.set("content-type", "video/mp4");
+    respHeaders.set("accept-ranges", "bytes");
+
+    return new Response(upstream.body, { status: upstream.status, headers: respHeaders });
 }
 
 function cleanupWarmupState() {
@@ -3388,7 +3411,7 @@ async function proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, cach
                 } catch (e) { console.warn(`[warmup] key=${key} probe failed: ${e?.message}`); }
             })());
 
-            return playlistResponse(buildLoadingPlaylistBody(env));
+            return playlistResponse(buildLoadingPlaylistBody(request, env));
         }
 
         if (!warmup.ready) {
@@ -3412,7 +3435,7 @@ async function proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, cach
 
                 if (!warmup.ready) {
                     console.log(`[warmup] key=${key} still buffering (${warmup.segmentsSeen}/${requiredSegments} segments)`);
-                    return playlistResponse(buildLoadingPlaylistBody(env));
+                    return playlistResponse(buildLoadingPlaylistBody(request, env));
                 }
             }
         }
@@ -4544,6 +4567,11 @@ async function handleRequest(request, env, waitUntil) {
             xtream_compatibility: "get_all_categories returns a categories envelope",
             updated_at: "2026-06-14T00:44:00+02:00",
         });
+    }
+
+    // ─── Loading video proxy (serves MP4 with CORS) ─────────────────────────
+    if (path === "/loading.mp4") {
+        return proxyLoadingVideo(env, request);
     }
 
     if (path === "/") {
