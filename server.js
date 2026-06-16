@@ -76,7 +76,7 @@ let playlistChannelLoadPromise = null;
 const streamWarmupState = new Map();  // cacheKey → { startedAt, ready, segmentsSeen, warmupPromise }
 const MAX_WARMUP_ENTRIES = 500;
 const WARMUP_EXPIRY_MS = 120_000;     // forget warmup state after 2 minutes
-const LOADING_VIDEO_URL = "https://pub-170b5f1508954220a1c673d1ae1baaae.r2.dev/TaxiDevLoad.mp4";
+const LOADING_VIDEO_URL = "https://store6.gofile.io/download/web/efa83213-1a30-449d-bf0f-4e33eab99078/TaxiDevLoad.mp4";
 const WARMUP_REQUIRED_SEGMENTS = 2;   // how many segments must appear before switching to live
 
 // Disk-persist cache paths (loaded on startup so first request is always instant)
@@ -3312,38 +3312,32 @@ async function buildLivePlaylistBody(key, sourceUrl, request, env, waitUntil, ca
     });
 }
 
-// ─── Loading Video Playlist (warmup) ────────────────────────────────────────
-// Generates a short EVENT-type M3U8 playlist that plays the loading video,
-// then loops it. IPTV players poll the playlist URL every few seconds; once
-// the real segments are ready we simply return the live playlist instead.
+// ─── Loading Video (warmup) ─────────────────────────────────────────────────
+// Plays TaxiDevLoad.mp4 (a plain MP4, ~4 min) while the upstream HLS warms up.
+// Once 2 real segments appear in the upstream playlist, we stop the loading
+// video and serve the live stream. Simple.
 
-function countSegmentsInPlaylist(text) {
+function countUpstreamSegments(text) {
     if (!text) return 0;
     let count = 0;
     for (const line of text.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith("#")) {
-            // Non-comment, non-empty line = segment or sub-playlist URL
-            if (!trimmed.toLowerCase().endsWith(".m3u8")) count++;
-        }
+        const t = line.trim();
+        if (t && !t.startsWith("#") && !t.toLowerCase().endsWith(".m3u8")) count++;
     }
     return count;
 }
 
 function buildLoadingPlaylistBody(env) {
     const videoUrl = envString(env, "LOADING_VIDEO_URL", LOADING_VIDEO_URL);
-    // Serve a short VOD playlist pointing to the loading video.
-    // Most IPTV players will play this MP4 seamlessly via HLS.
-    // We set a 6-second target duration matching a typical intro length.
-    // EXT-X-PLAYLIST-TYPE:EVENT tells the player to keep polling for updates.
+    // Single MP4 file, full duration (~240s). No #EXT-X-ENDLIST so the player
+    // keeps polling the M3U8 URL — next poll will get the real live stream
+    // once the upstream is ready.
     return [
         "#EXTM3U",
         "#EXT-X-VERSION:3",
-        "#EXT-X-TARGETDURATION:12",
+        "#EXT-X-TARGETDURATION:240",
         "#EXT-X-MEDIA-SEQUENCE:0",
-        "#EXTINF:10.0,",
-        videoUrl,
-        "#EXTINF:10.0,",
+        "#EXTINF:240.0,",
         videoUrl,
         "",
     ].join("\n");
@@ -3354,24 +3348,9 @@ function cleanupWarmupState() {
     for (const [k, state] of streamWarmupState) {
         if (now - state.startedAt > WARMUP_EXPIRY_MS) streamWarmupState.delete(k);
     }
-    // Hard cap
     if (streamWarmupState.size > MAX_WARMUP_ENTRIES) {
         const keys = [...streamWarmupState.keys()];
         for (let i = 0; i < keys.length - MAX_WARMUP_ENTRIES; i++) streamWarmupState.delete(keys[i]);
-    }
-}
-
-async function warmUpStream(key, sourceUrl, env, waitUntil, cacheKey) {
-    // Try to fetch the upstream HLS and count segments
-    try {
-        const upstream = await findUpstreamHls(key, sourceUrl, env);
-        if (!upstream) return 0;
-        const segmentCount = countSegmentsInPlaylist(upstream.text);
-        console.log(`[warmup] key=${key} upstream has ${segmentCount} segments`);
-        return segmentCount;
-    } catch (err) {
-        console.warn(`[warmup] key=${key} upstream probe failed: ${err?.message}`);
-        return 0;
     }
 }
 
@@ -3383,68 +3362,64 @@ async function proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, cach
     const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 0));
     const cached = livePlaylistCache.get(cacheKey);
 
-    // ── Warmup logic: show loading video until upstream has enough segments ──
+    // ── Warmup: play the loading MP4 while upstream HLS stabilises ───────────
     if (warmupEnabled && requiredSegments > 0) {
         let warmup = streamWarmupState.get(cacheKey);
 
         if (!warmup) {
-            // First request for this stream — start warmup
+            // First hit — start warmup, kick off upstream probe in background
             cleanupWarmupState();
-            warmup = { startedAt: now, ready: false, segmentsSeen: 0, probing: false };
+            warmup = { startedAt: now, ready: false, segmentsSeen: 0 };
             streamWarmupState.set(cacheKey, warmup);
-            console.log(`[warmup] key=${key} starting warmup, serving loading video...`);
+            console.log(`[warmup] key=${key} → serving loading video while upstream buffers`);
 
-            // Kick off background probe
-            warmup.probing = true;
+            // Probe upstream in background so it's ready on next poll
             waitUntil((async () => {
-                const segs = await warmUpStream(key, sourceUrl, env, waitUntil, cacheKey);
-                const w = streamWarmupState.get(cacheKey);
-                if (w) {
-                    w.segmentsSeen = Math.max(w.segmentsSeen, segs);
-                    w.probing = false;
-                    if (w.segmentsSeen >= requiredSegments) {
-                        w.ready = true;
-                        console.log(`[warmup] key=${key} READY — ${w.segmentsSeen} segments available, switching to live`);
+                try {
+                    const upstream = await findUpstreamHls(key, sourceUrl, env);
+                    const w = streamWarmupState.get(cacheKey);
+                    if (w && upstream) {
+                        w.segmentsSeen = countUpstreamSegments(upstream.text);
+                        if (w.segmentsSeen >= requiredSegments) {
+                            w.ready = true;
+                            console.log(`[warmup] key=${key} READY (${w.segmentsSeen} segments)`);
+                        }
                     }
-                }
+                } catch (e) { console.warn(`[warmup] key=${key} probe failed: ${e?.message}`); }
             })());
 
-            // Serve loading video for first request
             return playlistResponse(buildLoadingPlaylistBody(env));
         }
 
-        // Warmup in progress but not yet ready
         if (!warmup.ready) {
-            // Check if warmup has been running too long (safety timeout)
-            const warmupTimeoutMs = envInt(env, "WARMUP_TIMEOUT_MS", 15000);
-            if (now - warmup.startedAt > warmupTimeoutMs) {
-                console.warn(`[warmup] key=${key} timed out after ${warmupTimeoutMs}ms, forcing live`);
+            // Safety timeout — don't show loading forever
+            const timeoutMs = envInt(env, "WARMUP_TIMEOUT_MS", 15000);
+            if (now - warmup.startedAt > timeoutMs) {
+                console.warn(`[warmup] key=${key} timed out after ${timeoutMs}ms, forcing live`);
                 warmup.ready = true;
             } else {
-                // Re-probe if not already probing
-                if (!warmup.probing) {
-                    warmup.probing = true;
-                    waitUntil((async () => {
-                        const segs = await warmUpStream(key, sourceUrl, env, waitUntil, cacheKey);
-                        const w = streamWarmupState.get(cacheKey);
-                        if (w) {
-                            w.segmentsSeen = Math.max(w.segmentsSeen, segs);
-                            w.probing = false;
-                            if (w.segmentsSeen >= requiredSegments) {
-                                w.ready = true;
-                                console.log(`[warmup] key=${key} READY — ${w.segmentsSeen} segments available, switching to live`);
-                            }
+                // Re-probe upstream on each poll
+                try {
+                    const upstream = await findUpstreamHls(key, sourceUrl, env);
+                    if (upstream) {
+                        warmup.segmentsSeen = Math.max(warmup.segmentsSeen, countUpstreamSegments(upstream.text));
+                        if (warmup.segmentsSeen >= requiredSegments) {
+                            warmup.ready = true;
+                            console.log(`[warmup] key=${key} READY (${warmup.segmentsSeen} segments)`);
                         }
-                    })());
+                    }
+                } catch (_) { /* will retry next poll */ }
+
+                if (!warmup.ready) {
+                    console.log(`[warmup] key=${key} still buffering (${warmup.segmentsSeen}/${requiredSegments} segments)`);
+                    return playlistResponse(buildLoadingPlaylistBody(env));
                 }
-                console.log(`[warmup] key=${key} still warming up (${warmup.segmentsSeen}/${requiredSegments} segments), serving loading video...`);
-                return playlistResponse(buildLoadingPlaylistBody(env));
             }
         }
-        // If we get here, warmup is ready — fall through to normal logic
+        // Warmup done — fall through to real stream
     }
 
-    // ── Normal live playlist proxy (post-warmup or warmup disabled) ──────────
+    // ── Normal live playlist ─────────────────────────────────────────────────
     if (cached && now - cached.at < freshMs) return playlistResponse(cached.body);
     try {
         const body = await buildLivePlaylistBody(key, sourceUrl, request, env, waitUntil, cacheKey);
