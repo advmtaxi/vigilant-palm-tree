@@ -3378,7 +3378,7 @@ function cleanupWarmupState() {
 }
 
 async function proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, cacheKey) {
-    const warmupEnabled = envBool(env, "LOADING_VIDEO_ENABLED", true);
+    const warmupEnabled = envBool(env, "LOADING_VIDEO_ENABLED", false);
     const requiredSegments = envInt(env, "WARMUP_REQUIRED_SEGMENTS", WARMUP_REQUIRED_SEGMENTS);
     const now = Date.now();
     const freshMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", 2000));
