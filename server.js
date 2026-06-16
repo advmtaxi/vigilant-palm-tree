@@ -76,7 +76,7 @@ let playlistChannelLoadPromise = null;
 const streamWarmupState = new Map();  // cacheKey → { startedAt, ready, segmentsSeen, warmupPromise }
 const MAX_WARMUP_ENTRIES = 500;
 const WARMUP_EXPIRY_MS = 120_000;     // forget warmup state after 2 minutes
-const LOADING_VIDEO_URL = "https://store6.gofile.io/download/web/efa83213-1a30-449d-bf0f-4e33eab99078/TaxiDevLoad.mp4";
+const LOADING_VIDEO_URL = "https://pub-170b5f1508954220a1c673d1ae1baaae.r2.dev/TaxiDevLoad.mp4";
 const WARMUP_REQUIRED_SEGMENTS = 2;   // how many segments must appear before switching to live
 
 // Disk-persist cache paths (loaded on startup so first request is always instant)
