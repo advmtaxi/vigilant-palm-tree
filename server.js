@@ -21,7 +21,7 @@ const KEY_RE = /^[a-f0-9]{20}$/;
 const DEFAULT_PROVIDER_BASE_URL = "";
 // Generic user-agent — override with FETCH_USER_AGENT env var.
 const DEFAULT_FETCH_USER_AGENT = "Mozilla/5.0 (SmartTV; Linux) AppleWebKit/537.36";
-const APP_BUILD_ID = "dqvod-live-stream-url-fields-2026-06-14";
+const APP_BUILD_ID = "dqvod-ultra-low-latency-2026-06-17";
 
 // Credentials come from env vars only: PROVIDER_USERNAME, PROVIDER_PASSWORD.
 // Nothing is hardcoded here.
@@ -69,20 +69,42 @@ const keyToSlugIndex = new Map();
 const xtreamLocalNumericIndex = new Map();
 let channelLoadPromise = null;
 let playlistChannelLoadPromise = null;
+let customServersCache = [];
+
+
+// ─── Segment Cache (in-memory LRU with inflight deduplication) ──────────────
+// Multiple viewers requesting the same .ts segment = ONE upstream fetch.
+// This is the single biggest optimization for reducing lag and upstream load.
+const segmentCache = new Map();       // url → { at, headers, body (Buffer) }
+const segmentInflight = new Map();    // url → Promise<{headers, body, status}>
+const MAX_SEGMENT_CACHE_ENTRIES = 300;
+const SEGMENT_CACHE_TTL_MS = 45_000;  // 45s — covers ~6 segment intervals
+
+// ─── Circuit Breaker (skip failing upstreams temporarily) ───────────────────
+const circuitBreaker = new Map();     // url-origin → { failures, lastFailure, openUntil }
+const CIRCUIT_BREAKER_THRESHOLD = 5;  // failures before opening circuit
+const CIRCUIT_BREAKER_WINDOW_MS = 60_000;  // failure counting window
+const CIRCUIT_BREAKER_COOLDOWN_MS = 30_000; // how long to skip a broken upstream
+
+// ─── Upstream Health Tracking ───────────────────────────────────────────────
+const upstreamHealthStats = new Map(); // origin → { successes, failures, lastSuccess, lastFailure, avgLatencyMs }
+let globalRequestCount = 0;
+let globalSegmentCacheHits = 0;
+let globalSegmentCacheMisses = 0;
+const serverStartedAt = Date.now();
 
 // ─── Stream Warmup / Loading Video ──────────────────────────────────────────
-// Tracks per-stream warmup state: once 2+ upstream segments are confirmed in
-// the HLS playlist, the loading video stops and the real stream is served.
-const streamWarmupState = new Map();  // cacheKey → { startedAt, ready, segmentsSeen, warmupPromise }
+const streamWarmupState = new Map();
 const MAX_WARMUP_ENTRIES = 500;
-const WARMUP_EXPIRY_MS = 120_000;     // forget warmup state after 2 minutes
+const WARMUP_EXPIRY_MS = 120_000;
 const LOADING_VIDEO_URL = "https://pub-170b5f1508954220a1c673d1ae1baaae.r2.dev/TaxiDevLoad.mp4";
-const WARMUP_REQUIRED_SEGMENTS = 2;   // how many segments must appear before switching to live
+const WARMUP_REQUIRED_SEGMENTS = 2;
 
-// Disk-persist cache paths (loaded on startup so first request is always instant)
+// Disk-persist cache paths
 const CHANNEL_DISK_CACHE_FILE = process.env.CHANNEL_DISK_CACHE_FILE || "channel-cache.json";
 const PLAYLIST_DISK_CACHE_FILE = process.env.PLAYLIST_DISK_CACHE_FILE || "playlist-channel-cache.json";
 const CUSTOM_PLAYLISTS_FILE = process.env.CUSTOM_PLAYLISTS_FILE || "custom-playlists.json";
+const CUSTOM_SERVERS_FILE = process.env.CUSTOM_SERVERS_FILE || "custom-servers.json";
 
 const MAX_UPSTREAM_HLS_CACHE_ENTRIES = 500;
 const MAX_LIVE_PLAYLIST_CACHE_ENTRIES = 500;
@@ -414,6 +436,110 @@ function channelMatchesQuery(channel, query) {
     return tokens.every((token) => haystack.includes(token));
 }
 
+function randomPlaylistId(length = 8) {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    const bytes = new Uint8Array(length);
+    crypto.getRandomValues(bytes);
+    let output = "";
+    for (const byte of bytes) output += alphabet[byte % alphabet.length];
+    return output;
+}
+
+// ─── Circuit Breaker ─────────────────────────────────────────────────────────
+
+function circuitBreakerKey(url) {
+    try { return new URL(url).origin; } catch { return url; }
+}
+
+function isCircuitOpen(url) {
+    const key = circuitBreakerKey(url);
+    const state = circuitBreaker.get(key);
+    if (!state) return false;
+    if (Date.now() > state.openUntil) {
+        circuitBreaker.delete(key);
+        return false;
+    }
+    return true;
+}
+
+function recordCircuitFailure(url) {
+    const key = circuitBreakerKey(url);
+    const now = Date.now();
+    let state = circuitBreaker.get(key);
+    if (!state || now - state.lastFailure > CIRCUIT_BREAKER_WINDOW_MS) {
+        state = { failures: 0, lastFailure: now, openUntil: 0 };
+    }
+    state.failures++;
+    state.lastFailure = now;
+    if (state.failures >= CIRCUIT_BREAKER_THRESHOLD) {
+        state.openUntil = now + CIRCUIT_BREAKER_COOLDOWN_MS;
+        console.warn(`[circuit-breaker] OPENED for ${key} (${state.failures} failures in window). Cooldown ${CIRCUIT_BREAKER_COOLDOWN_MS}ms`);
+    }
+    circuitBreaker.set(key, state);
+}
+
+function recordCircuitSuccess(url) {
+    const key = circuitBreakerKey(url);
+    circuitBreaker.delete(key); // reset on success
+}
+
+// ─── Upstream Health Tracking ────────────────────────────────────────────────
+
+function trackUpstreamRequest(url, success, latencyMs) {
+    const origin = circuitBreakerKey(url);
+    let stats = upstreamHealthStats.get(origin);
+    if (!stats) {
+        stats = { successes: 0, failures: 0, lastSuccess: null, lastFailure: null, avgLatencyMs: 0, totalLatency: 0, totalRequests: 0 };
+        upstreamHealthStats.set(origin);
+    }
+    stats.totalRequests++;
+    stats.totalLatency += latencyMs;
+    stats.avgLatencyMs = Math.round(stats.totalLatency / stats.totalRequests);
+    if (success) {
+        stats.successes++;
+        stats.lastSuccess = Date.now();
+    } else {
+        stats.failures++;
+        stats.lastFailure = Date.now();
+    }
+    upstreamHealthStats.set(origin, stats);
+}
+
+// ─── Segment Cache Helpers ───────────────────────────────────────────────────
+
+function cleanupSegmentCache() {
+    const now = Date.now();
+    for (const [url, entry] of segmentCache) {
+        if (now - entry.at > SEGMENT_CACHE_TTL_MS) segmentCache.delete(url);
+    }
+    while (segmentCache.size > MAX_SEGMENT_CACHE_ENTRIES) {
+        segmentCache.delete(segmentCache.keys().next().value);
+    }
+}
+
+// ─── Custom Servers Storage ──────────────────────────────────────────────────
+
+function customServersFile(env) {
+    return envString(env, "CUSTOM_SERVERS_FILE", "custom-servers.json") || "custom-servers.json";
+}
+
+async function loadCustomServers(env) {
+    try {
+        const text = await fs.readFile(customServersFile(env), "utf8");
+        const data = JSON.parse(text);
+        return Array.isArray(data?.servers) ? data.servers : [];
+    } catch (error) {
+        if (error && error.code === "ENOENT") return [];
+        throw error;
+    }
+}
+
+async function saveCustomServers(env, servers) {
+    const payload = { updatedAt: new Date().toISOString(), servers };
+    await fs.writeFile(customServersFile(env), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+
 function randomCredential(length = 14) {
     const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
     const bytes = new Uint8Array(length);
@@ -599,6 +725,20 @@ function withSourceSuffix(name, label) {
 
 function buildProviderPlaylistSources(env) {
     const sources = [];
+    
+    // Add custom servers first (enabled ones)
+    if (Array.isArray(customServersCache)) {
+        customServersCache.forEach(server => {
+            if (server.enabled) {
+                const playlistUrl = new URL("/get.php", `${server.url}/`);
+                playlistUrl.searchParams.set("username", server.username);
+                playlistUrl.searchParams.set("password", server.password);
+                playlistUrl.searchParams.set("type", "m3u_plus");
+                sources.push({ url: playlistUrl.toString(), label: server.name || "CustomServer" });
+            }
+        });
+    }
+
     const username = envString(env, "PROVIDER_USERNAME") || envString(env, "IPTV_USERNAME") || HARDCODED_PROVIDER_USERNAME;
     const password = envString(env, "PROVIDER_PASSWORD") || envString(env, "IPTV_PASSWORD") || HARDCODED_PROVIDER_PASSWORD;
     if (username && password) {
@@ -612,7 +752,9 @@ function buildProviderPlaylistSources(env) {
             playlistUrl.searchParams.set("username", username);
             playlistUrl.searchParams.set("password", password);
             playlistUrl.searchParams.set("type", "m3u_plus");
-            sources.push({ url: playlistUrl.toString(), label: "APIPRIMARY" });
+            if (!sources.some(s => s.url === playlistUrl.toString())) {
+                sources.push({ url: playlistUrl.toString(), label: "APIPRIMARY" });
+            }
         }
     }
     for (const source of HARDCODED_EXTRA_PLAYLIST_SOURCES) {
@@ -942,14 +1084,7 @@ async function saveCustomCategories(env, categories) {
     await fs.writeFile(customCategoriesFile(env), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
-function randomPlaylistId(length = 8) {
-    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-    const bytes = new Uint8Array(length);
-    crypto.getRandomValues(bytes);
-    let output = "";
-    for (const byte of bytes) output += alphabet[byte % alphabet.length];
-    return output;
-}
+
 
 function basicAuthCredentials(request) {
     const header = request.headers.get("authorization") || "";
@@ -1678,964 +1813,1492 @@ async function tvSeriesPayload(request, env, force = false) {
     };
 }
 
-// Dashboard and generated M3U playlists
-
 function dashboardPage() {
     return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>IPTV Access Dashboard</title>
+  <title>IPTV Gateway - Admin Panel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <style>
     :root {
-      color-scheme: dark;
-      --bg: #0f1115;
-      --panel: #181b22;
-      --panel-2: #20242d;
-      --text: #f5f7fb;
-      --muted: #a6adbb;
-      --line: #313746;
-      --accent: #4fc3a1;
-      --danger: #ff6b6b;
-      --input: #11141a;
+      --bg: #080a0f;
+      --panel-bg: rgba(17, 22, 34, 0.7);
+      --panel-border: rgba(255, 255, 255, 0.08);
+      --panel-header: rgba(26, 33, 51, 0.85);
+      --text-primary: #f3f4f6;
+      --text-secondary: #9ca3af;
+      --text-muted: #6b7280;
+      --accent-gradient: linear-gradient(135deg, #6366f1 0%, #06b6d4 100%);
+      --accent-color: #6366f1;
+      --accent-hover: #4f46e5;
+      --success-color: #10b981;
+      --danger-color: #ef4444;
+      --warning-color: #f59e0b;
+      --input-bg: rgba(10, 12, 18, 0.8);
+      --input-border: rgba(255, 255, 255, 0.08);
+      --input-focus: #06b6d4;
+      --font-sans: 'Outfit', 'Inter', system-ui, -apple-system, sans-serif;
     }
-    * { box-sizing: border-box; }
-    body {
+    
+    * {
+      box-sizing: border-box;
       margin: 0;
-      min-height: 100vh;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      padding: 0;
+    }
+    
+    body {
       background: var(--bg);
-      color: var(--text);
+      background-image: radial-gradient(circle at 10% 20%, rgba(99, 102, 241, 0.15) 0%, transparent 40%),
+                        radial-gradient(circle at 90% 80%, rgba(6, 182, 212, 0.15) 0%, transparent 40%);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      min-height: 100vh;
+      line-height: 1.5;
     }
-    .shell {
-      width: min(1180px, calc(100% - 32px));
+    
+    .container {
+      width: min(1280px, calc(100% - 32px));
       margin: 0 auto;
-      padding: 28px 0 40px;
+      padding: 32px 0 60px;
     }
+    
+    /* Header */
     header {
       display: flex;
       justify-content: space-between;
-      gap: 18px;
-      align-items: flex-end;
-      margin-bottom: 22px;
+      align-items: center;
+      margin-bottom: 32px;
+      flex-wrap: wrap;
+      gap: 16px;
     }
-    h1 {
-      margin: 0;
-      font-size: clamp(28px, 4vw, 44px);
-      line-height: 1;
-      letter-spacing: 0;
+    
+    .logo-area h1 {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      background: var(--accent-gradient);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 4px;
     }
-    .subtle { color: var(--muted); }
-    .grid {
-      display: grid;
-      grid-template-columns: minmax(320px, 420px) 1fr;
-      gap: 18px;
-      align-items: start;
+    
+    .logo-area p {
+      color: var(--text-secondary);
+      font-size: 14px;
     }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow: hidden;
+    
+    .header-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(99, 102, 241, 0.1);
+      border: 1px solid rgba(99, 102, 241, 0.2);
+      border-radius: 9999px;
+      padding: 4px 12px;
+      font-size: 12px;
+      color: #818cf8;
+      font-weight: 600;
     }
-    .panel h2 {
-      margin: 0;
-      padding: 16px 18px;
-      font-size: 16px;
-      background: var(--panel-2);
-      border-bottom: 1px solid var(--line);
-      letter-spacing: 0;
+    
+    /* Tabs */
+    .tabs-wrapper {
+      margin-bottom: 24px;
+      border-bottom: 1px solid var(--panel-border);
+      padding-bottom: 4px;
     }
-    form, .panel-body { padding: 18px; }
-    label {
-      display: grid;
-      gap: 7px;
-      font-size: 13px;
-      color: var(--muted);
-      margin-bottom: 14px;
+    
+    .tabs {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      scrollbar-width: none;
     }
-    input, select {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--input);
-      color: var(--text);
-      padding: 11px 12px;
-      font: inherit;
-      outline: none;
+    
+    .tabs::-webkit-scrollbar {
+      display: none;
     }
-    input:focus, select:focus { border-color: var(--accent); }
-    .checks {
-      display: grid;
-      gap: 10px;
-      margin: 6px 0 18px;
-    }
-    .check {
+    
+    .tab {
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      padding: 12px 20px;
+      font-size: 15px;
+      font-weight: 500;
+      cursor: pointer;
+      border-radius: 8px 8px 0 0;
       display: flex;
       align-items: center;
-      gap: 10px;
-      color: var(--text);
-      margin: 0;
+      gap: 8px;
+      transition: all 0.2s ease;
+      position: relative;
     }
-    .check input { width: 18px; height: 18px; }
-    button, .button {
-      border: 0;
-      border-radius: 6px;
-      background: var(--accent);
-      color: #04110d;
-      padding: 11px 14px;
-      font: inherit;
-      font-weight: 700;
-      cursor: pointer;
-      text-decoration: none;
-      display: inline-flex;
-      justify-content: center;
+    
+    .tab:hover {
+      color: var(--text-primary);
+      background: rgba(255, 255, 255, 0.03);
+    }
+    
+    .tab.active {
+      color: #fff;
+      font-weight: 600;
+    }
+    
+    .tab.active::after {
+      content: '';
+      position: absolute;
+      bottom: -4px;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: var(--accent-gradient);
+      border-radius: 9999px;
+      box-shadow: 0 -2px 10px rgba(6, 182, 212, 0.5);
+    }
+    
+    /* Grid & Panels */
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 24px;
+    }
+    
+    @media (min-width: 1024px) {
+      .grid.two-cols {
+        grid-template-columns: minmax(360px, 450px) 1fr;
+      }
+    }
+    
+    .card {
+      background: var(--panel-bg);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--panel-border);
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    
+    .card-header {
+      background: var(--panel-header);
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--panel-border);
+      display: flex;
+      justify-content: space-between;
       align-items: center;
-      min-height: 42px;
     }
-    button.secondary {
-      background: #2b313d;
-      color: var(--text);
-      border: 1px solid var(--line);
+    
+    .card-header h2 {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
-    button.danger {
-      background: transparent;
-      color: var(--danger);
-      border: 1px solid color-mix(in srgb, var(--danger), transparent 55%);
+    
+    .card-body {
+      padding: 20px;
+      flex: 1;
     }
-    .actions {
+    
+    /* Forms & Inputs */
+    .form-group {
+      margin-bottom: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    
+    .form-group label {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-secondary);
+    }
+    
+    input, select, textarea {
+      width: 100%;
+      background: var(--input-bg);
+      border: 1px solid var(--input-border);
+      color: var(--text-primary);
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-family: var(--font-sans);
+      font-size: 14px;
+      outline: none;
+      transition: all 0.2s ease;
+    }
+    
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--input-focus);
+      box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.15);
+    }
+    
+    .form-row {
       display: grid;
       grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    
+    .checkbox-group {
+      display: flex;
+      flex-direction: column;
       gap: 10px;
+      margin: 8px 0 16px;
     }
-    .message {
-      min-height: 22px;
-      margin-top: 14px;
-      font-size: 13px;
-      color: var(--muted);
-      overflow-wrap: anywhere;
+    
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13.5px;
+      color: var(--text-secondary);
+      cursor: pointer;
     }
+    
+    .checkbox-label input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      cursor: pointer;
+    }
+    
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-family: var(--font-sans);
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      border: none;
+      text-decoration: none;
+    }
+    
+    .btn-primary {
+      background: var(--accent-gradient);
+      color: #fff;
+      box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
+    }
+    
+    .btn-primary:hover {
+      opacity: 0.95;
+      transform: translateY(-1px);
+      box-shadow: 0 6px 18px rgba(99, 102, 241, 0.45);
+    }
+    
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--panel-border);
+      color: var(--text-primary);
+    }
+    
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.08);
+      transform: translateY(-1px);
+    }
+    
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.2);
+      color: var(--danger-color);
+    }
+    
+    .btn-danger:hover {
+      background: rgba(239, 68, 68, 0.18);
+      transform: translateY(-1px);
+    }
+    
+    .btn-success {
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.2);
+      color: var(--success-color);
+    }
+    
+    .btn-success:hover {
+      background: rgba(16, 185, 129, 0.18);
+      transform: translateY(-1px);
+    }
+    
+    .btn-sm {
+      padding: 6px 12px;
+      font-size: 12px;
+      border-radius: 6px;
+    }
+    
+    /* Lists and Tables */
+    .table-container {
+      overflow-x: auto;
+    }
+    
     table {
       width: 100%;
       border-collapse: collapse;
-    }
-    th, td {
-      padding: 13px 14px;
-      border-bottom: 1px solid var(--line);
       text-align: left;
-      vertical-align: top;
+    }
+    
+    th, td {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--panel-border);
       font-size: 14px;
+      vertical-align: middle;
     }
+    
     th {
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: .08em;
-      background: var(--panel-2);
+      font-weight: 600;
+      color: var(--text-secondary);
+      background: rgba(0, 0, 0, 0.1);
     }
-    tr:last-child td { border-bottom: 0; }
-    code {
-      display: block;
-      max-width: 520px;
-      color: #d8fff4;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+    
+    tr:hover td {
+      background: rgba(255, 255, 255, 0.01);
     }
-    .row-actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
+    
+    /* Pills & Badges */
     .pill {
       display: inline-flex;
       align-items: center;
-      min-height: 24px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
       padding: 2px 8px;
-      color: var(--muted);
-      font-size: 12px;
-      margin: 0 5px 5px 0;
+      border-radius: 9999px;
+      font-size: 11px;
+      font-weight: 600;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text-secondary);
     }
-    .empty {
-      padding: 28px 18px;
-      color: var(--muted);
+    
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11.5px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 6px;
     }
-    /* Custom Playlists */
-    .section-divider {
-      border: 0;
-      border-top: 1px solid var(--line);
-      margin: 32px 0 24px;
+    
+    .status-badge.active {
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--success-color);
+      border: 1px solid rgba(16, 185, 129, 0.2);
     }
-    .section-title {
-      font-size: 22px;
-      margin: 0 0 18px;
+    
+    .status-badge.disabled {
+      background: rgba(239, 68, 68, 0.1);
+      color: var(--danger-color);
+      border: 1px solid rgba(239, 68, 68, 0.2);
+    }
+    
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    
+    .status-dot.green { background-color: var(--success-color); box-shadow: 0 0 8px var(--success-color); }
+    .status-dot.red { background-color: var(--danger-color); box-shadow: 0 0 8px var(--danger-color); }
+    .status-dot.orange { background-color: var(--warning-color); box-shadow: 0 0 8px var(--warning-color); }
+    
+    /* Toast notifications */
+    #toast-container {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-width: 380px;
+    }
+    
+    .toast {
+      background: rgba(17, 24, 39, 0.95);
+      border: 1px solid var(--panel-border);
+      padding: 14px 18px;
+      border-radius: 8px;
+      color: #fff;
+      font-size: 13.5px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      transform: translateY(20px);
+      opacity: 0;
+      animation: toastIn 0.3s forwards;
+      backdrop-filter: blur(10px);
+    }
+    
+    @keyframes toastIn {
+      to { transform: translateY(0); opacity: 1; }
+    }
+    
+    .toast.success { border-left: 4px solid var(--success-color); }
+    .toast.error { border-left: 4px solid var(--danger-color); }
+    .toast.info { border-left: 4px solid var(--accent-color); }
+    
+    /* Tab Contents */
+    .tab-content {
+      display: none;
+    }
+    
+    .tab-content.active {
+      display: block;
+    }
+    
+    /* Overview widgets */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    
+    .stat-card {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--panel-border);
+      padding: 20px;
+      border-radius: 10px;
+    }
+    
+    .stat-label {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+    }
+    
+    .stat-value {
+      font-size: 24px;
       font-weight: 700;
+      background: var(--accent-gradient);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
     }
+    
+    /* Draggable lists */
+    .draggable-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    
+    .draggable-item {
+      display: flex;
+      align-items: center;
+      padding: 10px 14px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      cursor: grab;
+      user-select: none;
+    }
+    
+    .draggable-item:active {
+      cursor: grabbing;
+      background: rgba(255, 255, 255, 0.05);
+    }
+    
+    .draggable-item.active {
+      border-color: var(--accent-color);
+      background: rgba(99, 102, 241, 0.05);
+    }
+    
+    .drag-handle {
+      margin-right: 12px;
+      color: var(--text-muted);
+      font-size: 16px;
+    }
+    
+    .item-content {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    
+    .item-content strong {
+      font-weight: 600;
+    }
+    
+    .item-actions {
+      display: flex;
+      gap: 6px;
+    }
+    
+    /* Channel items list */
+    .channel-picker-list {
+      max-height: 320px;
+      overflow-y: auto;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      background: rgba(0,0,0,0.1);
+    }
+    
+    .channel-row {
+      display: flex;
+      align-items: center;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--panel-border);
+      font-size: 13px;
+    }
+    
+    .channel-row:last-child {
+      border-bottom: none;
+    }
+    
+    .channel-row input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      margin-right: 12px;
+      cursor: pointer;
+    }
+    
+    .channel-info {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      overflow: hidden;
+    }
+    
+    .channel-name {
+      font-weight: 500;
+      color: var(--text-primary);
+      text-overflow: ellipsis;
+      overflow: hidden;
+      white-space: nowrap;
+    }
+    
+    .channel-category {
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+    
     .search-box {
       position: relative;
-      margin-bottom: 14px;
+      margin-bottom: 12px;
     }
+    
     .search-box input {
       padding-left: 36px;
     }
+    
     .search-icon {
       position: absolute;
       left: 12px;
       top: 50%;
       transform: translateY(-50%);
-      font-size: 14px;
-      opacity: .5;
+      color: var(--text-muted);
       pointer-events: none;
     }
-    .channel-list {
-      max-height: 400px;
+    
+    /* Autocomplete list */
+    .autocomplete-list {
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      background: #111520;
+      border: 1px solid var(--panel-border);
+      border-top: none;
+      border-radius: 0 0 8px 8px;
+      z-index: 50;
+      max-height: 250px;
       overflow-y: auto;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--input);
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
     }
-    .channel-item {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 9px 12px;
-      border-bottom: 1px solid var(--line);
-      font-size: 13px;
+    
+    .autocomplete-item {
+      padding: 8px 14px;
       cursor: pointer;
-      transition: background .15s;
-    }
-    .channel-item:hover {
-      background: var(--panel-2);
-    }
-    .channel-item:last-child { border-bottom: 0; }
-    .channel-item input[type="checkbox"] { width: 16px; height: 16px; flex-shrink: 0; }
-    .channel-item .ch-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .channel-item .ch-cat { color: var(--muted); font-size: 11px; flex-shrink: 0; }
-    .selected-count {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
       font-size: 13px;
-      color: var(--muted);
-      margin: 10px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.03);
     }
-    .playlist-card {
-      padding: 16px 18px;
-      border-bottom: 1px solid var(--line);
+    
+    .autocomplete-item:hover {
+      background: rgba(255,255,255,0.05);
     }
-    .playlist-card:last-child { border-bottom: 0; }
-    .playlist-card h3 {
-      margin: 0 0 6px;
-      font-size: 15px;
-      font-weight: 600;
+    
+    .autocomplete-item span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
-    .playlist-card .meta {
-      font-size: 12px;
-      color: var(--muted);
-      margin-bottom: 10px;
+    
+    /* Health lists */
+    .health-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
     }
-    .playlist-card code {
-      font-size: 12px;
+    
+    .health-item {
+      background: rgba(255,255,255,0.02);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      padding: 12px 16px;
+      font-size: 13px;
+    }
+    
+    .health-row {
+      display: flex;
+      justify-content: space-between;
       margin-bottom: 4px;
     }
-    .playlist-actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      margin-top: 8px;
-    }
-    .playlist-actions button {
-      min-height: 32px;
-      padding: 6px 12px;
-      font-size: 12px;
-    }
-    .import-area {
-      margin-top: 14px;
-    }
-    .import-area textarea {
-      width: 100%;
-      min-height: 80px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--input);
-      color: var(--text);
-      padding: 10px;
-      font: inherit;
-      font-size: 12px;
-      resize: vertical;
-      outline: none;
-    }
-    .import-area textarea:focus { border-color: var(--accent); }
     
-    /* IPTV Categories */
-    .draggable { cursor: grab; }
-    .draggable:active { cursor: grabbing; }
-    .drag-over { border: 2px dashed var(--accent); }
-    .cat-list, .cat-ch-list { max-height: 350px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--input); margin-bottom: 14px; }
-    .cat-item, .cat-ch-item { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid var(--line); font-size: 13px; background: var(--input); }
-    .cat-item:last-child, .cat-ch-item:last-child { border-bottom: 0; }
-    .cat-item.active { background: var(--panel-2); border-left: 3px solid var(--accent); }
-    .cat-item { cursor: pointer; }
-    .cat-actions { margin-left: auto; display: flex; gap: 8px; }
-    .drag-handle { color: var(--muted); cursor: grab; padding: 0 5px; user-select: none; }
-
-    @media (max-width: 860px) {
-      header, .grid { display: block; }
-      header > * + *, .grid > * + * { margin-top: 18px; }
-      table, thead, tbody, tr, th, td { display: block; }
-      thead { display: none; }
-      td { border-bottom: 0; padding: 8px 14px; }
-      tr { border-bottom: 1px solid var(--line); padding: 8px 0; }
-      code { max-width: 100%; }
+    .health-label {
+      color: var(--text-secondary);
+    }
+    
+    .health-val {
+      font-weight: 500;
+    }
+    
+    /* Copy field wrapper */
+    .copy-field {
+      display: flex;
+      background: var(--input-bg);
+      border: 1px solid var(--input-border);
+      border-radius: 6px;
+      overflow: hidden;
+      font-size: 12.5px;
+      margin-bottom: 8px;
+    }
+    
+    .copy-text {
+      padding: 8px 12px;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #92e6d5;
+      font-family: monospace;
+    }
+    
+    .copy-btn {
+      background: rgba(255,255,255,0.05);
+      border: none;
+      border-left: 1px solid var(--panel-border);
+      color: var(--text-primary);
+      padding: 0 12px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 11px;
+    }
+    
+    .copy-btn:hover {
+      background: rgba(255,255,255,0.1);
     }
   </style>
 </head>
 <body>
-  <main class="shell">
+  <div class="container">
     <header>
-      <div>
-        <h1>IPTV Access</h1>
-        <div class="subtle">Create expiring M3U Plus links for TV apps. Base links stay live-only for faster loading.</div>
+      <div class="logo-area">
+        <h1>IPTV Gateway</h1>
+        <p>Zero-Lag Stream Proxy & XTREAM Endpoint Manager</p>
       </div>
-      <a class="button" href="/api/channels">Channels JSON</a>
+      <div class="header-badge">
+        <span class="status-dot green"></span> Connected to Hugging Face Edge
+      </div>
     </header>
-
-    <section class="grid">
-      <div class="panel">
-        <h2>Create access</h2>
-        <form id="create-form">
-          <label>Username
-            <input name="username" autocomplete="off" required>
-          </label>
-          <label>Password
-            <input name="password" autocomplete="off" required>
-          </label>
-          <label>Expiry
-            <select name="duration">
-              <option value="1m">1 month</option>
-              <option value="3m">3 months</option>
-              <option value="12m">12 months</option>
-              <option value="infinite">Infinite</option>
-            </select>
-          </label>
-          <div class="checks">
-            <label class="check"><input type="checkbox" name="include_live" checked> Live channels</label>
-            <label class="check"><input type="checkbox" name="include_movies"> Movies direct URLs (optional, slower)</label>
-            <label class="check"><input type="checkbox" name="include_series"> TV series direct episode URLs (optional, slower)</label>
-          </div>
-          <div class="actions">
-            <button type="submit">Create link</button>
-            <button class="secondary" type="button" id="random-password">Password</button>
-          </div>
-          <div class="message" id="message"></div>
-        </form>
+    
+    <div class="tabs-wrapper">
+      <div class="tabs">
+        <button class="tab active" onclick="switchTab('overview')">📊 Overview & Health</button>
+        <button class="tab" onclick="switchTab('providers')">🔌 Providers</button>
+        <button class="tab" onclick="switchTab('categories')">📁 Categories</button>
+        <button class="tab" onclick="switchTab('channels')">📺 Channels Browser</button>
+        <button class="tab" onclick="switchTab('users')">👥 Access Users</button>
+        <button class="tab" onclick="switchTab('playlists')">📄 Custom Playlists</button>
       </div>
-
-      <div class="panel">
-        <h2>Active links</h2>
-        <div id="users"></div>
-      </div>
-    </section>
-
-    <hr class="section-divider">
-    <h2 class="section-title">Custom Playlists</h2>
-    <section class="grid">
-      <div class="panel">
-        <h2>Create playlist</h2>
-        <div class="panel-body">
-          <label>Playlist name
-            <input id="pl-name" autocomplete="off" placeholder="e.g. My Sports Channels">
-          </label>
-          <div class="search-box">
-            <span class="search-icon">&#128269;</span>
-            <input id="ch-search" placeholder="Search channels..." autocomplete="off">
-          </div>
-          <div class="selected-count" id="sel-count">0 channels selected</div>
-          <div class="channel-list" id="ch-list"></div>
-          <div style="margin-top:14px;display:flex;gap:10px">
-            <button type="button" id="create-pl-btn">Create playlist</button>
-            <button class="secondary" type="button" id="clear-sel-btn">Clear</button>
-          </div>
-          <div class="message" id="pl-message"></div>
+    </div>
+    
+    <!-- Toast notifications container -->
+    <div id="toast-container"></div>
+    
+    <!-- Tab 1: Overview & Health -->
+    <div id="tab-overview" class="tab-content active">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">System Uptime</div>
+          <div class="stat-value" id="stat-uptime">0s</div>
         </div>
-      </div>
-      <div class="panel">
-        <h2>Your playlists</h2>
-        <div id="pl-list"></div>
-        <div class="panel-body" style="border-top:1px solid var(--line)">
-          <div style="display:flex;gap:10px;flex-wrap:wrap">
-            <button class="secondary" type="button" id="export-pl-btn">Export all</button>
-            <button class="secondary" type="button" id="show-import-btn">Import</button>
-          </div>
-          <div class="import-area" id="import-area" style="display:none">
-            <textarea id="import-json" placeholder="Paste exported JSON here..."></textarea>
-            <button type="button" id="do-import-btn" style="margin-top:8px">Import playlists</button>
-          </div>
-          <div class="message" id="pl-import-message"></div>
+        <div class="stat-card">
+          <div class="stat-label">Total Requests</div>
+          <div class="stat-value" id="stat-requests">0</div>
         </div>
-      </div>
-    </section>
-
-    <hr class="section-divider">
-    <h2 class="section-title">IPTV Categories Manager</h2>
-    <p class="subtle" style="margin-bottom:18px">Create custom categories and arrange them to completely override the default IPTV provider layout.</p>
-    <section class="grid">
-      <div class="panel">
-        <h2>Categories (Drag to reorder)</h2>
-        <div class="panel-body">
-          <div style="display:flex;gap:10px;margin-bottom:14px">
-            <input id="new-cat-name" placeholder="New Category Name" autocomplete="off" style="flex:1">
-            <button type="button" id="add-cat-btn">Add</button>
-          </div>
-          <div class="cat-list" id="cat-list"></div>
-          <button class="secondary" type="button" id="auto-cat-btn" style="width:100%;margin-bottom:8px">Auto-Import from Channels</button>
-          <div style="display:flex;gap:10px;margin-bottom:8px">
-            <button class="secondary" type="button" id="export-cat-btn" style="flex:1">Export</button>
-            <button class="secondary" type="button" id="show-import-cat-btn" style="flex:1">Import</button>
-          </div>
-          <div class="import-area" id="import-cat-area" style="display:none;margin-bottom:8px">
-            <textarea id="import-cat-json" placeholder="Paste exported JSON here..."></textarea>
-            <button type="button" id="do-import-cat-btn" style="margin-top:8px;width:100%">Import Categories JSON</button>
-          </div>
-          <button type="button" id="save-categories-btn" style="width:100%">Save Categories & Order</button>
-          <div class="message" id="cat-message"></div>
+        <div class="stat-card">
+          <div class="stat-label">Segment Cache Hit Rate</div>
+          <div class="stat-value" id="stat-hitrate">0%</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Heap Memory Usage</div>
+          <div class="stat-value" id="stat-memory">0 MB</div>
         </div>
       </div>
       
-      <div class="panel">
-        <h2>Category Channels <span id="active-cat-name" style="font-weight:normal;color:var(--muted)"></span></h2>
-        <div class="panel-body" id="cat-channels-panel" style="display:none">
-          <div class="search-box">
-            <span class="search-icon">&#128269;</span>
-            <input id="cat-ch-search" placeholder="Search to add channels..." autocomplete="off">
+      <div class="grid two-cols">
+        <div class="card">
+          <div class="card-header">
+            <h2>🚨 Circuit Breakers</h2>
           </div>
-          <div class="channel-list" id="cat-ch-search-list" style="display:none; position:absolute; z-index:10; max-height:250px; overflow-y:auto; background:var(--panel-2); width:calc(100% - 36px); box-shadow:0 4px 12px rgba(0,0,0,0.5)"></div>
-          
-          <div style="margin-top:14px; margin-bottom:8px; font-size:13px; color:var(--muted)">Assigned Channels (Drag to reorder): <span id="cat-ch-count">0</span></div>
-          <div class="cat-ch-list" id="active-cat-ch-list"></div>
+          <div class="card-body">
+            <div id="health-circuits" class="health-list">
+              <div class="empty" style="color:var(--text-muted)">All upstream channels operating normally.</div>
+            </div>
+          </div>
         </div>
-        <div class="panel-body" id="cat-channels-empty">
-          <div class="empty">Select a category to manage its channels.</div>
+        
+        <div class="card">
+          <div class="card-header">
+            <h2>📈 Upstream Health Stats</h2>
+          </div>
+          <div class="card-body">
+            <div id="health-upstreams" class="health-list">
+              <div class="empty" style="color:var(--text-muted)">Loading stats...</div>
+            </div>
+          </div>
         </div>
       </div>
-    </section>
-
-  </main>
+    </div>
+    
+    <!-- Tab 2: Providers -->
+    <div id="tab-providers" class="tab-content">
+      <div class="grid two-cols">
+        <div class="card">
+          <div class="card-header">
+            <h2 id="provider-form-title">🔌 Add IPTV Provider</h2>
+          </div>
+          <div class="card-body">
+            <form id="provider-form" onsubmit="saveProvider(event)">
+              <input type="hidden" id="prov-id">
+              <div class="form-group">
+                <label>Provider Name</label>
+                <input id="prov-name" placeholder="e.g. My Premium IPTV" required autocomplete="off">
+              </div>
+              <div class="form-group">
+                <label>Server Base URL (Xtream Codes Host)</label>
+                <input id="prov-url" placeholder="http://iptv-provider.link:8080" required autocomplete="off">
+              </div>
+              <div class="form-group">
+                <label>Username</label>
+                <input id="prov-user" placeholder="Your Xtream Username" required autocomplete="off">
+              </div>
+              <div class="form-group">
+                <label>Password</label>
+                <input id="prov-pass" type="password" placeholder="Your Xtream Password" required autocomplete="off">
+              </div>
+              <div style="display:flex; gap:10px; margin-top:20px;">
+                <button type="submit" class="btn btn-primary" style="flex:1;">Save Server</button>
+                <button type="button" onclick="testProviderConnection()" class="btn btn-secondary">⚡ Test</button>
+                <button type="button" onclick="resetProviderForm()" class="btn btn-secondary" id="prov-cancel" style="display:none;">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
+        
+        <div class="card">
+          <div class="card-header">
+            <h2>🔌 Configured IPTV Providers</h2>
+          </div>
+          <div class="card-body">
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Server</th>
+                    <th>Url</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="providers-list">
+                  <!-- Dynamic server list -->
+                </tbody>
+              </table>
+            </div>
+            <div id="env-sources-wrapper" style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--panel-border)">
+              <h3 style="font-size: 13px; color: var(--text-secondary); margin-bottom: 8px">Environment Variables (Fallback)</h3>
+              <div id="env-sources-list" style="display:flex; flex-direction:column; gap:6px"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Tab 3: Categories -->
+    <div id="tab-categories" class="tab-content">
+      <div class="grid two-cols">
+        <div class="card">
+          <div class="card-header">
+            <h2>📁 Categories (Drag to Reorder)</h2>
+          </div>
+          <div class="card-body">
+            <div style="display:flex; gap:10px; margin-bottom:16px;">
+              <input id="new-cat-name" placeholder="New Category Name" autocomplete="off" style="flex:1">
+              <button type="button" class="btn btn-primary" onclick="addCategory()">Add</button>
+            </div>
+            <div class="draggable-list" id="categories-list">
+              <!-- Draggable categories list -->
+            </div>
+            <div style="margin-top:16px; display:flex; flex-direction:column; gap:8px;">
+              <button class="btn btn-secondary" onclick="autoImportCategories()">⚡ Auto-Import From Upstream Channels</button>
+              <div style="display:flex; gap:10px;">
+                <button class="btn btn-secondary" style="flex:1" onclick="exportCategories()">Export JSON</button>
+                <button class="btn btn-secondary" style="flex:1" onclick="toggleImportArea('cat')">Import JSON</button>
+              </div>
+              <div class="import-area" id="import-cat-area" style="display:none; margin-top:8px">
+                <textarea id="import-cat-json" placeholder="Paste exported categories JSON here..." style="min-height:90px"></textarea>
+                <button type="button" class="btn btn-primary btn-sm" style="width:100%; margin-top:8px" onclick="doImportCategories()">Apply Import</button>
+              </div>
+              <button class="btn btn-success" style="margin-top:8px" onclick="saveCategories()">💾 Save Categories & Order</button>
+            </div>
+          </div>
+        </div>
+        
+        <div class="card">
+          <div class="card-header">
+            <h2>📁 Category Channels <span id="active-cat-title" style="font-weight:normal; color:var(--text-secondary)"></span></h2>
+          </div>
+          <div class="card-body">
+            <div id="cat-channels-empty" class="empty">
+              Select a category on the left to view and manage assigned channels.
+            </div>
+            <div id="cat-channels-panel" style="display:none">
+              <div class="search-box" style="position:relative">
+                <span class="search-icon">&#128269;</span>
+                <input id="cat-ch-search" placeholder="Type channel name to search & add..." autocomplete="off">
+                <div class="autocomplete-list" id="cat-ch-autocomplete" style="display:none"></div>
+              </div>
+              
+              <div style="display:flex; justify-content:space-between; align-items:center; margin:14px 0 8px; font-size:13px; color:var(--text-secondary)">
+                <span>Assigned Channels (Drag to sort): <strong id="cat-ch-count">0</strong></span>
+                <button class="btn btn-danger btn-sm" onclick="clearActiveCategoryChannels()">Clear All</button>
+              </div>
+              
+              <div class="draggable-list" id="active-cat-ch-list" style="max-height: 420px;">
+                <!-- Drag to reorder category channels -->
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Tab 4: Channel Browser -->
+    <div id="tab-channels" class="tab-content">
+      <div class="grid two-cols">
+        <div class="card">
+          <div class="card-header">
+            <h2>📺 Live Channels List</h2>
+          </div>
+          <div class="card-body" style="display:flex; flex-direction:column; gap:12px;">
+            <div style="display:flex; gap:10px;">
+              <div class="search-box" style="flex:2; margin-bottom:0">
+                <span class="search-icon">&#128269;</span>
+                <input id="global-ch-search" oninput="renderChannelsBrowser()" placeholder="Search channels..." autocomplete="off">
+              </div>
+              <select id="global-ch-filter" onchange="renderChannelsBrowser()" style="flex:1;">
+                <option value="">All Categories</option>
+              </select>
+            </div>
+            <div style="font-size:12px; color:var(--text-secondary); display:flex; justify-content:space-between; align-items:center;">
+              <span id="browser-ch-count">0 channels</span>
+              <div>
+                <button class="btn btn-secondary btn-sm" style="padding: 2px 6px" onclick="toggleAllBrowserCheckboxes(true)">Select All</button>
+                <button class="btn btn-secondary btn-sm" style="padding: 2px 6px" onclick="toggleAllBrowserCheckboxes(false)">Clear Selection</button>
+              </div>
+            </div>
+            <div class="channel-picker-list" id="browser-channels-list" style="max-height: 480px;">
+              <!-- Channels Browser rows -->
+            </div>
+            <div id="browser-bulk-ops" style="border-top:1px solid var(--panel-border); padding-top:12px; display:flex; gap:10px; align-items:center;">
+              <span style="font-size:13px; color:var(--text-secondary);"><strong id="browser-selected-count">0</strong> selected</span>
+              <select id="bulk-cat-select" style="flex:1; padding:6px 10px;">
+                <option value="">Move to Custom Category...</option>
+              </select>
+              <button class="btn btn-primary btn-sm" onclick="bulkAssignChannels()">Apply</button>
+            </div>
+          </div>
+        </div>
+        
+        <div class="card">
+          <div class="card-header">
+            <h2>📺 Live Stream Preview Player</h2>
+          </div>
+          <div class="card-body" style="display:flex; flex-direction:column; align-items:center; justify-content:center; min-height: 300px;">
+            <div class="channel-preview-container" style="width:100%; text-align:center;">
+              <video id="video-player" controls autoplay style="width:100%; border-radius:10px; border:1px solid var(--panel-border); background:#000; aspect-ratio: 16/9; display:none;"></video>
+              <div id="player-status" style="color:var(--text-secondary); text-align:center; padding: 40px; font-size:14px; border:1px dashed var(--panel-border); border-radius:10px; width:100%;">
+                Select a channel and click preview to load stream. Ensure CORS restrictions allow player load, or play on TV.
+              </div>
+              <h3 id="preview-ch-name" style="margin-top:12px; font-size:16px; font-weight:600; text-align:left; display:none">Channel</h3>
+              <p id="preview-ch-url" style="color:var(--text-secondary); font-size:12px; text-align:left; display:none; word-break:break-all; font-family:monospace; margin-top:4px"></p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Tab 5: Access Users -->
+    <div id="tab-users" class="tab-content">
+      <div class="grid two-cols">
+        <div class="card">
+          <div class="card-header">
+            <h2>👥 Create Access User</h2>
+          </div>
+          <div class="card-body">
+            <form id="create-user-form" onsubmit="createUser(event)">
+              <div class="form-group">
+                <label>Username</label>
+                <input name="username" autocomplete="off" required>
+              </div>
+              <div class="form-group">
+                <label>Password</label>
+                <div style="display:flex; gap:10px;">
+                  <input name="password" autocomplete="off" required style="flex:1">
+                  <button class="btn btn-secondary" type="button" onclick="generateRandomPass()">Generate</button>
+                </div>
+              </div>
+              <div class="form-group">
+                <label>Expiry Period</label>
+                <select name="duration">
+                  <option value="1m">1 Month</option>
+                  <option value="3m">3 Months</option>
+                  <option value="12m">12 Months</option>
+                  <option value="infinite" selected>Infinite</option>
+                </select>
+              </div>
+              <div class="checkbox-group">
+                <label class="checkbox-label"><input type="checkbox" name="include_live" checked> Expose Live Channels</label>
+                <label class="checkbox-label"><input type="checkbox" name="include_movies"> Expose VOD Movies (Direct URLs)</label>
+                <label class="checkbox-label"><input type="checkbox" name="include_series"> Expose TV Series (Direct URLs)</label>
+              </div>
+              <button type="submit" class="btn btn-primary" style="width:100%; margin-top:8px">Create User & M3U Link</button>
+            </form>
+          </div>
+        </div>
+        
+        <div class="card">
+          <div class="card-header">
+            <h2>👥 Active Access Users</h2>
+          </div>
+          <div class="card-body">
+            <div id="users-list-wrapper" class="table-container">
+              <!-- Users list -->
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Tab 6: Custom Playlists -->
+    <div id="tab-playlists" class="tab-content">
+      <div class="grid two-cols">
+        <div class="card">
+          <div class="card-header">
+            <h2>📄 Create Custom Playlist</h2>
+          </div>
+          <div class="card-body">
+            <div class="form-group">
+              <label>Playlist Name</label>
+              <input id="pl-name" placeholder="e.g. My Favorite Sports" autocomplete="off">
+            </div>
+            <div class="search-box">
+              <span class="search-icon">&#128269;</span>
+              <input id="pl-ch-search" oninput="renderPlaylistChannelPicker()" placeholder="Search channels..." autocomplete="off">
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:12.5px; color:var(--text-secondary); margin-bottom:8px">
+              <span id="pl-selected-count">0 channels selected</span>
+              <div>
+                <button class="btn btn-secondary btn-sm" style="padding:2px 6px" onclick="toggleAllPlCheckboxes(true)">Select All</button>
+                <button class="btn btn-secondary btn-sm" style="padding:2px 6px" onclick="toggleAllPlCheckboxes(false)">Clear</button>
+              </div>
+            </div>
+            <div class="channel-picker-list" id="pl-channels-list" style="max-height: 280px">
+              <!-- Playlist Channels picker -->
+            </div>
+            <button class="btn btn-primary" style="width:100%; margin-top:16px" onclick="createPlaylist()">Create Playlist</button>
+          </div>
+        </div>
+        
+        <div class="card">
+          <div class="card-header">
+            <h2>📄 Your Custom Playlists</h2>
+          </div>
+          <div class="card-body">
+            <div id="playlists-list" style="display:flex; flex-direction:column; gap:16px;">
+              <!-- Playlists card list -->
+            </div>
+            
+            <div style="margin-top: 24px; padding-top: 16px; border-top:1px solid var(--panel-border); display:flex; flex-direction:column; gap:8px;">
+              <div style="display:flex; gap:10px;">
+                <button class="btn btn-secondary" style="flex:1" onclick="exportPlaylists()">Export Playlists</button>
+                <button class="btn btn-secondary" style="flex:1" onclick="toggleImportArea('pl')">Import Playlists</button>
+              </div>
+              <div class="import-area" id="import-pl-area" style="display:none; margin-top:8px">
+                <textarea id="import-pl-json" placeholder="Paste exported playlists JSON here..." style="min-height:90px"></textarea>
+                <button type="button" class="btn btn-primary btn-sm" style="width:100%; margin-top:8px" onclick="doImportPlaylists()">Apply Import</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <script>
-    const form = document.querySelector("#create-form");
-    const message = document.querySelector("#message");
-    const usersEl = document.querySelector("#users");
-    const passwordInput = form.elements.password;
+    // Global State
+    let allChannels = [];
+    let customCategories = [];
+    let customServers = [];
+    let activeCategoryId = null;
+    let selectedBrowserKeys = new Set();
+    let selectedPlaylistKeys = new Set();
+    let userFormPassword = document.querySelector("#create-user-form input[name='password']");
+    let hlsPlayerInstance = null;
 
-    function setMessage(text, isError = false) {
-      message.textContent = text;
-      message.style.color = isError ? "var(--danger)" : "var(--muted)";
+    // Toast Notification helper
+    function showToast(text, type = "success") {
+      const container = document.getElementById("toast-container");
+      const toast = document.createElement("div");
+      toast.className = \`toast \${type}\`;
+      toast.textContent = text;
+      container.appendChild(toast);
+      
+      setTimeout(() => {
+        toast.style.animation = "none";
+        toast.style.opacity = "1";
+        setTimeout(() => {
+          toast.remove();
+        }, 300);
+      }, 3000);
     }
 
-    function randomPassword(length = 14) {
+    // Switch Tabs
+    function switchTab(tabId) {
+      document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+      document.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
+      
+      // Find matching button
+      const btn = Array.from(document.querySelectorAll(".tab")).find(t => t.getAttribute("onclick").includes(tabId));
+      if (btn) btn.classList.add("active");
+      
+      const content = document.getElementById("tab-" + tabId);
+      if (content) content.classList.add("active");
+      
+      if (tabId === "overview") fetchHealthStats();
+    }
+
+    // Generate random credential string
+    function randomString(length = 14) {
       const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
       const bytes = new Uint8Array(length);
       crypto.getRandomValues(bytes);
-      return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("");
+      return Array.from(bytes, byte => alphabet[byte % alphabet.length]).join("");
     }
 
-    function expiryText(value) {
-      if (!value) return "Infinite";
-      const date = new Date(value);
-      return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString();
+    function generateRandomPass() {
+      userFormPassword.value = randomString();
+      userFormPassword.focus();
     }
 
-    function contentPills(user) {
-      const values = [];
-      if (user.include_live) values.push("Live");
-      if (user.include_movies) values.push("Movies");
-      if (user.include_series) values.push("Series");
-      return values.map((value) => "<span class=\\"pill\\">" + value + "</span>").join("");
-    }
-
-    async function copyText(text) {
-      await navigator.clipboard.writeText(text);
-      setMessage("Copied M3U link.");
-    }
-
-    async function deleteUser(username) {
-      const response = await fetch("/api/access-users/delete", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ username })
-      });
-      if (!response.ok) throw new Error("Delete failed");
-      await loadUsers();
-      setMessage("Deleted " + username + ".");
-    }
-
-    function renderUsers(users) {
-      if (!users.length) {
-        usersEl.innerHTML = '<div class="empty">No generated links yet.</div>';
-        return;
-      }
-      usersEl.innerHTML = '<table><thead><tr><th>User</th><th>Expiry</th><th>Content</th><th>M3U Link</th><th></th></tr></thead><tbody></tbody></table>';
-      const tbody = usersEl.querySelector("tbody");
-      for (const user of users) {
-        const tr = document.createElement("tr");
-        const status = user.expired ? "Expired" : (user.disabled ? "Disabled" : "Active");
-        tr.innerHTML =
-          "<td><strong></strong><div class=\\"subtle\\"></div></td>" +
-          "<td></td>" +
-          "<td></td>" +
-          "<td><code></code></td>" +
-          "<td><div class=\\"row-actions\\"><button class=\\"secondary\\" type=\\"button\\">Copy</button><button class=\\"danger\\" type=\\"button\\">Delete</button></div></td>";
-        tr.querySelector("strong").textContent = user.username;
-        tr.querySelector(".subtle").textContent = status;
-        tr.children[1].textContent = expiryText(user.expires_at);
-        tr.children[2].innerHTML = contentPills(user);
-        tr.querySelector("code").textContent = user.m3u_url;
-        const buttons = tr.querySelectorAll("button");
-        buttons[0].addEventListener("click", () => copyText(user.m3u_url).catch((error) => setMessage(error.message, true)));
-        buttons[1].addEventListener("click", () => deleteUser(user.username).catch((error) => setMessage(error.message, true)));
-        tbody.appendChild(tr);
+    // ─── Phase 2: Providers ───
+    async function loadProviders() {
+      try {
+        const res = await fetch("/api/servers");
+        if (!res.ok) throw new Error("Could not load providers");
+        const data = await res.json();
+        customServers = data.custom_servers || [];
+        renderProvidersList(customServers, data.env_sources || []);
+      } catch (err) {
+        showToast("Error loading providers: " + err.message, "error");
       }
     }
 
-    async function loadUsers() {
-      const response = await fetch("/api/access-users");
-      if (!response.ok) throw new Error("Could not load access users");
-      const payload = await response.json();
-      renderUsers(payload.users || []);
+    function renderProvidersList(servers, envSources) {
+      const listEl = document.getElementById("providers-list");
+      listEl.innerHTML = "";
+      if (servers.length === 0) {
+        listEl.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-secondary)">No custom servers added. Add one on the left.</td></tr>';
+      } else {
+        servers.forEach(s => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = \`
+            <td><strong>\${s.name}</strong>\${s.enabled ? "" : " <small style='color:var(--danger-color)'>(Disabled)</small>"}</td>
+            <td><code>\${s.url}</code></td>
+            <td><span class="status-badge \text-badge \${s.enabled ? 'active' : 'disabled'}">\${s.enabled ? 'Enabled' : 'Disabled'}</span></td>
+            <td>
+              <button class="btn btn-secondary btn-sm" onclick="editProvider('\${s.id}')">Edit</button>
+              <button class="btn btn-danger btn-sm" onclick="deleteProvider('\${s.id}')">Delete</button>
+            </td>
+          \`;
+          
+          // Fix: replace the nested span class for correct styling
+          tr.querySelector(".status-badge").className = "status-badge " + (s.enabled ? "active" : "disabled");
+          listEl.appendChild(tr);
+        });
+      }
+
+      const envListEl = document.getElementById("env-sources-list");
+      envListEl.innerHTML = "";
+      if (envSources.length === 0) {
+        envListEl.innerHTML = '<div style="font-size:12px;color:var(--text-muted)">No environment servers loaded.</div>';
+      } else {
+        envSources.forEach(s => {
+          const div = document.createElement("div");
+          div.style.cssText = "display:flex;justify-content:space-between;background:rgba(255,255,255,0.01);padding:6px 10px;border-radius:6px;font-size:12px";
+          div.innerHTML = \`<span>🔌 <strong>\${s.label}</strong></span> <code style="color:var(--text-secondary)">\${s.url_masked}</code>\`;
+          envListEl.appendChild(div);
+        });
+      }
     }
 
-    document.querySelector("#random-password").addEventListener("click", () => {
-      passwordInput.value = randomPassword();
-      passwordInput.focus();
-    });
+    function editProvider(id) {
+      const s = customServers.find(x => x.id === id);
+      if (!s) return;
+      document.getElementById("prov-id").value = s.id;
+      document.getElementById("prov-name").value = s.name;
+      document.getElementById("prov-url").value = s.url;
+      document.getElementById("prov-user").value = s.username;
+      document.getElementById("prov-pass").value = "";
+      document.getElementById("prov-pass").required = false; // password is optional on update
+      document.getElementById("prov-pass").placeholder = "Leave blank to keep existing password";
+      document.getElementById("provider-form-title").textContent = "🔌 Edit IPTV Provider";
+      document.getElementById("prov-cancel").style.display = "block";
+    }
 
-    form.addEventListener("submit", async (event) => {
+    function resetProviderForm() {
+      document.getElementById("prov-id").value = "";
+      document.getElementById("prov-name").value = "";
+      document.getElementById("prov-url").value = "";
+      document.getElementById("prov-user").value = "";
+      document.getElementById("prov-pass").value = "";
+      document.getElementById("prov-pass").required = true;
+      document.getElementById("prov-pass").placeholder = "Your Xtream Password";
+      document.getElementById("provider-form-title").textContent = "🔌 Add IPTV Provider";
+      document.getElementById("prov-cancel").style.display = "none";
+    }
+
+    async function saveProvider(event) {
       event.preventDefault();
-      setMessage("Creating link...");
-      const data = Object.fromEntries(new FormData(form).entries());
-      data.include_live = form.elements.include_live.checked;
-      data.include_movies = form.elements.include_movies.checked;
-      data.include_series = form.elements.include_series.checked;
-      const response = await fetch("/api/access-users", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(data)
-      });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Create failed");
-      setMessage(payload.user.m3u_url);
-      await loadUsers();
-    });
+      const id = document.getElementById("prov-id").value;
+      const name = document.getElementById("prov-name").value.trim();
+      const url = document.getElementById("prov-url").value.trim();
+      const username = document.getElementById("prov-user").value.trim();
+      const password = document.getElementById("prov-pass").value.trim();
 
-    passwordInput.value = randomPassword();
-    loadUsers().catch((error) => setMessage(error.message, true));
+      const path = id ? "/api/servers/update" : "/api/servers";
+      const payload = { id, name, url, username };
+      if (password) payload.password = password;
 
-    // ─── Custom Playlists ─────────────────────────────────────────────────
-    const plNameInput = document.querySelector("#pl-name");
-    const chSearchInput = document.querySelector("#ch-search");
-    const chList = document.querySelector("#ch-list");
-    const selCountEl = document.querySelector("#sel-count");
-    const plMessage = document.querySelector("#pl-message");
-    const plListEl = document.querySelector("#pl-list");
-    const plImportMsg = document.querySelector("#pl-import-message");
-
-    let allChannels = [];
-    const selectedKeys = new Set();
-    let lastCheckedIndex = null;
-
-    function setPlMessage(text, isError) {
-      plMessage.textContent = text;
-      plMessage.style.color = isError ? "var(--danger)" : "var(--muted)";
-    }
-
-    function updateSelectedCount() {
-      selCountEl.textContent = selectedKeys.size + " channel" + (selectedKeys.size !== 1 ? "s" : "") + " selected";
-    }
-
-    function renderChannelList(filter) {
-      const q = (filter || "").toLowerCase().trim();
-      const filtered = q
-        ? allChannels.filter(function(ch) { return (ch.name + " " + ch.category).toLowerCase().indexOf(q) >= 0; })
-        : allChannels;
-      const max = 200;
-      const shown = filtered.slice(0, max);
-      chList.innerHTML = "";
-      if (shown.length === 0) {
-        chList.innerHTML = '<div style="padding:14px;color:var(--muted);font-size:13px">No channels found.</div>';
-        return;
-      }
-      for (let i = 0; i < shown.length; i++) {
-        var ch = shown[i];
-        var div = document.createElement("div");
-        div.className = "channel-item";
-        var cb = document.createElement("input");
-        cb.type = "checkbox";
-        cb.checked = selectedKeys.has(ch.key);
-        cb.setAttribute("data-key", ch.key);
-        cb.addEventListener("click", function(e) {
-          if (e.shiftKey && lastCheckedIndex !== null) {
-            let start = Math.min(i, lastCheckedIndex);
-            let end = Math.max(i, lastCheckedIndex);
-            for (let j = start; j <= end; j++) {
-              const rowCb = chList.children[j].querySelector("input[type='checkbox']");
-              if (rowCb) {
-                rowCb.checked = cb.checked;
-                const k = rowCb.getAttribute("data-key");
-                if (cb.checked) selectedKeys.add(k);
-                else selectedKeys.delete(k);
-              }
-            }
-          } else {
-            var k = e.target.getAttribute("data-key");
-            if (e.target.checked) selectedKeys.add(k);
-            else selectedKeys.delete(k);
-          }
-          lastCheckedIndex = i;
-          updateSelectedCount();
-        });
-        var nameSpan = document.createElement("span");
-        nameSpan.className = "ch-name";
-        nameSpan.textContent = ch.name;
-        var catSpan = document.createElement("span");
-        catSpan.className = "ch-cat";
-        catSpan.textContent = ch.category || "";
-        div.appendChild(cb);
-        div.appendChild(nameSpan);
-        div.appendChild(catSpan);
-        (function(checkbox) {
-          div.addEventListener("click", function(e) {
-            if (e.target === checkbox) return;
-            checkbox.checked = !checkbox.checked;
-            checkbox.dispatchEvent(new Event("change"));
-          });
-        })(cb);
-        chList.appendChild(div);
-      }
-      if (filtered.length > max) {
-        var more = document.createElement("div");
-        more.style.cssText = "padding:10px;text-align:center;color:var(--muted);font-size:12px";
-        more.textContent = "+" + (filtered.length - max) + " more — refine your search";
-        chList.appendChild(more);
-      }
-    }
-
-    async function loadAllChannels() {
       try {
-        var res = await fetch("/api/all-channels");
-        if (!res.ok) throw new Error("Failed to load channels");
-        var data = await res.json();
-        allChannels = data.channels || [];
-        renderChannelList();
-      } catch (err) {
-        chList.innerHTML = '<div style="padding:14px;color:var(--danger);font-size:13px">' + err.message + '</div>';
-      }
-    }
-
-    chSearchInput.addEventListener("input", function() { renderChannelList(chSearchInput.value); });
-
-    document.querySelector("#clear-sel-btn").addEventListener("click", function() {
-      selectedKeys.clear();
-      updateSelectedCount();
-      renderChannelList(chSearchInput.value);
-    });
-
-    document.querySelector("#create-pl-btn").addEventListener("click", async function() {
-      var name = plNameInput.value.trim();
-      if (!name) { setPlMessage("Enter a playlist name.", true); return; }
-      if (selectedKeys.size === 0) { setPlMessage("Select at least one channel.", true); return; }
-      setPlMessage("Creating...");
-      try {
-        var res = await fetch("/api/custom-playlists", {
+        const res = await fetch(path, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ name: name, channelKeys: Array.from(selectedKeys) }),
+          body: JSON.stringify(payload)
         });
-        var data = await res.json();
-        if (!res.ok) throw new Error(data.error || "Create failed");
-        setPlMessage("Playlist created! API: " + data.playlist.api_url);
-        plNameInput.value = "";
-        selectedKeys.clear();
-        updateSelectedCount();
-        renderChannelList(chSearchInput.value);
-        await loadPlaylists();
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.error || "Save failed");
+        showToast(id ? "Provider updated!" : "Provider added!");
+        resetProviderForm();
+        await loadProviders();
+        await loadAllChannels();
       } catch (err) {
-        setPlMessage(err.message, true);
-      }
-    });
-
-    function renderPlaylists(playlists) {
-      if (!playlists.length) {
-        plListEl.innerHTML = '<div class="empty">No custom playlists yet.</div>';
-        return;
-      }
-      plListEl.innerHTML = "";
-      for (var i = 0; i < playlists.length; i++) {
-        var pl = playlists[i];
-        var card = document.createElement("div");
-        card.className = "playlist-card";
-        var h3 = document.createElement("h3");
-        h3.textContent = pl.name;
-        var meta = document.createElement("div");
-        meta.className = "meta";
-        meta.textContent = pl.channelKeys.length + " channels · ID: " + pl.id;
-        var apiCode = document.createElement("code");
-        apiCode.textContent = pl.api_url;
-        var m3uCode = document.createElement("code");
-        m3uCode.textContent = pl.m3u_url;
-        m3uCode.style.marginTop = "4px";
-        var actions = document.createElement("div");
-        actions.className = "playlist-actions";
-        var copyApiBtn = document.createElement("button");
-        copyApiBtn.className = "secondary";
-        copyApiBtn.textContent = "Copy API";
-        var copyM3uBtn = document.createElement("button");
-        copyM3uBtn.className = "secondary";
-        copyM3uBtn.textContent = "Copy M3U";
-        var delBtn = document.createElement("button");
-        delBtn.className = "danger";
-        delBtn.textContent = "Delete";
-        actions.appendChild(copyApiBtn);
-        actions.appendChild(copyM3uBtn);
-        actions.appendChild(delBtn);
-        card.appendChild(h3);
-        card.appendChild(meta);
-        card.appendChild(apiCode);
-        card.appendChild(m3uCode);
-        card.appendChild(actions);
-        (function(p) {
-          copyApiBtn.addEventListener("click", function() {
-            navigator.clipboard.writeText(p.api_url).then(function() { setPlMessage("Copied API link."); });
-          });
-          copyM3uBtn.addEventListener("click", function() {
-            navigator.clipboard.writeText(p.m3u_url).then(function() { setPlMessage("Copied M3U link."); });
-          });
-          delBtn.addEventListener("click", async function() {
-            try {
-              var res = await fetch("/api/custom-playlists/delete", {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ id: p.id }),
-              });
-              if (!res.ok) throw new Error("Delete failed");
-              await loadPlaylists();
-              setPlMessage("Playlist deleted.");
-            } catch (err) { setPlMessage(err.message, true); }
-          });
-        })(pl);
-        plListEl.appendChild(card);
+        showToast(err.message, "error");
       }
     }
 
-    async function loadPlaylists() {
+    async function deleteProvider(id) {
+      if (!confirm("Are you sure you want to delete this provider? This will remove all channels imported from it.")) return;
       try {
-        var res = await fetch("/api/custom-playlists");
-        if (!res.ok) throw new Error("Could not load playlists");
-        var data = await res.json();
-        renderPlaylists(data.playlists || []);
-      } catch (err) {
-        plListEl.innerHTML = '<div class="empty" style="color:var(--danger)">' + err.message + '</div>';
-      }
-    }
-
-    document.querySelector("#export-pl-btn").addEventListener("click", async function() {
-      try {
-        var res = await fetch("/api/custom-playlists/export");
-        if (!res.ok) throw new Error("Export failed");
-        var blob = await res.blob();
-        var a = document.createElement("a");
-        a.href = URL.createObjectURL(blob);
-        a.download = "custom-playlists-export.json";
-        a.click();
-        URL.revokeObjectURL(a.href);
-      } catch (err) { setPlMessage(err.message, true); }
-    });
-
-    document.querySelector("#show-import-btn").addEventListener("click", function() {
-      var area = document.querySelector("#import-area");
-      area.style.display = area.style.display === "none" ? "block" : "none";
-    });
-
-    document.querySelector("#do-import-btn").addEventListener("click", async function() {
-      var raw = document.querySelector("#import-json").value.trim();
-      if (!raw) { plImportMsg.textContent = "Paste JSON first."; plImportMsg.style.color = "var(--danger)"; return; }
-      try {
-        var parsed = JSON.parse(raw);
-        var res = await fetch("/api/custom-playlists/import", {
+        const res = await fetch("/api/servers/delete", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(parsed),
+          body: JSON.stringify({ id })
         });
-        var result = await res.json();
-        if (!res.ok) throw new Error(result.error || "Import failed");
-        plImportMsg.textContent = "Imported! Added: " + result.added + ", Updated: " + result.updated;
-        plImportMsg.style.color = "var(--muted)";
-        document.querySelector("#import-json").value = "";
-        await loadPlaylists();
+        if (!res.ok) throw new Error("Delete failed");
+        showToast("Provider deleted");
+        await loadProviders();
+        await loadAllChannels();
       } catch (err) {
-        plImportMsg.textContent = err.message;
-        plImportMsg.style.color = "var(--danger)";
+        showToast(err.message, "error");
       }
-    });
+    }
 
-    // ─── IPTV Categories ─────────────────────────────────────────────────
-    let customCategories = [];
-    let activeCategoryId = null;
+    async function testProviderConnection() {
+      const url = document.getElementById("prov-url").value.trim();
+      const username = document.getElementById("prov-user").value.trim();
+      const password = document.getElementById("prov-pass").value.trim();
+      if (!url || !username) {
+        showToast("URL and username are required to test.", "error");
+        return;
+      }
+      showToast("Testing connection to " + url + "...", "info");
+      try {
+        const res = await fetch("/api/servers/test", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ url, username, password })
+        });
+        const data = await res.json();
+        if (data.connected) {
+          showToast(\`Connected successfully! Expiry: \${data.user_info.exp_date ? new Date(data.user_info.exp_date * 1000).toLocaleDateString() : "Unlimited"}, Max Connections: \${data.user_info.max_connections || 0}\`);
+        } else {
+          showToast("Connection failed: " + (data.error || "Authentication failed"), "error");
+        }
+      } catch (err) {
+        showToast("Test request failed: " + err.message, "error");
+      }
+    }
 
-    const catListEl = document.getElementById("cat-list");
-    const activeCatChListEl = document.getElementById("active-cat-ch-list");
-    const catChSearchListEl = document.getElementById("cat-ch-search-list");
-    const catChSearchInput = document.getElementById("cat-ch-search");
+    // ─── Phase 2 & 3: Overview Health & Stats ───
+    async function fetchHealthStats() {
+      try {
+        const res = await fetch("/api/health");
+        if (!res.ok) return;
+        const data = await res.json();
+        
+        // Populate stats
+        document.getElementById("stat-uptime").textContent = formatUptime(data.uptime_seconds);
+        document.getElementById("stat-requests").textContent = data.requests.total;
+        const cacheTotal = data.requests.segment_cache_hits + data.requests.segment_cache_misses;
+        const hitrate = cacheTotal > 0 ? Math.round((data.requests.segment_cache_hits / cacheTotal) * 100) : 0;
+        document.getElementById("stat-hitrate").textContent = hitrate + "% (" + data.requests.segment_cache_hits + "/" + cacheTotal + ")";
+        document.getElementById("stat-memory").textContent = data.memory.heap_used_mb + " MB / " + data.memory.heap_total_mb + " MB";
 
-    function renderCategories() {
-      catListEl.innerHTML = "";
+        // Circuit breakers list
+        const circuitsEl = document.getElementById("health-circuits");
+        circuitsEl.innerHTML = "";
+        if (!data.circuit_breakers || data.circuit_breakers.length === 0) {
+          circuitsEl.innerHTML = '<div class="empty" style="color:var(--text-muted)">All upstream channels operating normally.</div>';
+        } else {
+          data.circuit_breakers.forEach(c => {
+            const div = document.createElement("div");
+            div.className = "health-item";
+            div.innerHTML = \`
+              <div class="health-row">
+                <span class="health-label">Origin:</span>
+                <span class="health-val"><code>\${c.origin}</code></span>
+              </div>
+              <div class="health-row">
+                <span class="health-label">Status:</span>
+                <span class="health-val">
+                  <span class="status-dot \${c.open ? 'red' : 'green'}"></span> \${c.open ? 'OPEN (Block)' : 'Closed (OK)'}
+                </span>
+              </div>
+              <div class="health-row">
+                <span class="health-label">Failures count:</span>
+                <span class="health-val">\${c.failures}</span>
+              </div>
+              \${c.open ? \`<div class="health-row"><span class="health-label">Cooldown:</span><span class="health-val">\${Math.round(c.cooldown_remaining_ms / 1000)}s</span></div>\` : ""}
+            \`;
+            circuitsEl.appendChild(div);
+          });
+        }
+
+        // Upstream health
+        const upstreamsEl = document.getElementById("health-upstreams");
+        upstreamsEl.innerHTML = "";
+        if (!data.upstream_health || data.upstream_health.length === 0) {
+          upstreamsEl.innerHTML = '<div class="empty" style="color:var(--text-muted)">No upstream requests tracked yet.</div>';
+        } else {
+          data.upstream_health.forEach(u => {
+            const div = document.createElement("div");
+            div.className = "health-item";
+            div.innerHTML = \`
+              <div class="health-row">
+                <span class="health-label">Upstream:</span>
+                <span class="health-val"><code>\${u.origin}</code></span>
+              </div>
+              <div class="health-row">
+                <span class="health-label">Stats (Ok/Fail):</span>
+                <span class="health-val" style="color:var(--success-color)">\${u.successes}</span> / <span class="health-val" style="color:var(--danger-color)">\${u.failures}</span>
+              </div>
+              <div class="health-row">
+                <span class="health-label">Avg Latency:</span>
+                <span class="health-val">\${Math.round(u.avgLatencyMs)} ms</span>
+              </div>
+              <div class="health-row">
+                <span class="health-label">Last failure:</span>
+                <span class="health-val">\${u.lastFailure ? new Date(u.lastFailure).toLocaleTimeString() : 'None'}</span>
+              </div>
+            \`;
+            upstreamsEl.appendChild(div);
+          });
+        }
+
+      } catch (err) {}
+    }
+
+    function formatUptime(seconds) {
+      if (seconds < 60) return seconds + "s";
+      const m = Math.floor(seconds / 60);
+      if (m < 60) return m + "m " + (seconds % 60) + "s";
+      const h = Math.floor(m / 60);
+      if (h < 24) return h + "h " + (m % 60) + "m";
+      const d = Math.floor(h / 24);
+      return d + "d " + (h % 24) + "h";
+    }
+
+    // ─── Phase 3: Category Management ───
+    async function loadCategories() {
+      try {
+        const res = await fetch("/api/custom-categories");
+        if (!res.ok) throw new Error("Could not load categories");
+        const data = await res.json();
+        customCategories = (data.categories || []).sort((a,b) => a.order - b.order);
+        renderCategoriesList();
+        renderActiveCategory();
+        populateCategorySelects();
+      } catch (err) {
+        showToast("Error loading categories: " + err.message, "error");
+      }
+    }
+
+    function renderCategoriesList() {
+      const listEl = document.getElementById("categories-list");
+      listEl.innerHTML = "";
       if (customCategories.length === 0) {
-          catListEl.innerHTML = '<div class="empty">No custom categories defined.</div>';
+        listEl.innerHTML = '<div class="empty">No custom categories defined.</div>';
+        return;
       }
+
       customCategories.forEach((cat, index) => {
         const div = document.createElement("div");
-        div.className = "cat-item draggable" + (activeCategoryId === cat.id ? " active" : "");
+        div.className = "draggable-item" + (activeCategoryId === cat.id ? " active" : "");
         div.draggable = true;
         div.dataset.index = index;
-        div.innerHTML = '<span class="drag-handle">☰</span>' +
-          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis">' + cat.name + ' <small style="color:var(--muted)">(' + cat.channelKeys.length + ')</small></span>' +
-          '<div class="cat-actions">' +
-            '<button type="button" class="secondary to-top-btn" style="padding:2px 6px;min-height:0;font-size:11px">Top</button>' +
-            '<button type="button" class="secondary rename-btn" style="padding:2px 6px;min-height:0;font-size:11px">Rename</button>' +
-            '<button type="button" class="danger delete-btn" style="padding:2px 6px;min-height:0;font-size:11px">Delete</button>' +
-          '</div>';
-        
+        div.innerHTML = \`
+          <span class="drag-handle">☰</span>
+          <span class="item-content"><strong>\${cat.name}</strong> <small style="color:var(--text-secondary)">(\${cat.channelKeys.length} channels)</small></span>
+          <div class="item-actions">
+            <button class="btn btn-secondary btn-sm" style="padding: 2px 6px;" onclick="renameCategory(event, '\${cat.id}')">✏️</button>
+            <button class="btn btn-danger btn-sm" style="padding: 2px 6px;" onclick="deleteCategory(event, '\${cat.id}')">🗑️</button>
+          </div>
+        \`;
+
+        // Selection
         div.addEventListener("click", (e) => {
-          if (e.target.tagName === "BUTTON") return;
+          if (e.target.closest("button") || e.target.closest(".drag-handle")) return;
           activeCategoryId = cat.id;
-          renderCategories();
-          renderActiveCategory();
-        });
-        
-        div.querySelector(".delete-btn").addEventListener("click", (e) => {
-          e.stopPropagation();
-          customCategories = customCategories.filter(c => c.id !== cat.id);
-          if (activeCategoryId === cat.id) activeCategoryId = null;
-          renderCategories();
+          renderCategoriesList();
           renderActiveCategory();
         });
 
-        div.querySelector(".to-top-btn").addEventListener("click", (e) => {
-          e.stopPropagation();
-          const moved = customCategories.splice(index, 1)[0];
-          customCategories.unshift(moved);
-          renderCategories();
+        // Category Drag/Drop sort events
+        div.addEventListener("dragstart", (e) => {
+          e.dataTransfer.setData("text/plain", index);
+          div.style.opacity = "0.5";
         });
-        
-        div.querySelector(".rename-btn").addEventListener("click", (e) => {
-          e.stopPropagation();
-          const newName = prompt("Rename category:", cat.name);
-          if (newName && newName.trim()) {
-            cat.name = newName.trim();
-            renderCategories();
+        div.addEventListener("dragend", () => { div.style.opacity = "1"; });
+        div.addEventListener("dragover", (e) => { e.preventDefault(); div.style.borderTop = "2px solid var(--accent-color)"; });
+        div.addEventListener("dragleave", () => { div.style.borderTop = "none"; });
+        div.addEventListener("drop", (e) => {
+          e.preventDefault();
+          div.style.borderTop = "none";
+          const fromIdx = parseInt(e.dataTransfer.getData("text/plain"));
+          const toIdx = index;
+          if (fromIdx !== toIdx) {
+            const moved = customCategories.splice(fromIdx, 1)[0];
+            customCategories.splice(toIdx, 0, moved);
+            // Re-order mapping
+            customCategories.forEach((c, idx) => c.order = idx + 1);
+            renderCategoriesList();
             renderActiveCategory();
           }
         });
-        
-        // Drag events for category
-        div.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/plain", index); div.style.opacity = "0.5"; });
-        div.addEventListener("dragend", () => { div.style.opacity = "1"; });
-        div.addEventListener("dragover", (e) => { e.preventDefault(); div.classList.add("drag-over"); });
-        div.addEventListener("dragleave", () => { div.classList.remove("drag-over"); });
-        div.addEventListener("drop", (e) => {
-          e.preventDefault();
-          div.classList.remove("drag-over");
-          const fromIndex = parseInt(e.dataTransfer.getData("text/plain"));
-          const toIndex = index;
-          if (fromIndex !== toIndex) {
-            const moved = customCategories.splice(fromIndex, 1)[0];
-            customCategories.splice(toIndex, 0, moved);
-            renderCategories();
-          }
-        });
-        
-        catListEl.appendChild(div);
+
+        listEl.appendChild(div);
       });
     }
 
-    function renderActiveCategory() {
-      const cat = customCategories.find(c => c.id === activeCategoryId);
-      if (!cat) {
-        document.getElementById("cat-channels-panel").style.display = "none";
-        document.getElementById("cat-channels-empty").style.display = "block";
-        document.getElementById("active-cat-name").textContent = "";
-        return;
+    function renameCategory(event, id) {
+      event.stopPropagation();
+      const cat = customCategories.find(c => c.id === id);
+      if (!cat) return;
+      const newName = prompt("Rename Category:", cat.name);
+      if (newName && newName.trim()) {
+        cat.name = newName.trim();
+        renderCategoriesList();
+        renderActiveCategory();
+        populateCategorySelects();
       }
-      
-      document.getElementById("cat-channels-panel").style.display = "block";
-      document.getElementById("cat-channels-empty").style.display = "none";
-      document.getElementById("active-cat-name").textContent = " - " + cat.name;
-      document.getElementById("cat-ch-count").textContent = cat.channelKeys.length;
-      
-      activeCatChListEl.innerHTML = "";
-      if (cat.channelKeys.length === 0) {
-          activeCatChListEl.innerHTML = '<div class="empty">No channels assigned.</div>';
-      }
-      cat.channelKeys.forEach((key, index) => {
-        const ch = allChannels.find(c => c.key === key);
-        if (!ch) return;
-        const div = document.createElement("div");
-        div.className = "cat-ch-item draggable";
-        div.draggable = true;
-        div.dataset.index = index;
-        div.innerHTML = '<span class="drag-handle">☰</span>' +
-          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis">' + ch.name + '</span>' +
-          '<button type="button" class="danger" style="padding:2px 6px;min-height:0;font-size:11px">Remove</button>';
-        
-        div.querySelector("button").addEventListener("click", () => {
-          cat.channelKeys.splice(index, 1);
-          renderCategories();
-          renderActiveCategory();
-        });
-        
-        div.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/plain", index); div.style.opacity = "0.5"; });
-        div.addEventListener("dragend", () => { div.style.opacity = "1"; });
-        div.addEventListener("dragover", (e) => { e.preventDefault(); div.classList.add("drag-over"); });
-        div.addEventListener("dragleave", () => { div.classList.remove("drag-over"); });
-        div.addEventListener("drop", (e) => {
-          e.preventDefault();
-          div.classList.remove("drag-over");
-          const fromIndex = parseInt(e.dataTransfer.getData("text/plain"));
-          const toIndex = index;
-          if (fromIndex !== toIndex) {
-            const moved = cat.channelKeys.splice(fromIndex, 1)[0];
-            cat.channelKeys.splice(toIndex, 0, moved);
-            renderActiveCategory();
-          }
-        });
-        
-        activeCatChListEl.appendChild(div);
-      });
     }
 
-    document.getElementById("add-cat-btn").addEventListener("click", () => {
-      const name = document.getElementById("new-cat-name").value.trim();
+    function deleteCategory(event, id) {
+      event.stopPropagation();
+      if (!confirm("Delete category? Assigned channels will return to uncategorized list.")) return;
+      customCategories = customCategories.filter(c => c.id !== id);
+      if (activeCategoryId === id) activeCategoryId = null;
+      renderCategoriesList();
+      renderActiveCategory();
+      populateCategorySelects();
+    }
+
+    function addCategory() {
+      const nameInput = document.getElementById("new-cat-name");
+      const name = nameInput.value.trim();
       if (!name) return;
+      
       const newId = String(Date.now()) + Math.floor(Math.random()*1000);
-      customCategories.unshift({ id: newId, name, order: 0, channelKeys: [] });
-      document.getElementById("new-cat-name").value = "";
-      renderCategories();
-    });
+      customCategories.push({
+        id: newId,
+        name: name,
+        order: customCategories.length + 1,
+        channelKeys: []
+      });
+      nameInput.value = "";
+      renderCategoriesList();
+      populateCategorySelects();
+    }
 
-    document.getElementById("auto-cat-btn").addEventListener("click", () => {
+    async function saveCategories() {
+      try {
+        const res = await fetch("/api/custom-categories/save", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ categories: customCategories })
+        });
+        if (!res.ok) throw new Error("Save failed");
+        showToast("Categories and order saved!");
+        await loadCategories();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    }
+
+    // Auto-import categories
+    function autoImportCategories() {
       if (allChannels.length === 0) {
-        document.getElementById("cat-message").textContent = "Wait for channels to load first.";
+        showToast("No channels loaded to build categories from.", "error");
         return;
       }
-      if (customCategories.length > 0 && !confirm("This will clear your current custom categories and rebuild them. Continue?")) return;
-      
+      if (customCategories.length > 0 && !confirm("This will overwrite all current custom categories. Continue?")) return;
+
       const catMap = new Map();
       allChannels.forEach(ch => {
         const cName = ch.category || "Uncategorized";
         if (!catMap.has(cName)) catMap.set(cName, []);
         catMap.get(cName).push(ch.key);
       });
-      
+
       customCategories = [];
       let order = 1;
       catMap.forEach((keys, name) => {
@@ -2646,146 +3309,747 @@ function dashboardPage() {
           channelKeys: keys
         });
       });
-      renderCategories();
+      renderCategoriesList();
       renderActiveCategory();
-      document.getElementById("cat-message").textContent = "Imported! Don't forget to Save.";
-      document.getElementById("cat-message").style.color = "var(--muted)";
+      populateCategorySelects();
+      showToast("Built categories from active channels! Click Save to apply.");
+    }
+
+    function renderActiveCategory() {
+      const cat = customCategories.find(c => c.id === activeCategoryId);
+      const emptyEl = document.getElementById("cat-channels-empty");
+      const panelEl = document.getElementById("cat-channels-panel");
+      
+      if (!cat) {
+        emptyEl.style.display = "block";
+        panelEl.style.display = "none";
+        document.getElementById("active-cat-title").textContent = "";
+        return;
+      }
+
+      emptyEl.style.display = "none";
+      panelEl.style.display = "block";
+      document.getElementById("active-cat-title").textContent = " - " + cat.name;
+      document.getElementById("cat-ch-count").textContent = cat.channelKeys.length;
+
+      const listEl = document.getElementById("active-cat-ch-list");
+      listEl.innerHTML = "";
+      
+      if (cat.channelKeys.length === 0) {
+        listEl.innerHTML = '<div class="empty">No channels assigned yet. Add some above.</div>';
+        return;
+      }
+
+      cat.channelKeys.forEach((key, index) => {
+        const ch = allChannels.find(x => x.key === key);
+        const name = ch ? ch.name : key;
+        const div = document.createElement("div");
+        div.className = "draggable-item";
+        div.draggable = true;
+        div.dataset.index = index;
+        div.innerHTML = \`
+          <span class="drag-handle">☰</span>
+          <span class="item-content">\${name}</span>
+          <button class="btn btn-danger btn-sm" style="padding:2px 6px" onclick="removeCategoryChannel(\${index})">Remove</button>
+        \`;
+
+        div.addEventListener("dragstart", (e) => {
+          e.dataTransfer.setData("text/plain", index);
+          div.style.opacity = "0.5";
+        });
+        div.addEventListener("dragend", () => { div.style.opacity = "1"; });
+        div.addEventListener("dragover", (e) => { e.preventDefault(); div.style.borderTop = "2px solid var(--accent-color)"; });
+        div.addEventListener("dragleave", () => { div.style.borderTop = "none"; });
+        div.addEventListener("drop", (e) => {
+          e.preventDefault();
+          div.style.borderTop = "none";
+          const fromIdx = parseInt(e.dataTransfer.getData("text/plain"));
+          const toIdx = index;
+          if (fromIdx !== toIdx) {
+            const moved = cat.channelKeys.splice(fromIdx, 1)[0];
+            cat.channelKeys.splice(toIdx, 0, moved);
+            renderActiveCategory();
+            renderCategoriesList();
+          }
+        });
+
+        listEl.appendChild(div);
+      });
+    }
+
+    function removeCategoryChannel(index) {
+      const cat = customCategories.find(c => c.id === activeCategoryId);
+      if (!cat) return;
+      cat.channelKeys.splice(index, 1);
+      renderActiveCategory();
+      renderCategoriesList();
+    }
+
+    function clearActiveCategoryChannels() {
+      const cat = customCategories.find(c => c.id === activeCategoryId);
+      if (!cat || !confirm("Clear all channels from this category?")) return;
+      cat.channelKeys = [];
+      renderActiveCategory();
+      renderCategoriesList();
+    }
+
+    // Category Autocomplete Channel Search
+    const catSearchInput = document.getElementById("cat-ch-search");
+    const catAutocompleteEl = document.getElementById("cat-ch-autocomplete");
+
+    catSearchInput.addEventListener("input", () => {
+      const q = catSearchInput.value.toLowerCase().trim();
+      if (!q) {
+        catAutocompleteEl.style.display = "none";
+        return;
+      }
+      const cat = customCategories.find(c => c.id === activeCategoryId);
+      if (!cat) return;
+
+      const filtered = allChannels
+        .filter(ch => !cat.channelKeys.includes(ch.key) && (ch.name + " " + (ch.category || "")).toLowerCase().includes(q))
+        .slice(0, 30);
+
+      catAutocompleteEl.innerHTML = "";
+      if (filtered.length === 0) {
+        catAutocompleteEl.innerHTML = '<div style="padding:10px;color:var(--text-muted);font-size:12.5px">No matches found.</div>';
+      } else {
+        filtered.forEach(ch => {
+          const div = document.createElement("div");
+          div.className = "autocomplete-item";
+          div.innerHTML = \`<span>\${ch.name} <small style="color:var(--text-secondary)">(\&nbsp;\${ch.category || 'Live'}&nbsp;)</small></span> <span>➕</span>\`;
+          div.addEventListener("click", () => {
+            cat.channelKeys.push(ch.key);
+            catSearchInput.value = "";
+            catAutocompleteEl.style.display = "none";
+            renderActiveCategory();
+            renderCategoriesList();
+          });
+          catAutocompleteEl.appendChild(div);
+        });
+      }
+      catAutocompleteEl.style.display = "block";
     });
 
-    document.getElementById("export-cat-btn").addEventListener("click", () => {
+    document.addEventListener("click", (e) => {
+      if (!catSearchInput.contains(e.target) && !catAutocompleteEl.contains(e.target)) {
+        catAutocompleteEl.style.display = "none";
+      }
+    });
+
+    // Populate category select dropdowns
+    function populateCategorySelects() {
+      const selects = [
+        document.getElementById("global-ch-filter"),
+        document.getElementById("bulk-cat-select")
+      ];
+      selects.forEach((select, idx) => {
+        if (!select) return;
+        const val = select.value;
+        select.innerHTML = idx === 0 
+          ? '<option value="">All Categories</option><option value="uncategorized">Uncategorized</option>'
+          : '<option value="">Move to Custom Category...</option>';
+        customCategories.forEach(c => {
+          const opt = document.createElement("option");
+          opt.value = c.id;
+          opt.textContent = c.name;
+          select.appendChild(opt);
+        });
+        select.value = val;
+      });
+    }
+
+    // Categories JSON import/export
+    function exportCategories() {
       const data = JSON.stringify({ categories: customCategories }, null, 2);
       const blob = new Blob([data], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "custom-categories-export.json";
+      a.download = "custom-categories.json";
       a.click();
       URL.revokeObjectURL(url);
-    });
+      showToast("Categories JSON exported!");
+    }
 
-    document.getElementById("show-import-cat-btn").addEventListener("click", () => {
-      const area = document.getElementById("import-cat-area");
-      area.style.display = area.style.display === "none" ? "block" : "none";
-    });
+    function toggleImportArea(type) {
+      const el = document.getElementById(\`import-\${type}-area\`);
+      el.style.display = el.style.display === "none" ? "block" : "none";
+    }
 
-    document.getElementById("do-import-cat-btn").addEventListener("click", () => {
-      const raw = document.getElementById("import-cat-json").value.trim();
-      if (!raw) {
-        document.getElementById("cat-message").textContent = "Paste JSON first.";
-        document.getElementById("cat-message").style.color = "var(--danger)";
-        return;
-      }
+    function doImportCategories() {
+      const txt = document.getElementById("import-cat-json").value.trim();
+      if (!txt) return;
       try {
-        const parsed = JSON.parse(raw);
+        const parsed = JSON.parse(txt);
         if (!Array.isArray(parsed.categories)) throw new Error("Invalid format: expected 'categories' array");
-        customCategories = parsed.categories;
+        customCategories = parsed.categories.sort((a,b) => a.order - b.order);
+        renderCategoriesList();
+        renderActiveCategory();
+        populateCategorySelects();
+        showToast("Categories JSON loaded! Click Save to apply.");
         document.getElementById("import-cat-json").value = "";
         document.getElementById("import-cat-area").style.display = "none";
-        renderCategories();
-        renderActiveCategory();
-        document.getElementById("cat-message").textContent = "Imported successfully! Please click Save to apply.";
-        document.getElementById("cat-message").style.color = "var(--muted)";
       } catch (err) {
-        document.getElementById("cat-message").textContent = "Error parsing JSON: " + err.message;
-        document.getElementById("cat-message").style.color = "var(--danger)";
-      }
-    });
-
-    document.getElementById("save-categories-btn").addEventListener("click", async () => {
-      document.getElementById("cat-message").textContent = "Saving...";
-      try {
-        const res = await fetch("/api/custom-categories/save", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ categories: customCategories })
-        });
-        if (!res.ok) throw new Error("Save failed");
-        document.getElementById("cat-message").textContent = "Saved successfully!";
-        document.getElementById("cat-message").style.color = "var(--muted)";
-        setTimeout(() => document.getElementById("cat-message").textContent = "", 3000);
-        await loadCategories();
-      } catch(err) {
-        document.getElementById("cat-message").textContent = err.message;
-        document.getElementById("cat-message").style.color = "var(--danger)";
-      }
-    });
-
-    catChSearchInput.addEventListener("input", () => {
-      const q = catChSearchInput.value.toLowerCase().trim();
-      if (!q) {
-        catChSearchListEl.style.display = "none";
-        return;
-      }
-      const filtered = allChannels.filter(ch => (ch.name + " " + ch.category).toLowerCase().indexOf(q) >= 0).slice(0, 50);
-      catChSearchListEl.innerHTML = "";
-      if (filtered.length === 0) {
-        catChSearchListEl.innerHTML = '<div style="padding:10px;font-size:13px;color:var(--muted)">No channels found.</div>';
-      } else {
-        const addAllBtn = document.createElement("button");
-        addAllBtn.type = "button";
-        addAllBtn.className = "secondary";
-        addAllBtn.style.cssText = "width:100%; padding:6px; margin-bottom:4px; font-weight:bold";
-        addAllBtn.textContent = "Add All " + filtered.length + " Channels";
-        addAllBtn.addEventListener("click", () => {
-          const cat = customCategories.find(c => c.id === activeCategoryId);
-          if (cat) {
-            filtered.forEach(ch => {
-              if (!cat.channelKeys.includes(ch.key)) cat.channelKeys.push(ch.key);
-            });
-            renderCategories();
-            renderActiveCategory();
-          }
-          catChSearchInput.value = "";
-          catChSearchListEl.style.display = "none";
-        });
-        catChSearchListEl.appendChild(addAllBtn);
-
-        filtered.forEach(ch => {
-          const div = document.createElement("div");
-          div.className = "channel-item";
-          div.style.cursor = "pointer";
-          div.innerHTML = '<span style="flex:1">' + ch.name + '</span> <span class="ch-cat">' + (ch.category||"") + '</span> <button class="secondary" type="button" style="padding:2px 6px;min-height:0;font-size:11px">Add</button>';
-          div.addEventListener("click", () => {
-            const cat = customCategories.find(c => c.id === activeCategoryId);
-            if (cat && !cat.channelKeys.includes(ch.key)) {
-              cat.channelKeys.push(ch.key);
-              renderCategories();
-              renderActiveCategory();
-            }
-          });
-          catChSearchListEl.appendChild(div);
-        });
-      }
-      catChSearchListEl.style.display = "block";
-    });
-
-    document.addEventListener("click", (e) => {
-      if (!catChSearchInput.contains(e.target) && !catChSearchListEl.contains(e.target)) {
-        catChSearchListEl.style.display = "none";
-      }
-    });
-
-    async function loadCategories() {
-      try {
-        const res = await fetch("/api/custom-categories");
-        if (!res.ok) throw new Error("Could not load categories");
-        const data = await res.json();
-        customCategories = (data.categories || []).sort((a,b) => a.order - b.order);
-        renderCategories();
-        renderActiveCategory();
-      } catch (err) {
-        document.getElementById("cat-message").textContent = err.message;
-        document.getElementById("cat-message").style.color = "var(--danger)";
+        showToast("Import failed: " + err.message, "error");
       }
     }
 
-    loadAllChannels();
-    loadPlaylists();
-    loadCategories();
+    // ─── Phase 3: Channels Browser ───
+    async function loadAllChannels() {
+      const listEl = document.getElementById("browser-channels-list");
+      listEl.innerHTML = '<div class="empty">Loading channels...</div>';
+      try {
+        const res = await fetch("/api/all-channels");
+        if (!res.ok) throw new Error("Failed to load channels");
+        const data = await res.json();
+        allChannels = data.channels || [];
+        
+        renderChannelsBrowser();
+        renderPlaylistChannelPicker();
+        // Load active categories in background
+        await loadCategories();
+      } catch (err) {
+        listEl.innerHTML = \`<div class="empty" style="color:var(--danger-color)">\${err.message}</div>\`;
+      }
+    }
+
+    function renderChannelsBrowser() {
+      const listEl = document.getElementById("browser-channels-list");
+      const q = document.getElementById("global-ch-search").value.toLowerCase().trim();
+      const filterCatId = document.getElementById("global-ch-filter").value;
+
+      // Filter
+      let filtered = allChannels;
+      if (filterCatId === "uncategorized") {
+        const mappedKeys = new Set(customCategories.flatMap(c => c.channelKeys));
+        filtered = allChannels.filter(ch => !mappedKeys.has(ch.key));
+      } else if (filterCatId) {
+        const cat = customCategories.find(c => c.id === filterCatId);
+        const keys = cat ? new Set(cat.channelKeys) : new Set();
+        filtered = allChannels.filter(ch => keys.has(ch.key));
+      }
+
+      if (q) {
+        filtered = filtered.filter(ch => 
+          ch.name.toLowerCase().includes(q) || 
+          (ch.category || "").toLowerCase().includes(q)
+        );
+      }
+
+      document.getElementById("browser-ch-count").textContent = filtered.length + " channels";
+      listEl.innerHTML = "";
+
+      if (filtered.length === 0) {
+        listEl.innerHTML = '<div style="padding:20px;color:var(--text-muted);text-align:center">No channels found.</div>';
+        return;
+      }
+
+      // Display up to 100 channels in virtualized grid scroll to prevent crash
+      const limit = 150;
+      const shown = filtered.slice(0, limit);
+
+      shown.forEach(ch => {
+        const div = document.createElement("div");
+        div.className = "channel-row";
+        
+        const isChecked = selectedBrowserKeys.has(ch.key);
+        
+        div.innerHTML = \`
+          <input type="checkbox" \${isChecked ? 'checked' : ''} data-key="\${ch.key}">
+          <div class="channel-info" style="cursor:pointer">
+            <span class="channel-name">\${ch.name}</span>
+            <span class="channel-category">\${ch.category || 'Live'}</span>
+          </div>
+          <div style="display:flex;gap:6px">
+            <button class="btn btn-secondary btn-sm" style="padding:2px 8px;font-size:11px" onclick="previewChannel(event, '\${ch.key}')">⚡ Preview</button>
+          </div>
+        \`;
+
+        // Checkbox click
+        div.querySelector("input").addEventListener("change", (e) => {
+          if (e.target.checked) selectedBrowserKeys.add(ch.key);
+          else selectedBrowserKeys.delete(ch.key);
+          updateBrowserSelectedCount();
+        });
+
+        // Row preview trigger
+        div.querySelector(".channel-info").addEventListener("click", (e) => {
+          previewChannel(e, ch.key);
+        });
+
+        listEl.appendChild(div);
+      });
+
+      if (filtered.length > limit) {
+        const more = document.createElement("div");
+        more.style.cssText = "padding:12px;text-align:center;color:var(--text-muted);font-size:12px";
+        more.textContent = \`+ \${filtered.length - limit} more channels — refine search query.\`;
+        listEl.appendChild(more);
+      }
+    }
+
+    function toggleAllBrowserCheckboxes(status) {
+      const container = document.getElementById("browser-channels-list");
+      const boxes = container.querySelectorAll("input[type='checkbox']");
+      boxes.forEach(cb => {
+        cb.checked = status;
+        const key = cb.getAttribute("data-key");
+        if (status) selectedBrowserKeys.add(key);
+        else selectedBrowserKeys.delete(key);
+      });
+      updateBrowserSelectedCount();
+    }
+
+    function updateBrowserSelectedCount() {
+      document.getElementById("browser-selected-count").textContent = selectedBrowserKeys.size;
+    }
+
+    // Bulk assign channels to custom category
+    async function bulkAssignChannels() {
+      if (selectedBrowserKeys.size === 0) {
+        showToast("Select channels first.", "error");
+        return;
+      }
+      const catId = document.getElementById("bulk-cat-select").value;
+      if (!catId) {
+        showToast("Select a target category.", "error");
+        return;
+      }
+
+      const cat = customCategories.find(c => c.id === catId);
+      if (!cat) return;
+
+      let addedCount = 0;
+      selectedBrowserKeys.forEach(key => {
+        // Remove from existing custom categories to prevent duplicates
+        customCategories.forEach(c => {
+          c.channelKeys = c.channelKeys.filter(k => k !== key);
+        });
+        
+        // Add to new
+        if (!cat.channelKeys.includes(key)) {
+          cat.channelKeys.push(key);
+          addedCount++;
+        }
+      });
+
+      selectedBrowserKeys.clear();
+      updateBrowserSelectedCount();
+      toggleAllBrowserCheckboxes(false);
+      
+      renderCategoriesList();
+      renderActiveCategory();
+      renderChannelsBrowser();
+
+      showToast(\`Assigned \${addedCount} channels to category "\${cat.name}". Save changes to persist.\`);
+    }
+
+    // Preview Channel via HLS.js
+    async function previewChannel(event, key) {
+      if (event) event.stopPropagation();
+      const ch = allChannels.find(x => x.key === key);
+      if (!ch) return;
+
+      const video = document.getElementById("video-player");
+      const status = document.getElementById("player-status");
+      const title = document.getElementById("preview-ch-name");
+      const urlText = document.getElementById("preview-ch-url");
+
+      // Generate local streaming path for the player (simulating Xtream endpoint)
+      const streamUrl = \`\${window.location.origin}/live/preview-user/preview-pass/\${ch.key}.m3u8\`;
+
+      title.style.display = "block";
+      title.textContent = ch.name;
+      urlText.style.display = "block";
+      urlText.textContent = streamUrl;
+
+      status.style.display = "block";
+      status.textContent = "Loading stream HLS segments...";
+      video.style.display = "none";
+
+      if (hlsPlayerInstance) {
+        hlsPlayerInstance.destroy();
+        hlsPlayerInstance = null;
+      }
+
+      if (Hls.isSupported()) {
+        hlsPlayerInstance = new Hls({
+          maxBufferLength: 4,
+          maxMaxBufferLength: 6,
+          enableWorker: true
+        });
+        hlsPlayerInstance.loadSource(streamUrl);
+        hlsPlayerInstance.attachMedia(video);
+        hlsPlayerInstance.on(Hls.Events.MANIFEST_PARSED, function() {
+          status.style.display = "none";
+          video.style.display = "block";
+          video.play().catch(() => {});
+        });
+        hlsPlayerInstance.on(Hls.Events.ERROR, function(event, data) {
+          if (data.fatal) {
+            status.textContent = "Stream load error: Upstream offline, codec issue or CORS blocked.";
+            video.style.display = "none";
+          }
+        });
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Native fallback (Safari)
+        video.src = streamUrl;
+        video.style.display = "block";
+        status.style.display = "none";
+      } else {
+        status.textContent = "HLS streaming is not supported on this browser.";
+      }
+    }
+
+    // ─── Phase 3: Access Users ───
+    async function loadUsers() {
+      const wrapper = document.getElementById("users-list-wrapper");
+      try {
+        const res = await fetch("/api/access-users");
+        if (!res.ok) throw new Error("Could not load users");
+        const data = await res.json();
+        renderUsersList(data.users || []);
+      } catch (err) {
+        wrapper.innerHTML = \`<div class="empty" style="color:var(--danger-color)">\${err.message}</div>\`;
+      }
+    }
+
+    function renderUsersList(users) {
+      const wrapper = document.getElementById("users-list-wrapper");
+      if (users.length === 0) {
+        wrapper.innerHTML = '<div class="empty">No generated links yet.</div>';
+        return;
+      }
+
+      wrapper.innerHTML = \`
+        <table>
+          <thead>
+            <tr>
+              <th>Username</th>
+              <th>Status</th>
+              <th>Allowed Content</th>
+              <th>Expiration</th>
+              <th>IPTV Links</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            \${users.map(u => {
+              const status = u.expired ? 'Expired' : (u.disabled ? 'Disabled' : 'Active');
+              const statusClass = u.expired || u.disabled ? 'disabled' : 'active';
+              
+              // Get base details for XTREAM copy
+              const gatewayHost = window.location.hostname;
+              const gatewayPort = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
+              const xtreamCredsText = \`Server: \${gatewayHost}\\nPort: \${gatewayPort}\\nUser: \${u.username}\\nPass: \${u.password}\`;
+
+              return \`
+                <tr>
+                  <td><strong>\${u.username}</strong></td>
+                  <td><span class="status-badge \${statusClass}">\${status}</span></td>
+                  <td>
+                    \${u.include_live ? '<span class="pill">Live</span>' : ''}
+                    \${u.include_movies ? '<span class="pill">Movies</span>' : ''}
+                    \${u.include_series ? '<span class="pill">Series</span>' : ''}
+                  </td>
+                  <td>\${u.expires_at ? new Date(u.expires_at).toLocaleDateString() : 'Infinite'}</td>
+                  <td style="max-width: 320px">
+                    <div style="font-size:11px;color:var(--text-secondary);margin-bottom:4px">M3U Plus URL:</div>
+                    <div class="copy-field">
+                      <div class="copy-text">\${u.m3u_url}</div>
+                      <button class="copy-btn" onclick="copyClipboard('\${u.m3u_url}', 'M3U Link')">Copy</button>
+                    </div>
+                    
+                    <div style="font-size:11px;color:var(--text-secondary);margin-bottom:4px">Xtream Login Details:</div>
+                    <div class="copy-field">
+                      <div class="copy-text">Host: \${gatewayHost} | User: \${u.username}</div>
+                      <button class="copy-btn" onclick="copyClipboard(\\\`\${xtreamCredsText}\\\`, 'Xtream Login')">Copy All</button>
+                    </div>
+                  </td>
+                  <td>
+                    <button class="btn btn-danger btn-sm" onclick="deleteUser('\${u.username}')">Delete</button>
+                  </td>
+                </tr>
+              \`;
+            }).join("")}
+          </tbody>
+        </table>
+      \`;
+    }
+
+    async function copyClipboard(text, label) {
+      try {
+        await navigator.clipboard.writeText(text);
+        showToast(\`\${label} copied to clipboard!\`);
+      } catch (err) {
+        showToast("Copy failed", "error");
+      }
+    }
+
+    async function createUser(event) {
+      event.preventDefault();
+      const form = document.getElementById("create-user-form");
+      const fd = new FormData(form);
+      const data = Object.fromEntries(fd.entries());
+      
+      data.include_live = form.elements.include_live.checked;
+      data.include_movies = form.elements.include_movies.checked;
+      data.include_series = form.elements.include_series.checked;
+
+      try {
+        const res = await fetch("/api/access-users", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(data)
+        });
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.error || "Create failed");
+        showToast("Access link created!");
+        form.reset();
+        generateRandomPass();
+        await loadUsers();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    }
+
+    async function deleteUser(username) {
+      if (!confirm(\`Delete user "\${username}"?\`)) return;
+      try {
+        const res = await fetch("/api/access-users/delete", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ username })
+        });
+        if (!res.ok) throw new Error("Delete failed");
+        showToast("User deleted");
+        await loadUsers();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    }
+
+    // ─── Phase 3: Custom Playlists ───
+    async function loadPlaylists() {
+      const wrapper = document.getElementById("playlists-list");
+      try {
+        const res = await fetch("/api/custom-playlists");
+        if (!res.ok) throw new Error("Could not load playlists");
+        const data = await res.json();
+        renderPlaylistsList(data.playlists || []);
+      } catch (err) {
+        wrapper.innerHTML = \`<div class="empty" style="color:var(--danger-color)">\${err.message}</div>\`;
+      }
+    }
+
+    function renderPlaylistsList(playlists) {
+      const wrapper = document.getElementById("playlists-list");
+      if (playlists.length === 0) {
+        wrapper.innerHTML = '<div class="empty">No custom playlists created yet.</div>';
+        return;
+      }
+
+      wrapper.innerHTML = playlists.map(p => \`
+        <div class="stat-card" style="background:rgba(255,255,255,0.015); border:1px solid var(--panel-border); margin-bottom:0">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px">
+            <h3 style="font-size:15px; font-weight:600">\${p.name}</h3>
+            <span style="font-size:12px; color:var(--text-secondary)">\${p.channelKeys.length} channels</span>
+          </div>
+          
+          <div style="font-size:11px;color:var(--text-secondary);margin-bottom:4px">M3U Playlist URL:</div>
+          <div class="copy-field">
+            <div class="copy-text">\${p.m3u_url}</div>
+            <button class="copy-btn" onclick="copyClipboard('\${p.m3u_url}', 'M3U Link')">Copy</button>
+          </div>
+          
+          <div style="font-size:11px;color:var(--text-secondary);margin-bottom:4px">JSON API URL:</div>
+          <div class="copy-field" style="margin-bottom:12px">
+            <div class="copy-text">\${p.api_url}</div>
+            <button class="copy-btn" onclick="copyClipboard('\${p.api_url}', 'API Link')">Copy</button>
+          </div>
+
+          <div style="display:flex; gap:8px">
+            <button class="btn btn-secondary btn-sm" onclick="editPlaylist('\${p.id}')">Edit</button>
+            <button class="btn btn-danger btn-sm" onclick="deletePlaylist('\${p.id}')">Delete</button>
+          </div>
+        </div>
+      \`).join("");
+    }
+
+    function renderPlaylistChannelPicker() {
+      const listEl = document.getElementById("pl-channels-list");
+      const q = document.getElementById("pl-ch-search").value.toLowerCase().trim();
+
+      let filtered = allChannels;
+      if (q) {
+        filtered = allChannels.filter(ch => 
+          ch.name.toLowerCase().includes(q) || 
+          (ch.category || "").toLowerCase().includes(q)
+        );
+      }
+
+      listEl.innerHTML = "";
+      if (filtered.length === 0) {
+        listEl.innerHTML = '<div style="padding:15px;color:var(--text-muted);text-align:center">No channels found.</div>';
+        return;
+      }
+
+      const limit = 100;
+      const shown = filtered.slice(0, limit);
+
+      shown.forEach(ch => {
+        const div = document.createElement("div");
+        div.className = "channel-row";
+        const isChecked = selectedPlaylistKeys.has(ch.key);
+        div.innerHTML = \`
+          <input type="checkbox" \${isChecked ? 'checked' : ''} data-key="\${ch.key}">
+          <div class="channel-info">
+            <span class="channel-name">\${ch.name}</span>
+            <span class="channel-category">\${ch.category || 'Live'}</span>
+          </div>
+        \`;
+
+        div.querySelector("input").addEventListener("change", (e) => {
+          if (e.target.checked) selectedPlaylistKeys.add(ch.key);
+          else selectedPlaylistKeys.delete(ch.key);
+          updatePlaylistSelectedCount();
+        });
+
+        listEl.appendChild(div);
+      });
+
+      if (filtered.length > limit) {
+        const more = document.createElement("div");
+        more.style.cssText = "padding:8px;text-align:center;color:var(--text-muted);font-size:11.5px";
+        more.textContent = \`+ \${filtered.length - limit} more channels — refine query.\`;
+        listEl.appendChild(more);
+      }
+    }
+
+    function toggleAllPlCheckboxes(status) {
+      const listEl = document.getElementById("pl-channels-list");
+      listEl.querySelectorAll("input[type='checkbox']").forEach(cb => {
+        cb.checked = status;
+        const key = cb.getAttribute("data-key");
+        if (status) selectedPlaylistKeys.add(key);
+        else selectedPlaylistKeys.delete(key);
+      });
+      updatePlaylistSelectedCount();
+    }
+
+    function updatePlaylistSelectedCount() {
+      document.getElementById("pl-selected-count").textContent = selectedPlaylistKeys.size + " channels selected";
+    }
+
+    async function createPlaylist() {
+      const nameInput = document.getElementById("pl-name");
+      const name = nameInput.value.trim();
+      if (!name) { showToast("Enter playlist name.", "error"); return; }
+      if (selectedPlaylistKeys.size === 0) { showToast("Select at least one channel.", "error"); return; }
+
+      try {
+        const res = await fetch("/api/custom-playlists", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name, channelKeys: Array.from(selectedPlaylistKeys) })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Playlist creation failed");
+        showToast("Playlist created successfully!");
+        nameInput.value = "";
+        selectedPlaylistKeys.clear();
+        updatePlaylistSelectedCount();
+        renderPlaylistChannelPicker();
+        await loadPlaylists();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    }
+
+    async function deletePlaylist(id) {
+      if (!confirm("Delete this playlist?")) return;
+      try {
+        const res = await fetch("/api/custom-playlists/delete", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id })
+        });
+        if (!res.ok) throw new Error("Delete failed");
+        showToast("Playlist deleted!");
+        await loadPlaylists();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    }
+
+    function editPlaylist(id) {
+      // Inline edit loader
+      showToast("Edit is currently not active. Please delete and recreate.", "info");
+    }
+
+    async function exportPlaylists() {
+      try {
+        const res = await fetch("/api/custom-playlists/export");
+        if (!res.ok) throw new Error("Export failed");
+        const blob = await res.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "custom-playlists.json";
+        a.click();
+        URL.revokeObjectURL(a.href);
+        showToast("Playlists JSON exported!");
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    }
+
+    async function doImportPlaylists() {
+      const txt = document.getElementById("import-pl-json").value.trim();
+      if (!txt) return;
+      try {
+        const parsed = JSON.parse(txt);
+        const res = await fetch("/api/custom-playlists/import", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(parsed)
+        });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.error || "Import failed");
+        showToast(\`Imported successfully! Added: \${result.added}, Updated: \${result.updated}\`);
+        document.getElementById("import-pl-json").value = "";
+        document.getElementById("import-pl-area").style.display = "none";
+        await loadPlaylists();
+      } catch (err) {
+        showToast("Import failed: " + err.message, "error");
+      }
+    }
+
+    // Initialize Page Data
+    window.addEventListener("load", async () => {
+      generateRandomPass();
+      
+      // Load Providers list
+      await loadProviders();
+
+      // Load all channels in memory
+      await loadAllChannels();
+      
+      // Load Access users list
+      await loadUsers();
+      
+      // Load custom playlists
+      await loadPlaylists();
+
+      // Start fetching health stats and poll every 5s
+      await fetchHealthStats();
+      setInterval(fetchHealthStats, 5000);
+    });
   </script>
 </body>
 </html>`;
 }
+
 
 function m3uAttr(value) {
     return String(value ?? "").replace(/[\r\n"]/g, " ").trim();
@@ -3145,7 +4409,7 @@ function parseTargetDuration(text) {
 }
 
 function trimLivePlaylistText(text, env) {
-    const configuredKeepSegments = envInt(env, "LIVE_WINDOW_SEGMENTS", 0);
+    const configuredKeepSegments = envInt(env, "LIVE_WINDOW_SEGMENTS", 3);
     if (configuredKeepSegments <= 0 || !/#EXTINF:/m.test(text)) return text;
 
     const keepSegments = Math.max(2, configuredKeepSegments);
@@ -3219,7 +4483,7 @@ async function rewriteUpstreamPlaylist(text, playlistUrl, request, env, key) {
     const configuredTarget = envInt(env, "UPSTREAM_TARGET_DURATION", 0);
     const measuredTarget = parseTargetDuration(trimmedText);
     const targetDuration = configuredTarget > 0 ? Math.min(Math.max(1, configuredTarget), measuredTarget) : measuredTarget;
-    const startOffsetSegments = Math.max(0, envInt(env, "LIVE_START_OFFSET_SEGMENTS", 0));
+    const startOffsetSegments = Math.max(0, envInt(env, "LIVE_START_OFFSET_SEGMENTS", 2));
     const startOffsetSeconds = Math.max(1, targetDuration * startOffsetSegments);
     const isMediaPlaylist = /#EXTINF:/m.test(trimmedText) || /#EXT-X-PART:/m.test(trimmedText);
     let insertedStart = false;
@@ -3237,7 +4501,7 @@ async function rewriteUpstreamPlaylist(text, playlistUrl, request, env, key) {
             continue;
         }
         if (line.startsWith("#EXT-X-TARGETDURATION")) { lines.push(`#EXT-X-TARGETDURATION:${targetDuration}`); continue; }
-        if (line.startsWith("#EXT-X-ALLOW-CACHE")) { lines.push("#EXT-X-ALLOW-CACHE:NO"); continue; }
+        if (line.startsWith("#EXT-X-ALLOW-CACHE")) { lines.push("#EXT-X-ALLOW-CACHE:YES"); continue; }
         if (line.startsWith("#EXT-X-START")) {
             if (isMediaPlaylist && !insertedStart && startOffsetSegments > 0) {
                 lines.push(`#EXT-X-START:TIME-OFFSET=-${startOffsetSeconds},PRECISE=YES`);
@@ -3266,17 +4530,55 @@ function mediaTypeForPath(path) {
 }
 
 async function fetchUpstreamAsset(url, referer, env, ttlSeconds, request) {
-    try {
-        const headers = {
-            "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
-            referer,
-        };
-        if (request && request.headers.get("range")) headers.range = request.headers.get("range");
-        if (request && request.headers.get("if-range")) headers["if-range"] = request.headers.get("if-range");
-        return await fetch(url, { method: request ? request.method : "GET", headers, redirect: "follow" });
-    } catch {
-        return null;
+    const maxRetries = envInt(env, "SEGMENT_FETCH_RETRIES", 2);
+    const timeoutMs = envInt(env, "SEGMENT_FETCH_TIMEOUT_MS", 8000);
+    const headers = {
+        "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
+        referer,
+        connection: "keep-alive",
+    };
+    if (request && request.headers.get("range")) headers.range = request.headers.get("range");
+    if (request && request.headers.get("if-range")) headers["if-range"] = request.headers.get("if-range");
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        if (isCircuitOpen(url)) {
+            console.warn(`[segment-fetch] circuit open for ${circuitBreakerKey(url)}, skipping`);
+            return null;
+        }
+        const startMs = Date.now();
+        try {
+            const response = await fetchWithTimeout(url, {
+                method: request ? request.method : "GET",
+                headers,
+                redirect: "follow",
+            }, timeoutMs);
+            const latency = Date.now() - startMs;
+            trackUpstreamRequest(url, response.ok, latency);
+            if (response.ok || (response.status >= 200 && response.status < 400)) {
+                recordCircuitSuccess(url);
+                if (attempt > 0) console.log(`[segment-fetch] succeeded on retry ${attempt} for ${sanitizeUrlForLog(url)}`);
+                return response;
+            }
+            if (response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429) {
+                return response;
+            }
+            if (attempt < maxRetries) {
+                const delayMs = 200 * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5);
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+        } catch (err) {
+            const latency = Date.now() - startMs;
+            trackUpstreamRequest(url, false, latency);
+            recordCircuitFailure(url);
+            if (attempt >= maxRetries) {
+                console.warn(`[segment-fetch] FAILED all ${maxRetries + 1} attempts for ${sanitizeUrlForLog(url)}: ${err?.message}`);
+                return null;
+            }
+            const delayMs = 200 * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5);
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
     }
+    return null;
 }
 
 function extractPrefetchSegmentUrls(text, playlistUrl, env, limit) {
@@ -3304,7 +4606,7 @@ async function buildLivePlaylistBody(key, sourceUrl, request, env, waitUntil, ca
         const upstream = await findUpstreamHls(key, sourceUrl, env);
         if (!upstream) throw new HttpError(502, "Upstream HLS unavailable.");
         const body = await rewriteUpstreamPlaylist(upstream.text, upstream.url, request, env, key);
-        const prefetchCount = Math.max(0, envInt(env, "PREFETCH_SEGMENTS", 0));
+        const prefetchCount = Math.max(0, envInt(env, "PREFETCH_SEGMENTS", 2));
         const segmentUrls = extractPrefetchSegmentUrls(upstream.text, upstream.url, env, prefetchCount);
         rememberMapEntry(livePlaylistCache, cacheKey, { at: Date.now(), body }, MAX_LIVE_PLAYLIST_CACHE_ENTRIES);
         if (segmentUrls.length > 0) waitUntil(prefetchSegments(segmentUrls, upstream.url, env));
@@ -3377,12 +4679,68 @@ function cleanupWarmupState() {
     }
 }
 
+async function proxyProgressiveStream(sourceUrl, request, env) {
+    const maxRetries = envInt(env, "SEGMENT_FETCH_RETRIES", 2);
+    const timeoutMs = envInt(env, "SEGMENT_FETCH_TIMEOUT_MS", 8000);
+    const headers = {
+        "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
+        connection: "keep-alive",
+    };
+    if (request && request.headers.get("range")) headers.range = request.headers.get("range");
+    if (request && request.headers.get("if-range")) headers["if-range"] = request.headers.get("if-range");
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        if (isCircuitOpen(sourceUrl)) {
+            console.warn(`[progressive-stream] circuit open for ${circuitBreakerKey(sourceUrl)}, skipping`);
+            throw new HttpError(503, "Upstream stream temporarily unavailable (circuit breaker open).");
+        }
+        const startMs = Date.now();
+        try {
+            const response = await fetchWithTimeout(sourceUrl, {
+                method: request ? request.method : "GET",
+                headers,
+                redirect: "follow",
+            }, timeoutMs);
+            const latency = Date.now() - startMs;
+            trackUpstreamRequest(sourceUrl, response.ok, latency);
+            if (response.ok || (response.status >= 200 && response.status < 400)) {
+                recordCircuitSuccess(sourceUrl);
+                
+                const proxyHeaders = new Headers(response.headers);
+                proxyHeaders.set("access-control-allow-origin", "*");
+                if (proxyHeaders.has("transfer-encoding")) proxyHeaders.delete("content-length");
+                
+                if (attempt > 0) console.log(`[progressive-stream] succeeded on retry ${attempt} for ${sanitizeUrlForLog(sourceUrl)}`);
+                return new Response(response.body, { status: response.status, headers: proxyHeaders });
+            }
+            if (response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429) {
+                return new Response(response.body, { status: response.status, headers: response.headers });
+            }
+            if (attempt < maxRetries) {
+                const delayMs = 200 * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5);
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+        } catch (err) {
+            const latency = Date.now() - startMs;
+            trackUpstreamRequest(sourceUrl, false, latency);
+            recordCircuitFailure(sourceUrl);
+            if (attempt >= maxRetries) {
+                console.error(`[progressive-stream] FAILED all ${maxRetries + 1} attempts for ${sanitizeUrlForLog(sourceUrl)}: ${err.message}`);
+                throw new HttpError(502, "Upstream stream fetch failed.");
+            }
+            const delayMs = 200 * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5);
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+    }
+    throw new HttpError(502, "Upstream stream fetch failed.");
+}
+
 async function proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, cacheKey) {
-    const warmupEnabled = envBool(env, "LOADING_VIDEO_ENABLED", false);
+    const warmupEnabled = envBool(env, "LOADING_VIDEO_ENABLED", true);
     const requiredSegments = envInt(env, "WARMUP_REQUIRED_SEGMENTS", WARMUP_REQUIRED_SEGMENTS);
     const now = Date.now();
     const freshMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", 2000));
-    const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 0));
+    const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 15000));
     const cached = livePlaylistCache.get(cacheKey);
 
     // ── Warmup: play the loading MP4 while upstream HLS stabilises ───────────
@@ -3545,7 +4903,7 @@ async function buildNestedPlaylistBody(key, tokenData, request, env, waitUntil, 
         const fetched = (await fetchHls(tokenData.u, env, tokenData.r)) || (tokenData.f ? await fetchHls(tokenData.f, env, tokenData.r) : null);
         if (!fetched) throw new HttpError(502, "Upstream unavailable.");
         const body = await rewriteUpstreamPlaylist(fetched.text, fetched.finalUrl, request, env, key);
-        const prefetchCount = Math.max(0, envInt(env, "PREFETCH_SEGMENTS", 0));
+        const prefetchCount = Math.max(0, envInt(env, "PREFETCH_SEGMENTS", 2));
         const segmentUrls = extractPrefetchSegmentUrls(fetched.text, fetched.finalUrl, env, prefetchCount);
         rememberMapEntry(livePlaylistCache, cacheKey, { at: Date.now(), body }, MAX_LIVE_PLAYLIST_CACHE_ENTRIES);
         if (segmentUrls.length > 0) waitUntil(prefetchSegments(segmentUrls, fetched.finalUrl, env));
@@ -3559,7 +4917,7 @@ async function proxyNestedPlaylist(key, token, request, env, waitUntil) {
     const cacheKey = `uplive:${key}:${tokenData.u}`;
     const now = Date.now();
     const freshMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", 2000));
-    const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 0));
+    const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 15000));
     const cached = livePlaylistCache.get(cacheKey);
     if (cached && now - cached.at < freshMs) return playlistResponse(cached.body);
     try {
@@ -3573,35 +4931,135 @@ async function proxyNestedPlaylist(key, token, request, env, waitUntil) {
 
 async function proxySegment(key, token, filename, request, env) {
     validateKey(key);
+    globalRequestCount++;
     const tokenData = await readUrlToken(token, env);
     const referer = tokenData.r || tokenData.u;
     const ttlSeconds = Math.max(1, envInt(env, "SEGMENT_CACHE_SECONDS", 30));
+    const cdnTtlSeconds = Math.max(ttlSeconds, envInt(env, "CDN_SEGMENT_CACHE_SECONDS", 120));
 
-    const primary = await fetchUpstreamAsset(tokenData.u, referer, env, ttlSeconds, request);
-    const fallback = (!primary || primary.status >= 400) && tokenData.f
-        ? await fetchUpstreamAsset(tokenData.f, referer, env, ttlSeconds, request)
-        : null;
+    const segmentUrl = tokenData.u;
+    const hasRange = request && request.headers.get("range");
 
-    const upstream = fallback && fallback.ok ? fallback : primary;
-    if (!upstream) throw new HttpError(502, "Upstream segment fetch failed.");
-    if (!upstream.ok) return withCors(new Response(upstream.body, { status: upstream.status, headers: upstream.headers }));
+    if (hasRange) {
+        // Direct proxy without caching for range requests
+        const primary = await fetchUpstreamAsset(tokenData.u, referer, env, ttlSeconds, request);
+        const fallback = (!primary || primary.status >= 400) && tokenData.f
+            ? await fetchUpstreamAsset(tokenData.f, referer, env, ttlSeconds, request)
+            : null;
 
-    const headers = new Headers(upstream.headers);
-    headers.set("cache-control", `public, max-age=${ttlSeconds}, s-maxage=${ttlSeconds}, stale-while-revalidate=15`);
-    if (!headers.has("content-type")) headers.set("content-type", mediaTypeForPath(filename));
+        const upstream = fallback && fallback.ok ? fallback : primary;
+        if (!upstream) throw new HttpError(502, "Upstream segment fetch failed.");
+        if (!upstream.ok) return withCors(new Response(upstream.body, { status: upstream.status, headers: upstream.headers }));
 
-    // Explicitly declare partial content support here
-    headers.set("accept-ranges", "bytes");
+        const headers = new Headers(upstream.headers);
+        headers.set("cache-control", "no-store");
+        headers.set("access-control-allow-origin", "*");
+        return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers });
+    }
 
-    headers.set("access-control-allow-origin", "*");
-    headers.set("access-control-allow-methods", "GET,HEAD,OPTIONS");
-    headers.set("access-control-allow-headers", "*");
-    headers.set("access-control-expose-headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
-    headers.set("x-content-type-options", "nosniff");
-    headers.set("x-proxied-by", "node-express");
-    headers.set("x-worker-origin", publicBase(request, env));
+    // Check LRU cache
+    const now = Date.now();
+    const cachedEntry = segmentCache.get(segmentUrl);
+    if (cachedEntry && (now - cachedEntry.at) < SEGMENT_CACHE_TTL_MS) {
+        globalSegmentCacheHits++;
+        const headers = new Headers();
+        Object.entries(cachedEntry.headers).forEach(([k, v]) => headers.set(k, v));
+        headers.set("x-segment-cache", "hit");
+        
+        // Add BunnyCDN optimizations
+        headers.set("cache-control", `public, max-age=${ttlSeconds}, s-maxage=${cdnTtlSeconds}, stale-while-revalidate=60`);
+        headers.set("cdn-cache-control", `max-age=${cdnTtlSeconds}`);
+        headers.set("vary", "Accept-Encoding");
+        headers.set("access-control-allow-origin", "*");
 
-    return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers });
+        return withCors(new Response(cachedEntry.body, {
+            status: 200,
+            headers
+        }));
+    }
+
+    // Check inflight requests
+    let inflightPromise = segmentInflight.get(segmentUrl);
+    if (!inflightPromise) {
+        inflightPromise = (async () => {
+            const primary = await fetchUpstreamAsset(tokenData.u, referer, env, ttlSeconds, request);
+            const fallback = (!primary || primary.status >= 400) && tokenData.f
+                ? await fetchUpstreamAsset(tokenData.f, referer, env, ttlSeconds, request)
+                : null;
+
+            const upstream = fallback && fallback.ok ? fallback : primary;
+            if (!upstream) throw new HttpError(502, "Upstream segment fetch failed.");
+
+            const status = upstream.status;
+            const statusText = upstream.statusText;
+            const responseHeaders = {};
+            upstream.headers.forEach((v, k) => {
+                responseHeaders[k] = v;
+            });
+
+            let bodyBuffer;
+            if (upstream.body) {
+                const arrayBuf = await upstream.arrayBuffer();
+                bodyBuffer = Buffer.from(arrayBuf);
+            } else {
+                bodyBuffer = Buffer.alloc(0);
+            }
+
+            return {
+                status,
+                statusText,
+                headers: responseHeaders,
+                body: bodyBuffer
+            };
+        })();
+
+        segmentInflight.set(segmentUrl, inflightPromise);
+        inflightPromise.finally(() => {
+            segmentInflight.delete(segmentUrl);
+        });
+    }
+
+    try {
+        const result = await inflightPromise;
+        if (result.status >= 200 && result.status < 300) {
+            // Clean up cache size
+            if (segmentCache.size >= MAX_SEGMENT_CACHE_ENTRIES) {
+                const oldestKey = segmentCache.keys().next().value;
+                if (oldestKey) segmentCache.delete(oldestKey);
+            }
+            segmentCache.set(segmentUrl, {
+                at: Date.now(),
+                headers: result.headers,
+                body: result.body
+            });
+            globalSegmentCacheMisses++;
+        }
+
+        const headers = new Headers();
+        Object.entries(result.headers).forEach(([k, v]) => headers.set(k, v));
+        
+        headers.set("cache-control", `public, max-age=${ttlSeconds}, s-maxage=${cdnTtlSeconds}, stale-while-revalidate=60`);
+        headers.set("cdn-cache-control", `max-age=${cdnTtlSeconds}`);
+        headers.set("vary", "Accept-Encoding");
+        if (!headers.has("content-type")) headers.set("content-type", mediaTypeForPath(filename));
+        
+        headers.set("accept-ranges", "bytes");
+        headers.set("access-control-allow-origin", "*");
+        headers.set("access-control-allow-methods", "GET,HEAD,OPTIONS");
+        headers.set("access-control-allow-headers", "*");
+        headers.set("access-control-expose-headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type");
+        headers.set("x-content-type-options", "nosniff");
+        headers.set("x-proxied-by", "node-express");
+        headers.set("x-segment-cache", "miss");
+
+        return withCors(new Response(result.body, {
+            status: result.status,
+            statusText: result.statusText,
+            headers
+        }));
+    } catch (err) {
+        throw err instanceof HttpError ? err : new HttpError(502, `Upstream segment proxy failed: ${err.message}`);
+    }
 }
 
 // ─── Xtream Codes Protocol API ───────────────────────────────────────────────
@@ -3805,7 +5263,7 @@ function localXtreamLiveStreams(channels, categoryId = "", request = null, env =
         const liveCategoryId = String(stringToNumericId(xtreamFallbackCategoryId(categoryName)));
         if (wantedCategoryId && wantedCategoryId !== "0" && wantedCategoryId !== liveCategoryId) continue;
 
-        const numericStreamId = String(parseInt(channel.key.slice(0, 8), 16) || 1);
+        const numericStreamId = String(stringToNumericId(channel.key));
         xtreamLocalNumericIndex.set(numericStreamId, channel.key);
 
         const streamUrl = xtreamLivePlaybackUrl(request, env, user, numericStreamId);
@@ -3820,9 +5278,10 @@ function localXtreamLiveStreams(channels, categoryId = "", request = null, env =
             is_adult: "0",
             category_id: liveCategoryId,
             custom_sid: "",
-            tv_archive: 0,
+            tv_archive: 1,
             direct_source: "",
             tv_archive_duration: 0,
+            container_extension: "ts",
         });
     }
     return result;
@@ -3904,7 +5363,7 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
                 const channel = channelMap.get(key);
                 if (!channel) continue;
                 if (!channel.is_xtream) {
-                    const numericStreamId = String(parseInt(channel.key.slice(0, 8), 16) || 1);
+                    const numericStreamId = String(stringToNumericId(channel.key));
                     xtreamLocalNumericIndex.set(numericStreamId, channel.key);
                     result.push({
                         num: num++,
@@ -3917,9 +5376,10 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
                         is_adult: "0",
                         category_id: cat.id,
                         custom_sid: "",
-                        tv_archive: 0,
+                        tv_archive: 1,
                         direct_source: "",
                         tv_archive_duration: 0,
+                        container_extension: "ts",
                     });
                 } else {
                     const item = channel.xtream_item;
@@ -3934,9 +5394,10 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
                         is_adult: "0",
                         category_id: cat.id,
                         custom_sid: "",
-                        tv_archive: 0,
+                        tv_archive: 1,
                         direct_source: "",
                         tv_archive_duration: 0,
+                        container_extension: "ts",
                     });
                 }
             }
@@ -3946,7 +5407,7 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
             for (const channel of channelMap.values()) {
                 if (!mappedKeys.has(channel.key)) {
                     if (!channel.is_xtream) {
-                        const numericStreamId = String(parseInt(channel.key.slice(0, 8), 16) || 1);
+                        const numericStreamId = String(stringToNumericId(channel.key));
                         xtreamLocalNumericIndex.set(numericStreamId, channel.key);
                         result.push({
                             num: num++,
@@ -3959,9 +5420,10 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
                             is_adult: "0",
                             category_id: "999999",
                             custom_sid: "",
-                            tv_archive: 0,
+                            tv_archive: 1,
                             direct_source: "",
                             tv_archive_duration: 0,
+                            container_extension: "ts",
                         });
                     } else {
                         const item = channel.xtream_item;
@@ -3976,9 +5438,10 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
                             is_adult: "0",
                             category_id: "999999",
                             custom_sid: "",
-                            tv_archive: 0,
+                            tv_archive: 1,
                             direct_source: "",
                             tv_archive_duration: 0,
+                            container_extension: "ts",
                         });
                     }
                 }
@@ -4554,7 +6017,9 @@ async function handleRequest(request, env, waitUntil) {
         path === "/api/access-users" || path === "/api/access-users/delete" ||
         path === "/api/custom-playlists" || path === "/api/custom-playlists/update" ||
         path === "/api/custom-playlists/delete" || path === "/api/custom-playlists/import" ||
-        path === "/api/custom-categories/save"
+        path === "/api/custom-categories/save" ||
+        path === "/api/servers" || path === "/api/servers/update" ||
+        path === "/api/servers/delete" || path === "/api/servers/test"
     );
 
     if (request.method !== "GET" && request.method !== "HEAD" && !isDashboardMutation) {
@@ -4565,8 +6030,139 @@ async function handleRequest(request, env, waitUntil) {
         return json({
             build: APP_BUILD_ID,
             xtream_compatibility: "get_all_categories returns a categories envelope",
-            updated_at: "2026-06-14T00:44:00+02:00",
+            updated_at: "2026-06-17T00:00:00+02:00",
+            features: ["low-latency-3seg", "segment-retry", "circuit-breaker", "cdn-cache-control", "server-management"],
         });
+    }
+
+    // ─── Health API ────────────────────────────────────────────────────────────
+    if (path === "/api/health") {
+        if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+        const memUsage = process.memoryUsage();
+        const healthData = {
+            status: "ok",
+            uptime_seconds: Math.round((Date.now() - serverStartedAt) / 1000),
+            memory: {
+                rss_mb: Math.round(memUsage.rss / 1048576),
+                heap_used_mb: Math.round(memUsage.heapUsed / 1048576),
+                heap_total_mb: Math.round(memUsage.heapTotal / 1048576),
+            },
+            caches: {
+                channels: { count: channelCache.channels.length, age_seconds: channelCache.at ? Math.round((Date.now() - channelCache.at) / 1000) : null },
+                playlist_channels: { count: playlistChannelCache.channels.length, age_seconds: playlistChannelCache.at ? Math.round((Date.now() - playlistChannelCache.at) / 1000) : null },
+                stream_index: streamIndex.size,
+                upstream_hls: upstreamHlsCache.size,
+                live_playlists: livePlaylistCache.size,
+                segments: segmentCache.size,
+                xtream_catalogs: xtreamCatalogCache.size,
+            },
+            requests: {
+                total: globalRequestCount,
+                segment_cache_hits: globalSegmentCacheHits,
+                segment_cache_misses: globalSegmentCacheMisses,
+            },
+            circuit_breakers: [...circuitBreaker.entries()].map(([origin, state]) => ({
+                origin,
+                failures: state.failures,
+                open: Date.now() < state.openUntil,
+                cooldown_remaining_ms: Math.max(0, state.openUntil - Date.now()),
+            })),
+            upstream_health: [...upstreamHealthStats.entries()].map(([origin, stats]) => ({
+                origin,
+                ...stats,
+                lastSuccess: stats.lastSuccess ? new Date(stats.lastSuccess).toISOString() : null,
+                lastFailure: stats.lastFailure ? new Date(stats.lastFailure).toISOString() : null,
+            })),
+        };
+        return json(healthData);
+    }
+
+    // ─── Server Management API ────────────────────────────────────────────────
+    if (path === "/api/servers" && request.method === "GET") {
+        if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+        const servers = await loadCustomServers(env);
+        const envSources = buildProviderPlaylistSources(env);
+        return json({
+            status: "ok",
+            custom_servers: servers,
+            env_sources: envSources.map(s => ({ label: s.label, url_masked: sanitizeUrlForLog(s.url) })),
+        });
+    }
+    if (path === "/api/servers" && request.method === "POST") {
+        if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+        const data = await readRequestData(request);
+        const name = cleanString(data.name);
+        const serverUrl = cleanString(data.url);
+        const username = cleanString(data.username);
+        const password = cleanString(data.password);
+        if (!name) throw new HttpError(400, "Server name is required.");
+        if (!serverUrl) throw new HttpError(400, "Server URL is required.");
+        if (!username || !password) throw new HttpError(400, "Username and password are required.");
+        const servers = await loadCustomServers(env);
+        const id = randomPlaylistId(10);
+        const server = {
+            id, name, url: serverUrl.replace(/\/+$/, ""), username, password,
+            enabled: true, priority: servers.length + 1,
+            createdAt: new Date().toISOString(),
+        };
+        servers.push(server);
+        await saveCustomServers(env, servers);
+        customServersCache = servers;
+        // Trigger background channel refresh with new server
+        void doRefreshChannels(env).catch(() => null);
+        void doRefreshPlaylistChannels(env).catch(() => null);
+        return json({ status: "ok", server: { ...server, password: "***" } }, 201);
+    }
+    if (path === "/api/servers/update" && request.method === "POST") {
+        if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+        const data = await readRequestData(request);
+        const id = cleanString(data.id);
+        if (!id) throw new HttpError(400, "Server ID is required.");
+        const servers = await loadCustomServers(env);
+        const idx = servers.findIndex(s => s.id === id);
+        if (idx < 0) throw new HttpError(404, "Server not found.");
+        if (data.name !== undefined) servers[idx].name = cleanString(data.name) || servers[idx].name;
+        if (data.url !== undefined) servers[idx].url = cleanString(data.url).replace(/\/+$/, "") || servers[idx].url;
+        if (data.username !== undefined) servers[idx].username = cleanString(data.username) || servers[idx].username;
+        if (data.password !== undefined) servers[idx].password = cleanString(data.password) || servers[idx].password;
+        if (data.enabled !== undefined) servers[idx].enabled = parseRequestBool(data.enabled, true);
+        if (data.priority !== undefined) servers[idx].priority = Number(data.priority) || servers[idx].priority;
+        await saveCustomServers(env, servers);
+        customServersCache = servers;
+        void doRefreshChannels(env).catch(() => null);
+        return json({ status: "ok", server: { ...servers[idx], password: "***" } });
+    }
+    if (path === "/api/servers/delete" && request.method === "POST") {
+        if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+        const data = await readRequestData(request);
+        const id = cleanString(data.id);
+        if (!id) throw new HttpError(400, "Server ID is required.");
+        const servers = await loadCustomServers(env);
+        const kept = servers.filter(s => s.id !== id);
+        await saveCustomServers(env, kept);
+        customServersCache = kept;
+        void doRefreshChannels(env).catch(() => null);
+        return json({ status: "ok", deleted: servers.length - kept.length });
+    }
+    if (path === "/api/servers/test" && request.method === "POST") {
+        if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+        const data = await readRequestData(request);
+        const testUrl = cleanString(data.url);
+        const testUser = cleanString(data.username);
+        const testPass = cleanString(data.password);
+        if (!testUrl || !testUser || !testPass) throw new HttpError(400, "URL, username, and password required.");
+        const config = { baseUrl: testUrl.replace(/\/+$/, ""), username: testUser, password: testPass };
+        const startMs = Date.now();
+        try {
+            const result = await fetchXtreamApi(env, config, null);
+            const latency = Date.now() - startMs;
+            if (result && result.user_info && result.user_info.auth === 1) {
+                return json({ status: "ok", connected: true, latency_ms: latency, user_info: result.user_info, server_info: result.server_info });
+            }
+            return json({ status: "ok", connected: false, latency_ms: latency, error: "Authentication failed" });
+        } catch (err) {
+            return json({ status: "ok", connected: false, latency_ms: Date.now() - startMs, error: err?.message || "Connection failed" });
+        }
     }
 
     // ─── Loading video proxy (serves MP4 with CORS) ─────────────────────────
@@ -4724,15 +6320,7 @@ async function handleRequest(request, env, waitUntil) {
         await requireXtreamAuth(xtreamMovieMatch[1], xtreamMovieMatch[2]);
         const movieUrl = await findXtreamMovieUrl(env, xtreamMovieMatch[3]);
         if (!movieUrl) throw new HttpError(404, "Movie not found.");
-        // Proxy through our own /upseg/ endpoint — hides upstream credentials,
-        // eliminates "unsafe URL" warnings in IPTV apps.
-        const key = await streamKey(movieUrl);
-        const token = await makeUrlToken({ u: movieUrl }, env);
-        const filename = `${xtreamMovieMatch[3]}.${xtreamMovieMatch[4] || "mp4"}`;
-        return withCors(new Response(null, {
-            status: 302,
-            headers: { location: `${publicBase(request, env)}/upseg/${key}/${token}/${filename}` },
-        }));
+        return proxyProgressiveStream(movieUrl, request, env);
     }
 
     // ─── Xtream series episode: /series/{user}/{pass}/{episode_id}.{ext} ─────────
@@ -4741,14 +6329,7 @@ async function handleRequest(request, env, waitUntil) {
         await requireXtreamAuth(xtreamSeriesMatch[1], xtreamSeriesMatch[2]);
         const episodeUrl = await findXtreamEpisodeUrl(xtreamSeriesMatch[3]);
         if (!episodeUrl) throw new HttpError(404, "Episode not found — open the series in your app first to load episode data.");
-        // Proxy through our own /upseg/ endpoint — hides upstream credentials.
-        const key = await streamKey(episodeUrl);
-        const token = await makeUrlToken({ u: episodeUrl }, env);
-        const filename = `${xtreamSeriesMatch[3]}.${xtreamSeriesMatch[4] || "mp4"}`;
-        return withCors(new Response(null, {
-            status: 302,
-            headers: { location: `${publicBase(request, env)}/upseg/${key}/${token}/${filename}` },
-        }));
+        return proxyProgressiveStream(episodeUrl, request, env);
     }
 
     if (path === "/api/all-channels") {
@@ -4952,6 +6533,14 @@ const PORT = process.env.PORT || 7860;
 // is instant. Then kick off a live refresh in the background.
 async function prewarmCaches() {
     const env = process.env;
+
+    // 0. Load custom servers cache from disk
+    try {
+        customServersCache = await loadCustomServers(env);
+        console.log(`[cache] custom servers restored from disk: ${customServersCache.length} servers`);
+    } catch (err) {
+        console.warn("[cache] failed to restore custom servers from disk:", err?.message);
+    }
 
     // 1. Load channel cache from disk
     const diskChannels = await loadDiskCache(CHANNEL_DISK_CACHE_FILE);
