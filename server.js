@@ -82,9 +82,9 @@ const SEGMENT_CACHE_TTL_MS = 45_000;  // 45s — covers ~6 segment intervals
 
 // ─── Circuit Breaker (skip failing upstreams temporarily) ───────────────────
 const circuitBreaker = new Map();     // url-origin → { failures, lastFailure, openUntil }
-const CIRCUIT_BREAKER_THRESHOLD = 5;  // failures before opening circuit
-const CIRCUIT_BREAKER_WINDOW_MS = 60_000;  // failure counting window
-const CIRCUIT_BREAKER_COOLDOWN_MS = 30_000; // how long to skip a broken upstream
+const CIRCUIT_BREAKER_THRESHOLD = 10;  // failures before opening circuit (relaxed to avoid premature cutouts)
+const CIRCUIT_BREAKER_WINDOW_MS = 30_000;  // failure counting window (shorter window = forgive faster)
+const CIRCUIT_BREAKER_COOLDOWN_MS = 15_000; // how long to skip a broken upstream (recover faster)
 
 // ─── Upstream Health Tracking ───────────────────────────────────────────────
 const upstreamHealthStats = new Map(); // origin → { successes, failures, lastSuccess, lastFailure, avgLatencyMs }
@@ -100,7 +100,7 @@ const BUNNY_API_BASE = "https://api.bunny.net";
 const BUNNY_DATA_DIR = process.env.BUNNY_DATA_DIR || "/data";
 const BUNNY_PULLZONE_DATA_FILE = `${BUNNY_DATA_DIR}/bunny-pullzones.json`;
 const BUNNY_PULLZONE_CACHE_TTL_MS = (Number.parseInt(process.env.BUNNY_PULLZONE_CACHE_TTL_HOURS, 10) || 24) * 3600_000;
-const BUNNY_SEGMENT_CACHE_SEC = Number.parseInt(process.env.BUNNY_PULLZONE_SEGMENT_CACHE_SEC, 10) || 60;
+const BUNNY_SEGMENT_CACHE_SEC = Number.parseInt(process.env.BUNNY_PULLZONE_SEGMENT_CACHE_SEC, 10) || 30;
 const bunnyPullZoneCache = new Map();    // origin → { hostname, pullZoneId, createdAt }
 const bunnyPullZoneInflight = new Map(); // origin → Promise<{ hostname, pullZoneId } | null>
 let bunnyInitialized = false;
@@ -123,6 +123,13 @@ const MAX_UPSTREAM_HLS_CACHE_ENTRIES = 500;
 const MAX_LIVE_PLAYLIST_CACHE_ENTRIES = 500;
 const MAX_XTREAM_CATALOG_CACHE_ENTRIES = 100;
 const MAX_GENERATED_PLAYLIST_CACHE_ENTRIES = 200;
+
+// ─── Xtream API Response Cache ──────────────────────────────────────────────
+// Caches fully-built Xtream API responses (get_live_streams, get_live_categories, etc.)
+// so IPTV receivers get instant responses from cache instead of rebuilding every time.
+const xtreamResponseCache = new Map(); // cacheKey → { at, payload (JSON string) }
+const XTREAM_RESPONSE_CACHE_TTL_MS = 120_000; // 2 minutes — fast enough for live TV
+const MAX_XTREAM_RESPONSE_CACHE_ENTRIES = 50;
 
 const ACCESS_DURATION_MONTHS = {
     "1m": 1,
@@ -6138,41 +6145,71 @@ async function handleXtreamApi(request, env, waitUntil) {
         return json(payload);
     }
 
+    // ── Fast response cache for heavy list actions ────────────────────────────
+    // These actions build large payloads from upstream APIs + channel lists.
+    // Cache the pre-built JSON so IPTV receivers get instant responses.
+    const CACHEABLE_ACTIONS = new Set([
+        "get_live_categories", "get_live_streams", "get_all_categories",
+        "get_vod_categories", "get_vod_streams",
+        "get_series_categories", "get_series",
+        "get_all_channels", "get_all_streams", "get_all_live_streams",
+    ]);
+
+    if (action && CACHEABLE_ACTIONS.has(action)) {
+        const responseCacheKey = `xtream:${action}:${categoryId || "all"}`;
+        const cached = xtreamResponseCache.get(responseCacheKey);
+        const now = Date.now();
+        const freshMs = XTREAM_RESPONSE_CACHE_TTL_MS;      // 2 min fresh
+        const staleMs = freshMs * 2;                         // 4 min stale-while-revalidate
+
+        if (cached) {
+            const age = now - cached.at;
+            if (age < freshMs) {
+                // Fresh cache hit — return instantly
+                return withCors(new Response(cached.jsonStr, {
+                    headers: { "content-type": "application/json; charset=utf-8", "x-cache": "HIT" },
+                }));
+            }
+            if (age < staleMs) {
+                // Stale — return cached but refresh in background
+                waitUntil((async () => {
+                    try {
+                        const payload = await buildXtreamPayload(action, env, categoryId, request, user);
+                        const jsonStr = JSON.stringify(payload);
+                        rememberMapEntry(xtreamResponseCache, responseCacheKey, { at: Date.now(), jsonStr }, MAX_XTREAM_RESPONSE_CACHE_ENTRIES);
+                    } catch (e) { console.warn(`[xtream-cache] background refresh failed for ${action}: ${e?.message}`); }
+                })());
+                return withCors(new Response(cached.jsonStr, {
+                    headers: { "content-type": "application/json; charset=utf-8", "x-cache": "STALE" },
+                }));
+            }
+        }
+
+        // Cache miss — build and cache
+        const payload = await buildXtreamPayload(action, env, categoryId, request, user);
+        const jsonStr = JSON.stringify(payload);
+        rememberMapEntry(xtreamResponseCache, responseCacheKey, { at: now, jsonStr }, MAX_XTREAM_RESPONSE_CACHE_ENTRIES);
+        logXtreamAction(request, action, payload, { categoryId });
+        return withCors(new Response(jsonStr, {
+            headers: { "content-type": "application/json; charset=utf-8", "x-cache": "MISS" },
+        }));
+    }
+
+    // ── Non-cacheable actions (auth info, per-item lookups, EPG) ──────────────
     let payload;
     let logExtra = {};
     if (!action) {
         payload = xtreamUserInfoPayload(user, request, env);
-    } else if (action === "get_all_categories") {
-        payload = await xtreamAllCategoriesPayload(request, env, user);
-        logExtra = { mode: "dqvod_categories_envelope" };
-    } else if (action === "get_live_categories") {
-        payload = await xtreamLiveCategories(env);
-    } else if (action === "get_live_streams") {
-        payload = await xtreamLiveStreams(env, categoryId, request, user);
-        logExtra = { categoryId };
-    } else if (action === "get_vod_categories") {
-        payload = await xtreamVodCategories(env);
-    } else if (action === "get_vod_streams") {
-        payload = await xtreamVodStreams(env, categoryId);
-        logExtra = { categoryId };
     } else if (action === "get_vod_info") {
         const vodId = cleanString(url.searchParams.get("vod_id") || url.searchParams.get("movie_id") || url.searchParams.get("stream_id"));
         payload = await xtreamVodInfoPayload(env, vodId);
         logExtra = { id: vodId };
-    } else if (action === "get_series_categories") {
-        payload = await xtreamSeriesCategories(env);
-    } else if (action === "get_series") {
-        payload = await xtreamSeriesList(env, categoryId);
-        logExtra = { categoryId };
     } else if (action === "get_series_info") {
         const seriesId = cleanString(url.searchParams.get("series_id"));
         payload = await xtreamSeriesInfoPayload(env, seriesId);
         logExtra = { id: seriesId };
     } else if (action === "get_short_epg" || action === "get_simple_data_table") {
         payload = xtreamEmptyEpgPayload();
-    } else if (action === "get_all_channels" || action === "get_all_streams" || action === "get_all_live_streams") {
-        payload = await xtreamLiveStreams(env, categoryId, request, user);
-        logExtra = { categoryId };
     } else {
         console.warn(`[xtream] unsupported action=${action}; returning empty list`);
         payload = [];
@@ -6180,6 +6217,21 @@ async function handleXtreamApi(request, env, waitUntil) {
 
     logXtreamAction(request, action, payload, logExtra);
     return json(payload);
+}
+
+// Helper: builds the Xtream payload for a given action (extracted from handleXtreamApi)
+async function buildXtreamPayload(action, env, categoryId, request, user) {
+    if (action === "get_all_categories") return xtreamAllCategoriesPayload(request, env, user);
+    if (action === "get_live_categories") return xtreamLiveCategories(env);
+    if (action === "get_live_streams") return xtreamLiveStreams(env, categoryId, request, user);
+    if (action === "get_vod_categories") return xtreamVodCategories(env);
+    if (action === "get_vod_streams") return xtreamVodStreams(env, categoryId);
+    if (action === "get_series_categories") return xtreamSeriesCategories(env);
+    if (action === "get_series") return xtreamSeriesList(env, categoryId);
+    if (action === "get_all_channels" || action === "get_all_streams" || action === "get_all_live_streams") {
+        return xtreamLiveStreams(env, categoryId, request, user);
+    }
+    return [];
 }
 
 async function handleSystemApi(request, env) {
@@ -6441,6 +6493,7 @@ async function handleRequest(request, env, waitUntil) {
                 live_playlists: livePlaylistCache.size,
                 segments: segmentCache.size,
                 xtream_catalogs: xtreamCatalogCache.size,
+                xtream_responses: xtreamResponseCache.size,
             },
             requests: {
                 total: globalRequestCount,
