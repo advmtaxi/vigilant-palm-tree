@@ -1376,14 +1376,60 @@ async function saveCustomPlaylists(env, playlists) {
 function customCategoriesFile(env) {
     return envString(env, "CUSTOM_CATEGORIES_FILE", "custom-categories.json") || "custom-categories.json";
 }
+// ─── Hardcoded default category: always present at position 1 ────────────────
+const DEFAULT_WORLD_CUP_CATEGORY = {
+    id: "1781796727851764",
+    name: "WORLD CUP EVENTS | ADAM",
+    order: 0,
+    channelKeys: [
+        "7f044eae16a6d4915280","c617b4280b4323686bf5","5f9539f8c6910b76f8c3","6ae59c902ac29b98e0de",
+        "5d4ae36dafb49f3ecfaf","3dccad31d1f7e56597ec","d98e11c5bc363e46ca9c","fde346d47cd9c092a389",
+        "5f61a0f554559d957e26","88fc2823527708b86202","097bd25caca55f4ab891","9337418bb3c95fba784f",
+        "9d76515beeefaf1635be","4db79a571b1de5549f4e","d8d0a294cfe509ab8480","f124d6613581c0a90d87",
+        "ba4d2d0c7d978710752f","5fd093b444bf668cb085","ed4ad2c52823eb4a17a7","d7e9a09728dcf212112e",
+        "429590","71989","5bea60da1376411937d4","ec170e68542500365871","d968cacacb34d235aa3a",
+        "71988","1e9a0c4c4ab1bb997290","938e1f0dd22b8244927d","ed166719c1ae6ffc2b62",
+        "d1c39455f7381c3205b6","180cdb8c9ff176ca5710","f24b2937b417541af091","bf3ff045d54fde80cccd",
+        "57a3d10388283acf67e5","a712e421c88522e9cae4","64c23c899486d2eb8fdb","a7eda3ddb79f28c39909",
+        "2efa55fe58b04132d6ee","2c3053a4bc50093a4c29","9af9ac6825f6187aae0b","b1aad7b8c1bb3863d6ab",
+        "18fcc41404807ecc0d5f","571c602d3d3d2e4b92a9","49d4538abefc78b13e75","b24ef577092034e14eaa",
+        "36a109b5082f0bec83fa","cedb42b5526e6cbdbf91","614655747e8678ef7644","fc7c86196af98a677d3a",
+        "3efd38e1f707410f8360","3a81ce4bffa37a4fdde6","ccfaad79a9dee970867c","37741db7da914c6538c4",
+        "5f4094fc09850339b7a9","f81746361845d40a9b81","821c75b89519abdcb659","439211","439210",
+        "439209","76312","1028480","1028482","1028481","76310","76311",
+        "4fe20d719314f3f0051c","60f48c1cc58d516c3378","7dde78958ad84ec21cd6","4d331b46836520385ba7",
+        "d07430c410c6b56adbde","aeb118c6c7b2a99714a2","2fcda81be1b15e35cc2f","0c142971168dd5f6366e",
+        "4153612ff49856f3e387","61f1c498c60ff29cf306","87d9ba66799f85b50ced","58a995c08b4b7aad37b5",
+        "be5af498a03b3dc4a729","feab02bfad15de60fd51","52b98a26a0e343dbbfbb","b3a6269d9fed71028071",
+        "3ce309f2d1384ef5b2cd","67ff5a94840f3d92f093","a41146d0698d60ee8497","a885b67cb590f001714a",
+        "38c4c0a30c8cbe69605b","1d3a15ceadcf3f7a0252","6ffaab82ba6f58821ad5","72134bcf18a3f0d9ab5f",
+        "0e521b40eb59fcab9aa4","8fcca2c7f3ce86a393b9","d19b5ecb1a44ee24fa3b","1281523e4b5a14c9ab36",
+        "16d6e58ecd4e0352df53","43b04d39f60e3cca00dc","dc6160df45aca57469ad","4cb0c8d5dc2ad245ef44",
+        "71741fd03de823adf4db","f9f58983c064784c5bb0","eafc87c936ec306cd488","c386dfcb051f49b17a80",
+        "9b9b05a855f858f8574c","335fe0b40202a1aabf3e","ef674a3979052f5e5eb4",
+    ],
+};
+
+function ensureWorldCupCategory(categories) {
+    // Always inject the World Cup category at the top if not already present
+    const existing = categories.findIndex(c => c.id === DEFAULT_WORLD_CUP_CATEGORY.id);
+    if (existing >= 0) {
+        // Update it in place with the latest channel keys, keep it at its position
+        categories[existing] = { ...categories[existing], channelKeys: DEFAULT_WORLD_CUP_CATEGORY.channelKeys, name: DEFAULT_WORLD_CUP_CATEGORY.name };
+        return categories;
+    }
+    // Prepend it — shift all other orders down
+    return [DEFAULT_WORLD_CUP_CATEGORY, ...categories];
+}
 
 async function loadCustomCategories(env) {
     try {
         const text = await fs.readFile(customCategoriesFile(env), "utf8");
         const data = JSON.parse(text);
-        return Array.isArray(data?.categories) ? data.categories : [];
+        const cats = Array.isArray(data?.categories) ? data.categories : [];
+        return ensureWorldCupCategory(cats);
     } catch (error) {
-        if (error && error.code === "ENOENT") return [];
+        if (error && error.code === "ENOENT") return ensureWorldCupCategory([]);
         throw error;
     }
 }
@@ -6776,7 +6822,7 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use(express.raw({ type: "*/*", limit: "64kb" }));
+app.use(express.raw({ type: "*/*", limit: "50mb" }));
 
 async function pipeWebResponse(webResponse, res) {
     res.status(webResponse.status);
