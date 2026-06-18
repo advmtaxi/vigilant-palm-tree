@@ -93,6 +93,19 @@ let globalSegmentCacheHits = 0;
 let globalSegmentCacheMisses = 0;
 const serverStartedAt = Date.now();
 
+// ─── Bunny CDN Pull Zone Integration ────────────────────────────────────────
+// Automatically creates Bunny CDN pull zones for IPTV origins so segments
+// are served from Bunny's global edge network instead of through our server.
+const BUNNY_API_BASE = "https://api.bunny.net";
+const BUNNY_DATA_DIR = process.env.BUNNY_DATA_DIR || "/data";
+const BUNNY_PULLZONE_DATA_FILE = `${BUNNY_DATA_DIR}/bunny-pullzones.json`;
+const BUNNY_PULLZONE_CACHE_TTL_MS = (Number.parseInt(process.env.BUNNY_PULLZONE_CACHE_TTL_HOURS, 10) || 24) * 3600_000;
+const BUNNY_SEGMENT_CACHE_SEC = Number.parseInt(process.env.BUNNY_PULLZONE_SEGMENT_CACHE_SEC, 10) || 60;
+const bunnyPullZoneCache = new Map();    // origin → { hostname, pullZoneId, createdAt }
+const bunnyPullZoneInflight = new Map(); // origin → Promise<{ hostname, pullZoneId } | null>
+let bunnyInitialized = false;
+let bunnyEnabled = false; // set to true at startup if BUNNY_API_KEY is present
+
 // ─── Stream Warmup / Loading Video ──────────────────────────────────────────
 const streamWarmupState = new Map();
 const MAX_WARMUP_ENTRIES = 500;
@@ -515,6 +528,302 @@ function cleanupSegmentCache() {
     while (segmentCache.size > MAX_SEGMENT_CACHE_ENTRIES) {
         segmentCache.delete(segmentCache.keys().next().value);
     }
+}
+
+// ─── Bunny CDN Pull Zone Management ─────────────────────────────────────────
+// Creates and manages Bunny CDN pull zones for IPTV upstream origins.
+// Segments (.ts, .m4s) are served through Bunny CDN instead of our proxy.
+// If anything fails, getBunnyCdnSegmentUrl() returns null and the caller
+// falls back to the existing /upseg/ proxy path.
+
+async function bunnyApiRequest(method, path, body, env) {
+    const apiKey = envString(env, "BUNNY_API_KEY");
+    if (!apiKey) return null;
+    const url = `${BUNNY_API_BASE}${path}`;
+    const headers = {
+        "AccessKey": apiKey,
+        "Accept": "application/json",
+    };
+    const init = { method, headers, redirect: "follow" };
+    if (body && (method === "POST" || method === "PUT")) {
+        headers["Content-Type"] = "application/json";
+        init.body = JSON.stringify(body);
+    }
+    try {
+        const response = await fetchWithTimeout(url, init, 15000);
+        const text = await response.text();
+        if (!response.ok) {
+            console.warn(`[bunny-cdn] API ${method} ${path} → HTTP ${response.status}: ${text.slice(0, 300)}`);
+            return { ok: false, status: response.status, data: null, raw: text };
+        }
+        const data = text ? JSON.parse(text) : null;
+        return { ok: true, status: response.status, data };
+    } catch (err) {
+        console.error(`[bunny-cdn] API ${method} ${path} FAILED: ${err?.message || err}`);
+        return null;
+    }
+}
+
+async function generatePullZoneName(origin) {
+    // Deterministic name from origin hash so we always map the same origin to the same pull zone
+    const hash = await sha1Hex(origin);
+    // Bunny zone names: lowercase, alphanumeric + hyphens, 3-63 chars
+    return `iptv-${hash.slice(0, 12)}`;
+}
+
+async function loadBunnyPullZones(env) {
+    const filePath = envString(env, "BUNNY_PULLZONE_DATA_FILE") || BUNNY_PULLZONE_DATA_FILE;
+    try {
+        const text = await fs.readFile(filePath, "utf8");
+        const data = JSON.parse(text);
+        if (data && typeof data === "object" && data.pullZones) {
+            const entries = Object.entries(data.pullZones);
+            for (const [origin, info] of entries) {
+                if (info && info.hostname && info.pullZoneId) {
+                    bunnyPullZoneCache.set(origin, {
+                        hostname: info.hostname,
+                        pullZoneId: info.pullZoneId,
+                        createdAt: info.createdAt || Date.now(),
+                    });
+                }
+            }
+            console.log(`[bunny-cdn] loaded ${entries.length} pull zone mapping(s) from disk`);
+            return entries.length;
+        }
+    } catch (err) {
+        if (err?.code !== "ENOENT") {
+            console.warn(`[bunny-cdn] failed to load pull zones from ${filePath}: ${err?.message}`);
+        }
+    }
+    return 0;
+}
+
+async function saveBunnyPullZones(env) {
+    const filePath = envString(env, "BUNNY_PULLZONE_DATA_FILE") || BUNNY_PULLZONE_DATA_FILE;
+    const pullZones = {};
+    for (const [origin, info] of bunnyPullZoneCache) {
+        pullZones[origin] = {
+            hostname: info.hostname,
+            pullZoneId: info.pullZoneId,
+            createdAt: info.createdAt,
+        };
+    }
+    const payload = {
+        updatedAt: new Date().toISOString(),
+        pullZones,
+    };
+    try {
+        // Ensure the data directory exists
+        const dir = filePath.slice(0, filePath.lastIndexOf("/"));
+        if (dir) await fs.mkdir(dir, { recursive: true }).catch(() => null);
+        await fs.writeFile(filePath, JSON.stringify(payload, null, 2) + "\n", "utf8");
+        console.log(`[bunny-cdn] saved ${bunnyPullZoneCache.size} pull zone mapping(s) to disk`);
+    } catch (err) {
+        console.warn(`[bunny-cdn] failed to save pull zones to ${filePath}: ${err?.message}`);
+    }
+}
+
+async function listBunnyPullZones(env) {
+    const result = await bunnyApiRequest("GET", "/pullzone?page=0&perPage=1000", null, env);
+    if (!result?.ok || !result.data) return [];
+    // Response is { Items: [...], TotalItems: N } or just an array
+    return Array.isArray(result.data) ? result.data : (Array.isArray(result.data?.Items) ? result.data.Items : []);
+}
+
+async function findExistingPullZone(env, originUrl, zoneName) {
+    const allZones = await listBunnyPullZones(env);
+    // First try to find by origin URL match
+    for (const zone of allZones) {
+        const zoneOrigin = (zone.OriginUrl || "").replace(/\/+$/, "");
+        if (zoneOrigin === originUrl.replace(/\/+$/, "")) {
+            const hostname = zone.Hostnames?.[0]?.Value || `${zone.Name}.b-cdn.net`;
+            console.log(`[bunny-cdn] found existing pull zone "${zone.Name}" (ID ${zone.Id}) for origin ${originUrl}`);
+            return { hostname, pullZoneId: zone.Id, name: zone.Name };
+        }
+    }
+    // Then try by name
+    for (const zone of allZones) {
+        if (zone.Name === zoneName) {
+            const hostname = zone.Hostnames?.[0]?.Value || `${zone.Name}.b-cdn.net`;
+            console.log(`[bunny-cdn] found existing pull zone by name "${zoneName}" (ID ${zone.Id})`);
+            return { hostname, pullZoneId: zone.Id, name: zone.Name };
+        }
+    }
+    return null;
+}
+
+async function createBunnyPullZone(env, originUrl, zoneName) {
+    const segmentCacheSec = envInt(env, "BUNNY_PULLZONE_SEGMENT_CACHE_SEC", BUNNY_SEGMENT_CACHE_SEC);
+    const body = {
+        Name: zoneName,
+        OriginUrl: originUrl,
+        EnableGeoZoneUS: true,
+        EnableGeoZoneEU: true,
+        EnableGeoZoneASIA: true,
+        EnableGeoZoneSA: true,
+        EnableGeoZoneAF: true,
+        CacheControlMaxAgeOverride: segmentCacheSec,
+        CacheControlPublicMaxAgeOverride: segmentCacheSec,
+        FollowRedirects: true,
+        DisableCookies: true,
+        ConnectionLimitPerIPCount: 0,
+        IgnoreQueryStrings: false,
+        AddHostHeader: false,
+        EnableTLS1: true,
+        EnableTLS1_1: true,
+        VerifyOriginSSL: false,         // IPTV origins often have invalid certs
+        UseStaleWhileUpdating: true,
+        UseStaleWhileOffline: true,
+        EnableSmartCache: false,        // We control caching explicitly
+        Type: 0,                        // Standard pull zone
+    };
+
+    const result = await bunnyApiRequest("POST", "/pullzone", body, env);
+    if (!result) return null;
+
+    if (result.ok && result.data) {
+        const zone = result.data;
+        const hostname = zone.Hostnames?.[0]?.Value || `${zone.Name || zoneName}.b-cdn.net`;
+        console.log(`[bunny-cdn] ✓ created pull zone "${zone.Name}" (ID ${zone.Id}) → ${hostname} for origin ${originUrl}`);
+        return { hostname, pullZoneId: zone.Id, name: zone.Name };
+    }
+
+    // 409 = name conflict — zone with this name already exists
+    if (result.status === 409) {
+        console.log(`[bunny-cdn] pull zone name "${zoneName}" already exists, searching for existing zone...`);
+        return findExistingPullZone(env, originUrl, zoneName);
+    }
+
+    console.error(`[bunny-cdn] failed to create pull zone "${zoneName}" for ${originUrl}: HTTP ${result.status}`);
+    return null;
+}
+
+async function getOrCreateBunnyPullZone(originUrl, env) {
+    if (!bunnyEnabled) return null;
+    const origin = originUrl.replace(/\/+$/, "");
+
+    // 1. Check in-memory cache
+    const cached = bunnyPullZoneCache.get(origin);
+    if (cached && (Date.now() - cached.createdAt < BUNNY_PULLZONE_CACHE_TTL_MS)) {
+        return cached;
+    }
+
+    // 2. Inflight deduplication — don't create the same pull zone concurrently
+    const existing = bunnyPullZoneInflight.get(origin);
+    if (existing) return existing;
+
+    const promise = (async () => {
+        try {
+            const zoneName = await generatePullZoneName(origin);
+
+            // Try to create — if it already exists, findExisting will pick it up
+            const zone = await createBunnyPullZone(env, origin, zoneName)
+                      || await findExistingPullZone(env, origin, zoneName);
+
+            if (zone) {
+                const entry = {
+                    hostname: zone.hostname,
+                    pullZoneId: zone.pullZoneId,
+                    createdAt: Date.now(),
+                };
+                bunnyPullZoneCache.set(origin, entry);
+                // Persist to disk so next restart is instant
+                void saveBunnyPullZones(env);
+                return entry;
+            }
+            console.warn(`[bunny-cdn] could not create or find pull zone for ${origin}`);
+            return null;
+        } catch (err) {
+            console.error(`[bunny-cdn] getOrCreateBunnyPullZone failed for ${origin}: ${err?.message || err}`);
+            return null;
+        }
+    })();
+
+    bunnyPullZoneInflight.set(origin, promise);
+    try {
+        return await promise;
+    } finally {
+        if (bunnyPullZoneInflight.get(origin) === promise) {
+            bunnyPullZoneInflight.delete(origin);
+        }
+    }
+}
+
+/**
+ * Fast synchronous lookup: returns the Bunny CDN URL for a segment, or null.
+ * This is called during playlist rewriting for every segment URL in every M3U8.
+ * It MUST be fast — only checks the in-memory cache, never makes API calls.
+ *
+ * If the origin isn't cached yet, returns null (caller uses /upseg/ fallback)
+ * and kicks off async pull zone creation in the background.
+ */
+function getBunnyCdnSegmentUrl(absoluteUrl, env) {
+    if (!bunnyEnabled) return null;
+    try {
+        const parsed = new URL(absoluteUrl);
+        const origin = parsed.origin;
+        const cached = bunnyPullZoneCache.get(origin);
+        if (cached && cached.hostname) {
+            // Replace origin with Bunny CDN, preserve full path + query
+            return `https://${cached.hostname}${parsed.pathname}${parsed.search}`;
+        }
+        // Origin not yet in cache — kick off async creation (don't await)
+        if (!bunnyPullZoneInflight.has(origin)) {
+            void getOrCreateBunnyPullZone(origin, env).catch(() => null);
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Startup initialization: load saved pull zones from disk and pre-create
+ * pull zones for all configured IPTV provider origins.
+ */
+async function initBunnyPullZones(env) {
+    const apiKey = envString(env, "BUNNY_API_KEY");
+    if (!apiKey) {
+        console.log("[bunny-cdn] BUNNY_API_KEY not set — Bunny CDN integration disabled (using proxy fallback)");
+        bunnyEnabled = false;
+        bunnyInitialized = true;
+        return;
+    }
+
+    if (envString(env, "BUNNY_ENABLED", "true").toLowerCase() === "false") {
+        console.log("[bunny-cdn] BUNNY_ENABLED=false — Bunny CDN integration disabled");
+        bunnyEnabled = false;
+        bunnyInitialized = true;
+        return;
+    }
+
+    bunnyEnabled = true;
+    console.log("[bunny-cdn] initializing Bunny CDN pull zone integration...");
+
+    // 1. Load saved pull zone mappings from persistent storage
+    await loadBunnyPullZones(env);
+
+    // 2. Pre-create pull zones for all configured IPTV provider origins
+    const sources = buildProviderPlaylistSources(env);
+    const origins = new Set();
+    for (const source of sources) {
+        try {
+            const parsed = new URL(source.url);
+            origins.add(parsed.origin);
+        } catch { /* skip invalid URLs */ }
+    }
+
+    if (origins.size > 0) {
+        console.log(`[bunny-cdn] pre-creating pull zones for ${origins.size} IPTV origin(s)...`);
+        const results = await Promise.allSettled(
+            [...origins].map(origin => getOrCreateBunnyPullZone(origin, env))
+        );
+        const created = results.filter(r => r.status === "fulfilled" && r.value).length;
+        const failed = results.length - created;
+        console.log(`[bunny-cdn] initialization complete: ${created} pull zone(s) ready, ${failed} failed/skipped`);
+    }
+
+    bunnyInitialized = true;
 }
 
 // ─── Custom Servers Storage ──────────────────────────────────────────────────
@@ -2551,6 +2860,10 @@ function dashboardPage() {
           <div class="stat-label">Heap Memory Usage</div>
           <div class="stat-value" id="stat-memory">0 MB</div>
         </div>
+        <div class="stat-card">
+          <div class="stat-label">🐰 Bunny CDN Pull Zones</div>
+          <div class="stat-value" id="stat-bunny">—</div>
+        </div>
       </div>
       
       <div class="grid two-cols">
@@ -3082,6 +3395,21 @@ function dashboardPage() {
         const hitrate = cacheTotal > 0 ? Math.round((data.requests.segment_cache_hits / cacheTotal) * 100) : 0;
         document.getElementById("stat-hitrate").textContent = hitrate + "% (" + data.requests.segment_cache_hits + "/" + cacheTotal + ")";
         document.getElementById("stat-memory").textContent = data.memory.heap_used_mb + " MB / " + data.memory.heap_total_mb + " MB";
+
+        // Bunny CDN stat
+        const bunnyEl = document.getElementById("stat-bunny");
+        if (bunnyEl && data.bunny_cdn) {
+          if (data.bunny_cdn.enabled) {
+            bunnyEl.textContent = data.bunny_cdn.pull_zones_count + " Active";
+            bunnyEl.style.background = "linear-gradient(135deg, #f97316 0%, #eab308 100%)";
+            bunnyEl.style.webkitBackgroundClip = "text";
+            bunnyEl.style.webkitTextFillColor = "transparent";
+          } else {
+            bunnyEl.textContent = "Disabled";
+            bunnyEl.style.background = "none";
+            bunnyEl.style.webkitTextFillColor = "var(--text-muted)";
+          }
+        }
 
         // Circuit breakers list
         const circuitsEl = document.getElementById("health-circuits");
@@ -4455,13 +4783,25 @@ function trimLivePlaylistText(text, env) {
 
 async function upstreamAssetUrl(key, absoluteUrl, request, env, playlistUrl) {
     const httpsFallback = httpsFallbackCandidate(absoluteUrl, env);
-    const path = new URL(absoluteUrl).pathname;
+    const parsed = new URL(absoluteUrl);
+    const path = parsed.pathname;
     const filenameParts = path.split("/").filter(Boolean);
     const filename = filenameParts[filenameParts.length - 1] || "segment.bin";
+
+    // M3U8 nested playlists always go through our server (they need content rewriting)
+    if (path.toLowerCase().endsWith(".m3u8")) {
+        const token = await makeUrlToken({ u: absoluteUrl, r: playlistUrl, f: httpsFallback || undefined }, env);
+        const base = streamBase(request, env);
+        return `${base}/uplive/${key}/${token}.m3u8`;
+    }
+
+    // For segments (.ts, .m4s, etc.): try Bunny CDN first, fall back to proxy
+    const bunnyUrl = getBunnyCdnSegmentUrl(absoluteUrl, env);
+    if (bunnyUrl) return bunnyUrl;
+
+    // Fallback: proxy through our server (existing behavior)
     const token = await makeUrlToken({ u: absoluteUrl, r: playlistUrl, f: httpsFallback || undefined }, env);
-    // Use CDN base for segments so .ts files are served/cached through the CDN
     const base = streamBase(request, env);
-    if (path.toLowerCase().endsWith(".m3u8")) return `${base}/uplive/${key}/${token}.m3u8`;
     return `${base}/upseg/${key}/${token}/${filename}`;
 }
 
@@ -6031,7 +6371,7 @@ async function handleRequest(request, env, waitUntil) {
             build: APP_BUILD_ID,
             xtream_compatibility: "get_all_categories returns a categories envelope",
             updated_at: "2026-06-17T00:00:00+02:00",
-            features: ["low-latency-3seg", "segment-retry", "circuit-breaker", "cdn-cache-control", "server-management"],
+            features: ["low-latency-3seg", "segment-retry", "circuit-breaker", "cdn-cache-control", "server-management", "bunny-cdn-pullzone"],
         });
     }
 
@@ -6073,6 +6413,17 @@ async function handleRequest(request, env, waitUntil) {
                 lastSuccess: stats.lastSuccess ? new Date(stats.lastSuccess).toISOString() : null,
                 lastFailure: stats.lastFailure ? new Date(stats.lastFailure).toISOString() : null,
             })),
+            bunny_cdn: {
+                enabled: bunnyEnabled,
+                initialized: bunnyInitialized,
+                pull_zones_count: bunnyPullZoneCache.size,
+                pull_zones: [...bunnyPullZoneCache.entries()].map(([origin, info]) => ({
+                    origin,
+                    hostname: info.hostname,
+                    pull_zone_id: info.pullZoneId,
+                    age_hours: Math.round((Date.now() - info.createdAt) / 3600_000 * 10) / 10,
+                })),
+            },
         };
         return json(healthData);
     }
@@ -6565,7 +6916,15 @@ async function prewarmCaches() {
         console.log(`[cache] playlist channels restored from disk: ${playlistChannelCache.channels.length} channels`);
     }
 
-    // 3. Kick off live refresh in background (don't block startup)
+    // 3. Initialize Bunny CDN pull zones (load from disk + pre-create for known origins)
+    try {
+        await initBunnyPullZones(env);
+    } catch (err) {
+        console.warn("[bunny-cdn] initialization failed (falling back to proxy):", err?.message);
+        bunnyEnabled = false;
+    }
+
+    // 4. Kick off live refresh in background (don't block startup)
     void doRefreshChannels(env).catch((err) => console.warn("[cache] background channel refresh failed:", err?.message));
     void doRefreshPlaylistChannels(env).catch((err) => console.warn("[cache] background playlist refresh failed:", err?.message));
 }
