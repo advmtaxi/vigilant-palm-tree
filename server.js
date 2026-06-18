@@ -100,11 +100,15 @@ const BUNNY_API_BASE = "https://api.bunny.net";
 const BUNNY_DATA_DIR = process.env.BUNNY_DATA_DIR || "/data";
 const BUNNY_PULLZONE_DATA_FILE = `${BUNNY_DATA_DIR}/bunny-pullzones.json`;
 const BUNNY_PULLZONE_CACHE_TTL_MS = (Number.parseInt(process.env.BUNNY_PULLZONE_CACHE_TTL_HOURS, 10) || 24) * 3600_000;
-const BUNNY_SEGMENT_CACHE_SEC = Number.parseInt(process.env.BUNNY_PULLZONE_SEGMENT_CACHE_SEC, 10) || 30;
+const BUNNY_SEGMENT_CACHE_SEC = Number.parseInt(process.env.BUNNY_PULLZONE_SEGMENT_CACHE_SEC, 10) || 5;
 const bunnyPullZoneCache = new Map();    // origin → { hostname, pullZoneId, createdAt }
 const bunnyPullZoneInflight = new Map(); // origin → Promise<{ hostname, pullZoneId } | null>
 let bunnyInitialized = false;
 let bunnyEnabled = false; // set to true at startup if BUNNY_API_KEY is present
+
+// ─── Open Access Mode ───────────────────────────────────────────────────────
+// When enabled, ANY username/password combination is accepted for Xtream auth.
+let openAccessMode = false;
 
 // ─── Stream Warmup / Loading Video ──────────────────────────────────────────
 const streamWarmupState = new Map();
@@ -659,10 +663,10 @@ async function findExistingPullZone(env, originUrl, zoneName) {
     return null;
 }
 
-async function createBunnyPullZone(env, originUrl, zoneName) {
+// Build the pull zone settings body used for both create and update
+function bunnyPullZoneSettings(env, originUrl) {
     const segmentCacheSec = envInt(env, "BUNNY_PULLZONE_SEGMENT_CACHE_SEC", BUNNY_SEGMENT_CACHE_SEC);
-    const body = {
-        Name: zoneName,
+    return {
         OriginUrl: originUrl,
         EnableGeoZoneUS: true,
         EnableGeoZoneEU: true,
@@ -679,11 +683,15 @@ async function createBunnyPullZone(env, originUrl, zoneName) {
         EnableTLS1: true,
         EnableTLS1_1: true,
         VerifyOriginSSL: false,         // IPTV origins often have invalid certs
-        UseStaleWhileUpdating: true,
-        UseStaleWhileOffline: true,
+        UseStaleWhileUpdating: false,   // CRITICAL: don't serve stale segments for live TV!
+        UseStaleWhileOffline: false,    // CRITICAL: don't serve stale when origin is down
         EnableSmartCache: false,        // We control caching explicitly
         Type: 0,                        // Standard pull zone
     };
+}
+
+async function createBunnyPullZone(env, originUrl, zoneName) {
+    const body = { Name: zoneName, ...bunnyPullZoneSettings(env, originUrl) };
 
     const result = await bunnyApiRequest("POST", "/pullzone", body, env);
     if (!result) return null;
@@ -698,11 +706,31 @@ async function createBunnyPullZone(env, originUrl, zoneName) {
     // 409 = name conflict — zone with this name already exists
     if (result.status === 409) {
         console.log(`[bunny-cdn] pull zone name "${zoneName}" already exists, searching for existing zone...`);
-        return findExistingPullZone(env, originUrl, zoneName);
+        const existing = await findExistingPullZone(env, originUrl, zoneName);
+        // Update existing zone to ensure correct cache settings
+        if (existing) await updateBunnyPullZone(env, existing.pullZoneId, originUrl);
+        return existing;
     }
 
     console.error(`[bunny-cdn] failed to create pull zone "${zoneName}" for ${originUrl}: HTTP ${result.status}`);
     return null;
+}
+
+// Update an existing pull zone's settings (fixes stale cache issues)
+async function updateBunnyPullZone(env, pullZoneId, originUrl) {
+    const body = bunnyPullZoneSettings(env, originUrl);
+    const result = await bunnyApiRequest("POST", `/pullzone/${pullZoneId}`, body, env);
+    if (result?.ok) {
+        console.log(`[bunny-cdn] ✓ updated pull zone ${pullZoneId} with fresh cache settings (${BUNNY_SEGMENT_CACHE_SEC}s TTL, no stale)`);
+    } else {
+        console.warn(`[bunny-cdn] failed to update pull zone ${pullZoneId}: ${result?.status || 'no response'}`);
+    }
+    // Also purge the cache to clear any stale content
+    const purgeResult = await bunnyApiRequest("POST", `/pullzone/${pullZoneId}/purgeCache`, {}, env);
+    if (purgeResult?.ok) {
+        console.log(`[bunny-cdn] ✓ purged cache for pull zone ${pullZoneId}`);
+    }
+    return result?.ok || false;
 }
 
 async function getOrCreateBunnyPullZone(originUrl, env) {
@@ -771,8 +799,12 @@ function getBunnyCdnSegmentUrl(absoluteUrl, env) {
         const origin = parsed.origin;
         const cached = bunnyPullZoneCache.get(origin);
         if (cached && cached.hostname) {
-            // Replace origin with Bunny CDN, preserve full path + query
-            return `https://${cached.hostname}${parsed.pathname}${parsed.search}`;
+            // Cache-busting: add a timestamp bucket so Bunny CDN never serves stale live segments.
+            // Each 5-second window gets a unique URL → Bunny fetches fresh from origin.
+            const bustSec = Math.max(5, BUNNY_SEGMENT_CACHE_SEC);
+            const timeBucket = Math.floor(Date.now() / (bustSec * 1000));
+            const sep = parsed.search ? "&" : "?";
+            return `https://${cached.hostname}${parsed.pathname}${parsed.search}${sep}_b=${timeBucket}`;
         }
         // Origin not yet in cache — kick off async creation (don't await)
         if (!bunnyPullZoneInflight.has(origin)) {
@@ -810,7 +842,22 @@ async function initBunnyPullZones(env) {
     // 1. Load saved pull zone mappings from persistent storage
     await loadBunnyPullZones(env);
 
-    // 2. Pre-create pull zones for all configured IPTV provider origins
+    // 2. Update ALL existing pull zones with correct cache settings (fix stale issues)
+    if (bunnyPullZoneCache.size > 0) {
+        console.log(`[bunny-cdn] updating ${bunnyPullZoneCache.size} existing pull zone(s) with fresh cache settings...`);
+        const updatePromises = [];
+        for (const [origin, info] of bunnyPullZoneCache) {
+            if (info.pullZoneId) {
+                updatePromises.push(
+                    updateBunnyPullZone(env, info.pullZoneId, origin).catch(e =>
+                        console.warn(`[bunny-cdn] failed to update zone ${info.pullZoneId}: ${e?.message}`))
+                );
+            }
+        }
+        await Promise.allSettled(updatePromises);
+    }
+
+    // 3. Pre-create pull zones for all configured IPTV provider origins
     const sources = buildProviderPlaylistSources(env);
     const origins = new Set();
     for (const source of sources) {
@@ -1487,6 +1534,21 @@ function providerXtreamCredentials(env) {
 }
 
 async function resolveXtreamUser(env, username, password) {
+    // Open access mode: accept any credentials
+    if (openAccessMode && username && password) {
+        return {
+            username,
+            password,
+            createdAt: new Date().toISOString(),
+            expiresAt: null,
+            disabled: false,
+            includeLive: true,
+            includeMovies: true,
+            includeSeries: true,
+            _openAccess: true,
+        };
+    }
+
     const users = await loadAccessUsers(env);
     const user = users.find((entry) => entry.username === username && entry.password === password);
     if (user && !user.disabled && !isAccessUserExpired(user)) return user;
@@ -3124,6 +3186,20 @@ function dashboardPage() {
     
     <!-- Tab 5: Access Users -->
     <div id="tab-users" class="tab-content">
+      <!-- Open Access Toggle -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-body" style="display:flex; align-items:center; justify-content:space-between; padding:16px 24px">
+          <div>
+            <h3 style="margin:0; font-size:1rem; color:var(--text-primary)">🔓 Open Access Mode</h3>
+            <p style="margin:4px 0 0; font-size:0.85rem; color:var(--text-muted)">When enabled, <strong>any</strong> username &amp; password will be accepted. Useful for testing.</p>
+          </div>
+          <label style="position:relative;display:inline-block;width:56px;height:30px;flex-shrink:0">
+            <input type="checkbox" id="open-access-toggle" onchange="toggleOpenAccess(this.checked)" style="opacity:0;width:0;height:0">
+            <span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:rgba(255,255,255,0.1);transition:.3s;border-radius:30px"></span>
+            <span id="open-access-slider" style="position:absolute;content:'';height:22px;width:22px;left:4px;bottom:4px;background:white;transition:.3s;border-radius:50%"></span>
+          </label>
+        </div>
+      </div>
       <div class="grid two-cols">
         <div class="card">
           <div class="card-header">
@@ -3283,6 +3359,49 @@ function dashboardPage() {
     function generateRandomPass() {
       userFormPassword.value = randomString();
       userFormPassword.focus();
+    }
+
+    // ─── Open Access Toggle ───
+    async function toggleOpenAccess(enabled) {
+      try {
+        const res = await fetch("/api/open-access", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        if (!res.ok) throw new Error("Failed to toggle");
+        const slider = document.getElementById("open-access-slider");
+        const bg = document.getElementById("open-access-toggle").parentElement.querySelector("span");
+        if (enabled) {
+          slider.style.transform = "translateX(26px)";
+          bg.style.background = "linear-gradient(135deg, #22c55e, #16a34a)";
+          showToast("🔓 Open Access ENABLED — all credentials accepted", "success");
+        } else {
+          slider.style.transform = "translateX(0)";
+          bg.style.background = "rgba(255,255,255,0.1)";
+          showToast("🔒 Open Access DISABLED — normal auth restored", "info");
+        }
+      } catch (err) {
+        showToast("Error toggling open access: " + err.message, "error");
+        document.getElementById("open-access-toggle").checked = !enabled;
+      }
+    }
+
+    // Load initial open access state
+    async function loadOpenAccessState() {
+      try {
+        const res = await fetch("/api/open-access");
+        if (!res.ok) return;
+        const data = await res.json();
+        const toggle = document.getElementById("open-access-toggle");
+        const slider = document.getElementById("open-access-slider");
+        const bg = toggle.parentElement.querySelector("span");
+        toggle.checked = data.open_access;
+        if (data.open_access) {
+          slider.style.transform = "translateX(26px)";
+          bg.style.background = "linear-gradient(135deg, #22c55e, #16a34a)";
+        }
+      } catch { /* ignore */ }
     }
 
     // ─── Phase 2: Providers ───
@@ -4418,6 +4537,9 @@ function dashboardPage() {
       
       // Load Access users list
       await loadUsers();
+      
+      // Load open access toggle state
+      await loadOpenAccessState();
       
       // Load custom playlists
       await loadPlaylists();
@@ -6457,7 +6579,8 @@ async function handleRequest(request, env, waitUntil) {
         path === "/api/custom-playlists/delete" || path === "/api/custom-playlists/import" ||
         path === "/api/custom-categories/save" ||
         path === "/api/servers" || path === "/api/servers/update" ||
-        path === "/api/servers/delete" || path === "/api/servers/test"
+        path === "/api/servers/delete" || path === "/api/servers/test" ||
+        path === "/api/open-access"
     );
 
     if (request.method !== "GET" && request.method !== "HEAD" && !isDashboardMutation) {
@@ -6635,6 +6758,19 @@ async function handleRequest(request, env, waitUntil) {
 
     if (path === "/api/access-users/delete" && request.method === "POST") {
         return deleteAccessUser(request, env);
+    }
+
+    // ─── Open Access Mode API ─────────────────────────────────────────────────────
+    if (path === "/api/open-access" && request.method === "GET") {
+        if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+        return json({ status: "ok", open_access: openAccessMode });
+    }
+    if (path === "/api/open-access" && request.method === "POST") {
+        if (!dashboardAuthorized(request, env)) return dashboardAuthResponse();
+        const data = await readRequestData(request);
+        openAccessMode = Boolean(data.enabled);
+        console.log(`[auth] Open access mode ${openAccessMode ? "ENABLED — all credentials accepted" : "DISABLED — normal auth"}`);
+        return json({ status: "ok", open_access: openAccessMode });
     }
 
     // ─── Custom Categories API ─────────────────────────────────────────────────
