@@ -114,8 +114,8 @@ let openAccessMode = false;
 const streamWarmupState = new Map();
 const MAX_WARMUP_ENTRIES = 500;
 const WARMUP_EXPIRY_MS = 120_000;
-const LOADING_VIDEO_URL = "https://pub-170b5f1508954220a1c673d1ae1baaae.r2.dev/TaxiDevLoad.mp4";
-const WARMUP_REQUIRED_SEGMENTS = 2;
+const LOADING_VIDEO_URL = "";
+const WARMUP_REQUIRED_SEGMENTS = 0;
 
 // Disk-persist cache paths
 const CHANNEL_DISK_CACHE_FILE = process.env.CHANNEL_DISK_CACHE_FILE || "channel-cache.json";
@@ -132,7 +132,7 @@ const MAX_GENERATED_PLAYLIST_CACHE_ENTRIES = 200;
 // Caches fully-built Xtream API responses (get_live_streams, get_live_categories, etc.)
 // so IPTV receivers get instant responses from cache instead of rebuilding every time.
 const xtreamResponseCache = new Map(); // cacheKey → { at, payload (JSON string) }
-const XTREAM_RESPONSE_CACHE_TTL_MS = 120_000; // 2 minutes — fast enough for live TV
+const XTREAM_RESPONSE_CACHE_TTL_MS = 600_000; // 10 minutes — less laggy
 const MAX_XTREAM_RESPONSE_CACHE_ENTRIES = 50;
 
 const ACCESS_DURATION_MONTHS = {
@@ -5251,7 +5251,7 @@ async function proxyProgressiveStream(sourceUrl, request, env) {
 }
 
 async function proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, cacheKey) {
-    const warmupEnabled = envBool(env, "LOADING_VIDEO_ENABLED", true);
+    const warmupEnabled = envBool(env, "LOADING_VIDEO_ENABLED", false);
     const requiredSegments = envInt(env, "WARMUP_REQUIRED_SEGMENTS", WARMUP_REQUIRED_SEGMENTS);
     const now = Date.now();
     const freshMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", 2000));
@@ -6308,7 +6308,18 @@ async function handleXtreamApi(request, env, waitUntil) {
         }
 
         // Cache miss — build and cache
-        const payload = await buildXtreamPayload(action, env, categoryId, request, user);
+        let payload;
+        try {
+            payload = await buildXtreamPayload(action, env, categoryId, request, user);
+        } catch (err) {
+            console.error(`[xtream] buildXtreamPayload failed for ${action}: ${err.message}`);
+            if (cached) {
+                return withCors(new Response(cached.jsonStr, {
+                    headers: { "content-type": "application/json; charset=utf-8", "x-cache": "STALE-ERROR" },
+                }));
+            }
+            payload = [];
+        }
         const jsonStr = JSON.stringify(payload);
         rememberMapEntry(xtreamResponseCache, responseCacheKey, { at: now, jsonStr }, MAX_XTREAM_RESPONSE_CACHE_ENTRIES);
         logXtreamAction(request, action, payload, { categoryId });
