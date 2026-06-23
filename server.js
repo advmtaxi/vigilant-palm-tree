@@ -4762,8 +4762,8 @@ async function fetchProviderPlaylist(env, url) {
 
 // ─── FIXED: fetchHls with retry, logging, and timeout protection
 async function fetchHls(url, env, referer) {
-    const timeoutMs = envInt(env, "HLS_FETCH_TIMEOUT_MS", 6000);
-    const maxRetries = envInt(env, "HLS_FETCH_RETRIES", 1);
+    const timeoutMs = envInt(env, "HLS_FETCH_TIMEOUT_MS", 10000);
+    const maxRetries = envInt(env, "HLS_FETCH_RETRIES", 2);
     const headers = {
         accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
         "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
@@ -4998,32 +4998,15 @@ async function rewriteUpstreamPlaylist(text, playlistUrl, request, env, key) {
     const configuredTarget = envInt(env, "UPSTREAM_TARGET_DURATION", 0);
     const measuredTarget = parseTargetDuration(trimmedText);
     const targetDuration = configuredTarget > 0 ? Math.min(Math.max(1, configuredTarget), measuredTarget) : measuredTarget;
-    const startOffsetSegments = Math.max(0, envInt(env, "LIVE_START_OFFSET_SEGMENTS", 2));
-    const startOffsetSeconds = Math.max(1, targetDuration * startOffsetSegments);
-    const isMediaPlaylist = /#EXTINF:/m.test(trimmedText) || /#EXT-X-PART:/m.test(trimmedText);
-    let insertedStart = false;
     const lines = [];
 
     for (const rawLine of trimmedText.split(/\r?\n/)) {
         const line = rawLine.trim();
         if (!line) { lines.push(rawLine); continue; }
-        if (line.startsWith("#EXTM3U")) {
-            lines.push(rawLine);
-            if (isMediaPlaylist && !insertedStart && startOffsetSegments > 0) {
-                lines.push(`#EXT-X-START:TIME-OFFSET=-${startOffsetSeconds},PRECISE=YES`);
-                insertedStart = true;
-            }
-            continue;
-        }
+        if (line.startsWith("#EXTM3U")) { lines.push(rawLine); continue; }
         if (line.startsWith("#EXT-X-TARGETDURATION")) { lines.push(`#EXT-X-TARGETDURATION:${targetDuration}`); continue; }
         if (line.startsWith("#EXT-X-ALLOW-CACHE")) { lines.push("#EXT-X-ALLOW-CACHE:YES"); continue; }
-        if (line.startsWith("#EXT-X-START")) {
-            if (isMediaPlaylist && !insertedStart && startOffsetSegments > 0) {
-                lines.push(`#EXT-X-START:TIME-OFFSET=-${startOffsetSeconds},PRECISE=YES`);
-                insertedStart = true;
-            }
-            continue;
-        }
+        if (line.startsWith("#EXT-X-START")) { continue; /* Remove upstream start offsets to prevent rewind bugs */ }
         if (line.startsWith("#")) { lines.push(await rewriteUriAttributes(rawLine, key, playlistUrl, request, env)); continue; }
         lines.push(await upstreamAssetUrl(key, new URL(line, playlistUrl).toString(), request, env, playlistUrl));
     }
@@ -5117,6 +5100,7 @@ async function prefetchSegments(segmentUrls, referer, env) {
 // Live playlist proxy
 
 async function buildLivePlaylistBody(key, sourceUrl, request, env, waitUntil, cacheKey) {
+    cleanupSegmentCache();
     return withInflight(livePlaylistInflight, cacheKey, async () => {
         const upstream = await findUpstreamHls(key, sourceUrl, env);
         if (!upstream) throw new HttpError(502, "Upstream HLS unavailable.");
@@ -5254,8 +5238,8 @@ async function proxyLiveFromSource(key, sourceUrl, request, env, waitUntil, cach
     const warmupEnabled = envBool(env, "LOADING_VIDEO_ENABLED", false);
     const requiredSegments = envInt(env, "WARMUP_REQUIRED_SEGMENTS", WARMUP_REQUIRED_SEGMENTS);
     const now = Date.now();
-    const freshMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", 2000));
-    const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 15000));
+    const freshMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_CACHE_MS", 6000));
+    const staleMs = Math.max(0, envInt(env, "LIVE_PLAYLIST_STALE_MS", 30000));
     const cached = livePlaylistCache.get(cacheKey);
 
     // ── Warmup: play the loading MP4 while upstream HLS stabilises ───────────
@@ -5804,8 +5788,11 @@ function localXtreamLiveStreams(channels, categoryId = "", request = null, env =
 
 async function xtreamLiveCategories(env) {
     const custom = await loadCustomCategories(env);
+    const result = [];
+    const customIds = new Set();
+
     if (custom && custom.length > 0) {
-        const result = custom.map(c => ({
+        const sortedCustom = custom.map(c => ({
             category_id: c.id,
             category_name: c.name,
             parent_id: 0
@@ -5814,26 +5801,36 @@ async function xtreamLiveCategories(env) {
             const ob = custom.find(x => x.id === b.category_id)?.order || 0;
             return oa - ob;
         });
-
-        result.push({
-            category_id: "999999",
-            category_name: "Uncategorized",
-            parent_id: 0
-        });
-        return result;
+        result.push(...sortedCustom);
+        for (const c of sortedCustom) customIds.add(String(c.category_id));
     }
 
     const sources = buildProviderPlaylistSources(env);
     const catalogs = await Promise.all(sources.map((s) => loadXtreamCatalog(env, s, "live", false, false).catch(() => null)));
     const liveCategories = aggregateXtreamCategories(catalogs);
-    if (liveCategories.length > 1 || (liveCategories.length === 1 && liveCategories[0]?.category_id !== "1")) {
-        return liveCategories;
+
+    for (const cat of liveCategories) {
+        if (!customIds.has(String(cat.category_id))) {
+            result.push(cat);
+        }
+    }
+
+    if (custom && custom.length > 0) {
+        result.push({
+            category_id: "999999",
+            category_name: "Uncategorized",
+            parent_id: 0
+        });
+    }
+
+    if (result.length > 0 && (result.length > 1 || result[0]?.category_id !== "1")) {
+        return result;
     }
 
     const channels = await loadPlaylistChannels(env, false).catch(() => []);
     if (channels.length > 0) return localXtreamLiveCategories(channels);
 
-    return liveCategories;
+    return result;
 }
 
 async function xtreamLiveStreams(env, categoryId = "", request = null, user = null) {
@@ -5918,48 +5915,60 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
             }
         }
 
-        if (wantedCategoryId === "999999" || (!wantedCategoryId || wantedCategoryId === "0")) {
-            for (const channel of channelMap.values()) {
-                if (!mappedKeys.has(channel.key)) {
-                    if (!channel.is_xtream) {
-                        const numericStreamId = String(stringToNumericId(channel.key));
-                        xtreamLocalNumericIndex.set(numericStreamId, channel.key);
-                        result.push({
-                            num: num++,
-                            name: channel.name,
-                            stream_type: "live",
-                            stream_id: Number(numericStreamId),
-                            stream_icon: channel.logo,
-                            epg_channel_id: null,
-                            added: String(Math.floor(Date.now() / 1000)),
-                            is_adult: "0",
-                            category_id: "999999",
-                            custom_sid: "",
-                            tv_archive: 1,
-                            direct_source: "",
-                            tv_archive_duration: 0,
-                            container_extension: "ts",
-                        });
-                    } else {
-                        const item = channel.xtream_item;
-                        result.push({
-                            num: num++,
-                            name: channel.name,
-                            stream_type: "live",
-                            stream_id: Number(channel.key),
-                            stream_icon: channel.logo,
-                            epg_channel_id: null,
-                            added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
-                            is_adult: "0",
-                            category_id: "999999",
-                            custom_sid: "",
-                            tv_archive: 1,
-                            direct_source: "",
-                            tv_archive_duration: 0,
-                            container_extension: "ts",
-                        });
-                    }
+        const isCustomCat = custom.some(c => c.id === wantedCategoryId);
+        
+        for (const channel of channelMap.values()) {
+            if (mappedKeys.has(channel.key)) continue;
+            
+            const origCat = channel.category || "999999";
+            let useCat = origCat;
+            if (wantedCategoryId && wantedCategoryId !== "0") {
+                if (wantedCategoryId === "999999") {
+                    if (origCat !== "999999" && origCat !== "") continue;
+                } else if (!isCustomCat && wantedCategoryId === origCat) {
+                    useCat = origCat;
+                } else {
+                    continue;
                 }
+            }
+
+            if (!channel.is_xtream) {
+                const numericStreamId = String(stringToNumericId(channel.key));
+                xtreamLocalNumericIndex.set(numericStreamId, channel.key);
+                result.push({
+                    num: num++,
+                    name: channel.name,
+                    stream_type: "live",
+                    stream_id: Number(numericStreamId),
+                    stream_icon: channel.logo,
+                    epg_channel_id: null,
+                    added: String(Math.floor(Date.now() / 1000)),
+                    is_adult: "0",
+                    category_id: useCat,
+                    custom_sid: "",
+                    tv_archive: 1,
+                    direct_source: "",
+                    tv_archive_duration: 0,
+                    container_extension: "ts",
+                });
+            } else {
+                const item = channel.xtream_item;
+                result.push({
+                    num: num++,
+                    name: channel.name,
+                    stream_type: "live",
+                    stream_id: Number(channel.key),
+                    stream_icon: channel.logo,
+                    epg_channel_id: null,
+                    added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
+                    is_adult: "0",
+                    category_id: useCat,
+                    custom_sid: "",
+                    tv_archive: 1,
+                    direct_source: "",
+                    tv_archive_duration: 0,
+                    container_extension: "ts",
+                });
             }
         }
         return result;
