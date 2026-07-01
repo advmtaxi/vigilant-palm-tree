@@ -737,6 +737,19 @@ async function getOrCreateBunnyPullZone(originUrl, env) {
     if (!bunnyEnabled) return null;
     const origin = originUrl.replace(/\/+$/, "");
 
+    let isEnabledForOrigin = false;
+    if (Array.isArray(customServersCache)) {
+        for (const s of customServersCache) {
+            try {
+                if (new URL(s.url).origin === origin && s.bunny_enabled) {
+                    isEnabledForOrigin = true;
+                    break;
+                }
+            } catch(e) {}
+        }
+    }
+    if (!isEnabledForOrigin) return null;
+
     // 1. Check in-memory cache
     const cached = bunnyPullZoneCache.get(origin);
     if (cached && (Date.now() - cached.createdAt < BUNNY_PULLZONE_CACHE_TTL_MS)) {
@@ -797,6 +810,20 @@ function getBunnyCdnSegmentUrl(absoluteUrl, env) {
     try {
         const parsed = new URL(absoluteUrl);
         const origin = parsed.origin;
+        
+        let isEnabledForOrigin = false;
+        if (Array.isArray(customServersCache)) {
+            for (const s of customServersCache) {
+                try {
+                    if (new URL(s.url).origin === origin && s.bunny_enabled) {
+                        isEnabledForOrigin = true;
+                        break;
+                    }
+                } catch(e) {}
+            }
+        }
+        if (!isEnabledForOrigin) return null;
+
         const cached = bunnyPullZoneCache.get(origin);
         if (cached && cached.hostname) {
             // Cache-busting: add a timestamp bucket so Bunny CDN never serves stale live segments.
@@ -3032,6 +3059,11 @@ function dashboardPage() {
                 <label>Password</label>
                 <input id="prov-pass" type="password" placeholder="Your Xtream Password" required autocomplete="off">
               </div>
+              <div class="form-group" style="margin-top: 10px;">
+                <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+                  <input type="checkbox" id="prov-bunny"> Enable BunnyCDN (Default disabled, uses Proxy)
+                </label>
+              </div>
               <div style="display:flex; gap:10px; margin-top:20px;">
                 <button type="submit" class="btn btn-primary" style="flex:1;">Save Server</button>
                 <button type="button" onclick="testProviderConnection()" class="btn btn-secondary">⚡ Test</button>
@@ -3462,6 +3494,7 @@ function dashboardPage() {
       document.getElementById("prov-name").value = s.name;
       document.getElementById("prov-url").value = s.url;
       document.getElementById("prov-user").value = s.username;
+      document.getElementById("prov-bunny").checked = s.bunny_enabled || false;
       document.getElementById("prov-pass").value = "";
       document.getElementById("prov-pass").required = false; // password is optional on update
       document.getElementById("prov-pass").placeholder = "Leave blank to keep existing password";
@@ -3474,6 +3507,7 @@ function dashboardPage() {
       document.getElementById("prov-name").value = "";
       document.getElementById("prov-url").value = "";
       document.getElementById("prov-user").value = "";
+      document.getElementById("prov-bunny").checked = false;
       document.getElementById("prov-pass").value = "";
       document.getElementById("prov-pass").required = true;
       document.getElementById("prov-pass").placeholder = "Your Xtream Password";
@@ -3488,9 +3522,10 @@ function dashboardPage() {
       const url = document.getElementById("prov-url").value.trim();
       const username = document.getElementById("prov-user").value.trim();
       const password = document.getElementById("prov-pass").value.trim();
+      const bunny_enabled = document.getElementById("prov-bunny").checked;
 
       const path = id ? "/api/servers/update" : "/api/servers";
-      const payload = { id, name, url, username };
+      const payload = { id, name, url, username, bunny_enabled };
       if (password) payload.password = password;
 
       try {
@@ -3790,8 +3825,6 @@ function dashboardPage() {
         showToast("No channels loaded to build categories from.", "error");
         return;
       }
-      if (customCategories.length > 0 && !confirm("This will overwrite all current custom categories. Continue?")) return;
-
       const catMap = new Map();
       allChannels.forEach(ch => {
         const cName = ch.category || "Uncategorized";
@@ -3799,20 +3832,29 @@ function dashboardPage() {
         catMap.get(cName).push(ch.key);
       });
 
-      customCategories = [];
-      let order = 1;
+      let order = customCategories.length > 0 ? Math.max(...customCategories.map(c => c.order)) + 1 : 1;
+      let addedCount = 0;
+
       catMap.forEach((keys, name) => {
-        customCategories.push({
-          id: String(Date.now()) + Math.floor(Math.random()*1000) + order,
-          name: name,
-          order: order++,
-          channelKeys: keys
-        });
+        let existingCat = customCategories.find(c => c.name.toLowerCase() === name.toLowerCase());
+        if (existingCat) {
+            keys.forEach(k => {
+                if (!existingCat.channelKeys.includes(k)) existingCat.channelKeys.push(k);
+            });
+        } else {
+            customCategories.push({
+              id: String(Date.now()) + Math.floor(Math.random()*1000) + order,
+              name: name,
+              order: order++,
+              channelKeys: keys
+            });
+            addedCount++;
+        }
       });
       renderCategoriesList();
       renderActiveCategory();
       populateCategorySelects();
-      showToast("Built categories from active channels! Click Save to apply.");
+      showToast(`Merged categories! Added ${addedCount} new categories. Click Save to apply.`);
     }
 
     function renderActiveCategory() {
@@ -6691,11 +6733,12 @@ async function handleRequest(request, env, waitUntil) {
         if (!name) throw new HttpError(400, "Server name is required.");
         if (!serverUrl) throw new HttpError(400, "Server URL is required.");
         if (!username || !password) throw new HttpError(400, "Username and password are required.");
+        const bunny_enabled = parseRequestBool(data.bunny_enabled, false);
         const servers = await loadCustomServers(env);
         const id = randomPlaylistId(10);
         const server = {
             id, name, url: serverUrl.replace(/\/+$/, ""), username, password,
-            enabled: true, priority: servers.length + 1,
+            enabled: true, bunny_enabled, priority: servers.length + 1,
             createdAt: new Date().toISOString(),
         };
         servers.push(server);
@@ -6719,6 +6762,7 @@ async function handleRequest(request, env, waitUntil) {
         if (data.username !== undefined) servers[idx].username = cleanString(data.username) || servers[idx].username;
         if (data.password !== undefined) servers[idx].password = cleanString(data.password) || servers[idx].password;
         if (data.enabled !== undefined) servers[idx].enabled = parseRequestBool(data.enabled, true);
+        if (data.bunny_enabled !== undefined) servers[idx].bunny_enabled = parseRequestBool(data.bunny_enabled, false);
         if (data.priority !== undefined) servers[idx].priority = Number(data.priority) || servers[idx].priority;
         await saveCustomServers(env, servers);
         customServersCache = servers;
