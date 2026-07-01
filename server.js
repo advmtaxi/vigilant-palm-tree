@@ -3854,7 +3854,7 @@ function dashboardPage() {
       renderCategoriesList();
       renderActiveCategory();
       populateCategorySelects();
-      showToast(`Merged categories! Added ${addedCount} new categories. Click Save to apply.`);
+      showToast("Merged categories! Added " + addedCount + " new categories. Click Save to apply.");
     }
 
     function renderActiveCategory() {
@@ -5960,7 +5960,7 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
         const isCustomCat = custom.some(c => c.id === wantedCategoryId);
         
         for (const channel of channelMap.values()) {
-            if (mappedKeys.has(channel.key)) continue;
+            // Do not skip mapped keys so channels appear in both original and custom categories
             
             const origCat = channel.category || "999999";
             let useCat = origCat;
