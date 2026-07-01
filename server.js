@@ -1760,16 +1760,7 @@ async function doRefreshChannels(env) {
         // Retry playlist fetch
         for (let attempt = 0; attempt <= maxSourceRetries; attempt++) {
             try {
-                let fetchUrl = playlistSource.url;
-                try {
-                    const parsed = new URL(fetchUrl);
-                    if (parsed.pathname.endsWith("get.php")) {
-                        parsed.searchParams.set("action", "get_live_streams");
-                        fetchUrl = parsed.toString();
-                    }
-                } catch {}
-                
-                response = await fetchProviderPlaylist(env, fetchUrl);
+                response = await fetchProviderPlaylist(env, playlistSource.url);
                 if (response && response.ok) {
                     if (attempt > 0) console.log(`[cache] playlist fetch for ${playlistSource.label} succeeded on retry ${attempt}`);
                     break;
@@ -2087,15 +2078,7 @@ async function channelsPayload(request, env, force = false) {
 async function appendPlaylistMediaRecords(records, source, env, kind) {
     let response;
     try {
-        let fetchUrl = source.url;
-        try {
-            const parsed = new URL(fetchUrl);
-            if (parsed.pathname.endsWith("get.php")) {
-                parsed.searchParams.set("action", kind === "series" ? "get_series" : "get_vod_streams");
-                fetchUrl = parsed.toString();
-            }
-        } catch {}
-        response = await fetchProviderPlaylist(env, fetchUrl);
+        response = await fetchProviderPlaylist(env, source.url);
     } catch {
         return { ok: false, status: "network error", count: 0 };
     }
@@ -5888,7 +5871,11 @@ async function xtreamLiveCategories(env) {
         });
     }
 
-    const channels = await loadPlaylistChannels(env, false).catch(() => []);
+    // Use cached playlist channels if available (instant), otherwise try non-blocking load
+    let channels = playlistChannelCache.channels;
+    if (channels.length === 0) {
+        channels = await loadPlaylistChannels(env, false).catch(() => []);
+    }
     if (channels.length > 0) {
         const localCats = localXtreamLiveCategories(channels);
         for (const cat of localCats) {
@@ -5898,11 +5885,9 @@ async function xtreamLiveCategories(env) {
         }
     }
 
-    if (result.length > 0 && (result.length > 1 || result[0]?.category_id !== "1")) {
-        return result;
-    }
+    if (result.length > 0) return result;
 
-    return result;
+    return [{ category_id: "1", category_name: "All", parent_id: 0 }];
 }
 
 async function xtreamLiveStreams(env, categoryId = "", request = null, user = null) {
@@ -5911,12 +5896,17 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
 
     if (custom && custom.length > 0) {
         const channelMap = new Map();
-        const channels = await loadPlaylistChannels(env, false).catch(() => []);
+        // Use cached channels (instant) or fall back to load
+        let channels = playlistChannelCache.channels;
+        if (channels.length === 0) {
+            channels = await loadPlaylistChannels(env, false).catch(() => []);
+        }
         for (const ch of channels) channelMap.set(ch.key, { ...ch, is_xtream: false });
 
         const sources = buildProviderPlaylistSources(env);
-        for (const source of sources) {
-            const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
+        // Load all catalogs concurrently
+        const catalogs = await Promise.all(sources.map(s => loadXtreamCatalog(env, s, "live", false).catch(() => null)));
+        for (const catalog of catalogs) {
             if (catalog) {
                 for (const item of catalog.items) {
                     const id = itemId(item, "live");
@@ -6057,8 +6047,9 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
     const result = [];
     const seenIds = new Set();
     let num = 1;
-    for (const source of sources) {
-        const catalog = await loadXtreamCatalog(env, source, "live", false).catch(() => null);
+    // Load all catalogs concurrently instead of sequentially
+    const catalogs = await Promise.all(sources.map(s => loadXtreamCatalog(env, s, "live", false).catch(() => null)));
+    for (const catalog of catalogs) {
         if (!catalog) continue;
         for (const item of catalog.items) {
             const id = itemId(item, "live");
