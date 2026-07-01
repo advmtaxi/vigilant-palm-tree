@@ -1197,8 +1197,8 @@ function xtreamApiUrl(config, action, extraParams = {}) {
 }
 
 async function fetchXtreamApi(env, config, action, extraParams = {}) {
-    const timeoutMs = envInt(env, "XTREAM_API_TIMEOUT_MS", 4000);
-    const maxRetries = envInt(env, "XTREAM_API_RETRIES", 2);
+    const timeoutMs = envInt(env, "XTREAM_API_TIMEOUT_MS", 3000);
+    const maxRetries = envInt(env, "XTREAM_API_RETRIES", 1);
     const headers = {
         "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
         accept: "application/json, text/plain, */*",
@@ -1729,7 +1729,7 @@ async function doRefreshChannels(env) {
     const playlistSources = buildProviderPlaylistSources(env);
     if (playlistSources.length === 0) throw new HttpError(500, "No IPTV playlist sources configured.");
 
-    const maxSourceRetries = envInt(env, "SOURCE_LOAD_RETRIES", 2);
+    const maxSourceRetries = envInt(env, "SOURCE_LOAD_RETRIES", 0);
     const channels = [];
     const nextStreamIndex = new Map();
     const seenKeys = new Set();
@@ -1743,39 +1743,28 @@ async function doRefreshChannels(env) {
         let response = null;
         let liveCatalog = null;
 
-        // Retry Xtream catalog loading
-        for (let attempt = 0; attempt <= maxSourceRetries; attempt++) {
-            try {
-                liveCatalog = await loadXtreamCatalog(env, playlistSource, "live", attempt > 0);
-                if (liveCatalog) break;
-            } catch (err) {
-                console.warn(`[cache] Xtream catalog load for ${playlistSource.label} attempt ${attempt + 1}/${maxSourceRetries + 1} failed: ${err?.message || err}`);
-                if (attempt < maxSourceRetries) {
-                    const delayMs = 500 * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5);
-                    await new Promise((resolve) => setTimeout(resolve, delayMs));
-                }
-            }
+        // Try Xtream catalog (single attempt, fail fast)
+        try {
+            liveCatalog = await loadXtreamCatalog(env, playlistSource, "live", false);
+        } catch (err) {
+            console.warn(`[cache] Xtream catalog load for ${playlistSource.label} failed: ${err?.message || err}`);
         }
 
-        // Retry playlist fetch
-        for (let attempt = 0; attempt <= maxSourceRetries; attempt++) {
-            try {
-                response = await fetchProviderPlaylist(env, playlistSource.url);
-                if (response && response.ok) {
-                    if (attempt > 0) console.log(`[cache] playlist fetch for ${playlistSource.label} succeeded on retry ${attempt}`);
-                    break;
-                }
-                if (response && !response.ok) {
-                    console.warn(`[cache] playlist fetch for ${playlistSource.label} attempt ${attempt + 1}/${maxSourceRetries + 1} returned HTTP ${response.status}`);
-                }
-            } catch (err) {
-                console.warn(`[cache] playlist fetch for ${playlistSource.label} attempt ${attempt + 1}/${maxSourceRetries + 1} failed: ${err?.message || err}`);
-                response = null;
+        // Skip M3U download if Xtream catalog already has items
+        if (liveCatalog && liveCatalog.items && liveCatalog.items.length > 0) {
+            console.log(`[cache] source ${playlistSource.label} has ${liveCatalog.items.length} items from Xtream API, skipping M3U download`);
+            return { playlistSource, response: null, liveCatalog };
+        }
+
+        // Fetch M3U playlist (single attempt since inner function already retries)
+        try {
+            response = await fetchProviderPlaylist(env, playlistSource.url);
+            if (response && !response.ok) {
+                console.warn(`[cache] playlist fetch for ${playlistSource.label} returned HTTP ${response.status}`);
             }
-            if (attempt < maxSourceRetries && (!response || !response.ok)) {
-                const delayMs = 500 * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5);
-                await new Promise((resolve) => setTimeout(resolve, delayMs));
-            }
+        } catch (err) {
+            console.warn(`[cache] playlist fetch for ${playlistSource.label} failed: ${err?.message || err}`);
+            response = null;
         }
 
         return { playlistSource, response, liveCatalog };
@@ -4763,8 +4752,8 @@ async function generatedM3uResponse(request, env, waitUntil = (promise) => promi
 // Fetch helpers
 
 async function fetchProviderPlaylist(env, url) {
-    const timeoutMs = envInt(env, "PLAYLIST_FETCH_TIMEOUT_MS", 12000);
-    const maxRetries = envInt(env, "PLAYLIST_FETCH_RETRIES", 2);
+    const timeoutMs = envInt(env, "PLAYLIST_FETCH_TIMEOUT_MS", 8000);
+    const maxRetries = envInt(env, "PLAYLIST_FETCH_RETRIES", 1);
     const headers = {
         "user-agent": envString(env, "FETCH_USER_AGENT", DEFAULT_FETCH_USER_AGENT) || DEFAULT_FETCH_USER_AGENT,
         accept: "application/x-mpegURL, application/vnd.apple.mpegurl, text/plain, */*",
@@ -4788,8 +4777,8 @@ async function fetchProviderPlaylist(env, url) {
                 allFailures.push(failMsg);
                 console.warn(`[playlist-fetch] ${failMsg} (attempt ${attempt + 1}/${maxRetries + 1})`);
                 if (!firstBadResponse) firstBadResponse = response;
-                // Don't retry 4xx client errors
-                if (response.status >= 400 && response.status < 500) break;
+                // Don't retry non-retriable errors (4xx client errors and 5xx server errors)
+                if (response.status >= 400) break;
             } catch (err) {
                 const failMsg = `${sanitizeUrlForLog(candidateUrl)} -> ${err?.code === "TIMEOUT" ? "TIMEOUT" : err?.message || "network error"}`;
                 allFailures.push(failMsg);
