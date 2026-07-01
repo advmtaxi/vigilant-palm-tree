@@ -6649,6 +6649,177 @@ async function serveCustomPlaylistM3u(request, env, playlistId) {
     return playlistResponse(`${lines.join("\n")}\n`);
 }
 
+// ─── Stremio Addon ──────────────────────────────────────────────────────────────
+
+const STREMIO_ADDON_ID = "community.iptv.live";
+const STREMIO_ADDON_VERSION = "1.0.0";
+const STREMIO_ADDON_NAME = "IPTV Live TV";
+const STREMIO_CATALOG_ID = "iptv-live";
+const STREMIO_ID_PREFIX = "iptv:";
+const STREMIO_PAGE_SIZE = 100;
+
+/**
+ * Build the Stremio manifest dynamically so genres (channel categories) stay in sync.
+ */
+async function stremioManifest(env) {
+    // Collect unique categories from loaded channels
+    const channels = channelCache.channels.length > 0
+        ? channelCache.channels
+        : await loadChannels(env, false).catch(() => []);
+    const categorySet = new Set();
+    for (const ch of channels) {
+        const cat = cleanString(ch.category);
+        if (cat) categorySet.add(cat);
+    }
+    const genres = [...categorySet].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+
+    return {
+        id: STREMIO_ADDON_ID,
+        version: STREMIO_ADDON_VERSION,
+        name: STREMIO_ADDON_NAME,
+        description: "Live IPTV channels — browse by category, search, and stream in HD.",
+        logo: "https://cdn-icons-png.flaticon.com/512/2111/2111748.png",
+        resources: ["catalog", "meta", "stream"],
+        types: ["tv"],
+        idPrefixes: [STREMIO_ID_PREFIX],
+        catalogs: [
+            {
+                id: STREMIO_CATALOG_ID,
+                type: "tv",
+                name: STREMIO_ADDON_NAME,
+                extra: [
+                    { name: "genre", options: genres, isRequired: false },
+                    { name: "search", isRequired: false },
+                    { name: "skip", isRequired: false },
+                ],
+            },
+        ],
+        behaviorHints: { adult: false, configurable: false },
+    };
+}
+
+/**
+ * Build a Stremio catalog response. Supports genre (category) filtering,
+ * free-text search, and skip-based pagination.
+ */
+async function stremioCatalog(env, request, extraParams) {
+    const channels = channelCache.channels.length > 0
+        ? channelCache.channels
+        : await loadChannels(env, false).catch(() => []);
+
+    let filtered = channels;
+
+    // Genre filtering (maps to channel category)
+    const genre = cleanString(extraParams.genre);
+    if (genre) {
+        filtered = filtered.filter(ch => cleanString(ch.category).toLowerCase() === genre.toLowerCase());
+    }
+
+    // Search
+    const search = cleanString(extraParams.search);
+    if (search) {
+        filtered = filtered.filter(ch => channelMatchesQuery(ch, search));
+    }
+
+    // Pagination
+    const skip = Math.max(0, parseInt(extraParams.skip, 10) || 0);
+    const page = filtered.slice(skip, skip + STREMIO_PAGE_SIZE);
+
+    const metas = page.map(ch => ({
+        id: `${STREMIO_ID_PREFIX}${ch.key}`,
+        type: "tv",
+        name: cleanString(ch.name).replace(/\s*\(API[A-Z]*\)\s*$/i, "").replace(/\s*\([^)]*\)\s*$/, "").trim() || "Unknown",
+        poster: ch.logo || undefined,
+        posterShape: "square",
+        logo: ch.logo || undefined,
+        genres: ch.category ? [cleanString(ch.category)] : [],
+        description: ch.category ? `Category: ${cleanString(ch.category)}` : "Live TV Channel",
+    }));
+
+    return { metas };
+}
+
+/**
+ * Build a Stremio meta response for a single channel.
+ */
+async function stremioMeta(env, channelKey) {
+    const channels = channelCache.channels.length > 0
+        ? channelCache.channels
+        : await loadChannels(env, false).catch(() => []);
+    const ch = channels.find(c => c.key === channelKey);
+    if (!ch) return null;
+
+    return {
+        meta: {
+            id: `${STREMIO_ID_PREFIX}${ch.key}`,
+            type: "tv",
+            name: cleanString(ch.name).replace(/\s*\(API[A-Z]*\)\s*$/i, "").replace(/\s*\([^)]*\)\s*$/, "").trim() || "Unknown",
+            poster: ch.logo || undefined,
+            posterShape: "square",
+            logo: ch.logo || undefined,
+            background: ch.logo || undefined,
+            genres: ch.category ? [cleanString(ch.category)] : [],
+            description: ch.category ? `Category: ${cleanString(ch.category)}` : "Live TV Channel",
+        },
+    };
+}
+
+/**
+ * Build a Stremio stream response — returns the m3u8 proxy URL for the channel.
+ */
+async function stremioStream(env, request, channelKey) {
+    const sourceUrl = streamIndex.get(channelKey);
+    if (!sourceUrl) return { streams: [] };
+
+    const base = streamBase(request, env);
+
+    // Build the direct HLS proxy URL (same as the existing /live/{key}/index.m3u8)
+    const directToken = await makeUrlToken({ u: sourceUrl }, env);
+    const hlsUrl = `${base}/live/${channelKey}/index.m3u8`;
+
+    // Look up channel name for the stream title
+    const channels = channelCache.channels;
+    const ch = channels.find(c => c.key === channelKey);
+    const name = ch
+        ? cleanString(ch.name).replace(/\s*\(API[A-Z]*\)\s*$/i, "").replace(/\s*\([^)]*\)\s*$/, "").trim()
+        : "Live Stream";
+
+    return {
+        streams: [
+            {
+                name: STREMIO_ADDON_NAME,
+                title: name,
+                url: hlsUrl,
+                behaviorHints: {
+                    notWebReady: true,
+                    bingeGroup: "iptv-live",
+                },
+            },
+        ],
+    };
+}
+
+/**
+ * Parse Stremio extra parameters from the URL path.
+ * Stremio sends extras as: /catalog/tv/id/genre=X&skip=N.json
+ */
+function parseStremioExtra(extraPath) {
+    const params = {};
+    if (!extraPath) return params;
+    // Remove .json suffix if present
+    const clean = extraPath.replace(/\.json$/, "");
+    const parts = clean.split("&");
+    for (const part of parts) {
+        const eq = part.indexOf("=");
+        if (eq > 0) {
+            const key = decodeURIComponent(part.slice(0, eq));
+            const value = decodeURIComponent(part.slice(eq + 1));
+            params[key] = value;
+        }
+    }
+    return params;
+}
+
 // ─── Main request handler ─────────────────────────────────────────────────────
 
 async function handleRequest(request, env, waitUntil) {
@@ -7065,7 +7236,55 @@ async function handleRequest(request, env, waitUntil) {
     const segmentMatch = path.match(/^\/(?:upseg|upstream-segment)\/([a-f0-9]{20})\/([^/]+)\/([^/]+)$/);
     if (segmentMatch) return proxySegment(segmentMatch[1], segmentMatch[2], segmentMatch[3], request, env);
 
+    // ─── Stremio Addon Endpoints ────────────────────────────────────────────────
+
+    // Manifest
+    if (path === "/stremio/manifest.json" || path === "/stremio/manifest") {
+        const manifest = await stremioManifest(env);
+        console.log(`[stremio] manifest served — ${manifest.catalogs[0]?.extra?.[0]?.options?.length || 0} genres`);
+        return json(manifest);
+    }
+
+    // Catalog: /stremio/catalog/tv/{catalogId}.json  or  /stremio/catalog/tv/{catalogId}/{extra}.json
+    const stremioCatalogMatch = path.match(/^\/stremio\/catalog\/tv\/([^/]+?)(?:\/([^/]+))?\.json$/);
+    if (stremioCatalogMatch) {
+        const catalogId = stremioCatalogMatch[1];
+        if (catalogId !== STREMIO_CATALOG_ID) return json({ metas: [] });
+        const extraParams = parseStremioExtra(stremioCatalogMatch[2] || "");
+        // Also check query params for search (Stremio web sends ?search=)
+        const urlSearch = new URL(request.url).searchParams.get("search");
+        if (urlSearch && !extraParams.search) extraParams.search = urlSearch;
+        const catalog = await stremioCatalog(env, request, extraParams);
+        console.log(`[stremio] catalog served — ${catalog.metas.length} items (genre=${extraParams.genre || "all"}, search=${extraParams.search || "none"}, skip=${extraParams.skip || 0})`);
+        return json(catalog);
+    }
+
+    // Meta: /stremio/meta/tv/{id}.json
+    const stremioMetaMatch = path.match(/^\/stremio\/meta\/tv\/(.+?)\.json$/);
+    if (stremioMetaMatch) {
+        const rawId = decodeURIComponent(stremioMetaMatch[1]);
+        const channelKey = rawId.startsWith(STREMIO_ID_PREFIX)
+            ? rawId.slice(STREMIO_ID_PREFIX.length)
+            : rawId;
+        const meta = await stremioMeta(env, channelKey);
+        if (!meta) return json({ meta: null }, 404);
+        return json(meta);
+    }
+
+    // Stream: /stremio/stream/tv/{id}.json
+    const stremioStreamMatch = path.match(/^\/stremio\/stream\/tv\/(.+?)\.json$/);
+    if (stremioStreamMatch) {
+        const rawId = decodeURIComponent(stremioStreamMatch[1]);
+        const channelKey = rawId.startsWith(STREMIO_ID_PREFIX)
+            ? rawId.slice(STREMIO_ID_PREFIX.length)
+            : rawId;
+        const streamPayload = await stremioStream(env, request, channelKey);
+        console.log(`[stremio] stream served for ${channelKey} — ${streamPayload.streams.length} stream(s)`);
+        return json(streamPayload);
+    }
+
     return json({ error: "Not found." }, 404);
+
 }
 
 // Express server
