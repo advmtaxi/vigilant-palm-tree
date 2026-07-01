@@ -1466,7 +1466,7 @@ function customCategoriesFile(env) {
 }
 // ─── Hardcoded default category: always present at position 1 ────────────────
 const DEFAULT_WORLD_CUP_CATEGORY = {
-    id: "1781796727851764",
+    id: "889001",
     name: "WORLD CUP EVENTS | ADAM",
     order: 0,
     channelKeys: [
@@ -5742,9 +5742,10 @@ function aggregateXtreamCategories(catalogs) {
     for (const catalog of catalogs) {
         if (!catalog) continue;
         for (const [id, name] of catalog.categoriesById.entries()) {
-            if (seen.has(id)) continue;
-            seen.add(id);
-            result.push({ category_id: id, category_name: name, parent_id: 0 });
+            const numId = String(stringToNumericId(id));
+            if (seen.has(numId)) continue;
+            seen.add(numId);
+            result.push({ category_id: numId, category_name: name, parent_id: 0 });
         }
     }
     if (result.length === 0) result.push({ category_id: "1", category_name: "All", parent_id: 0 });
@@ -5904,7 +5905,7 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
                             key: id,
                             name: cleanString(item.name, "Unknown"),
                             logo: mediaLogo(item),
-                            category: cleanString(item.category_id),
+                            category: String(stringToNumericId(cleanString(item.category_id))),
                             is_xtream: true,
                             xtream_item: item
                         });
@@ -6043,7 +6044,8 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
         for (const item of catalog.items) {
             const id = itemId(item, "live");
             if (!id || seenIds.has(id)) continue;
-            if (wantedCategoryId && wantedCategoryId !== "0" && cleanString(item.category_id) !== wantedCategoryId) continue;
+            const hashedCat = String(stringToNumericId(cleanString(item.category_id)));
+            if (wantedCategoryId && wantedCategoryId !== "0" && hashedCat !== wantedCategoryId) continue;
             seenIds.add(id);
             const streamUrl = xtreamLivePlaybackUrl(request, env, user, id);
             result.push({
@@ -6055,7 +6057,7 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
                 epg_channel_id: null,
                 added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
                 is_adult: "0",
-                category_id: cleanString(item.category_id),
+                category_id: hashedCat,
                 custom_sid: "",
                 tv_archive: 0,
                 direct_source: "",
@@ -6089,7 +6091,8 @@ async function xtreamVodStreams(env, categoryId = "") {
         for (const item of catalog.items) {
             const id = itemId(item, "movies");
             if (!id || seenIds.has(id)) continue;
-            if (wantedCategoryId && wantedCategoryId !== "0" && cleanString(item.category_id) !== wantedCategoryId) continue;
+            const hashedCat = String(stringToNumericId(cleanString(item.category_id)));
+            if (wantedCategoryId && wantedCategoryId !== "0" && hashedCat !== wantedCategoryId) continue;
             seenIds.add(id);
             const ext = cleanString(item.container_extension, "mp4");
             const upstreamUrl = xtreamMediaUrl(catalog.config, "movie", String(id), ext);
@@ -6103,7 +6106,7 @@ async function xtreamVodStreams(env, categoryId = "") {
                 rating: String(mediaRating(item) ?? ""),
                 rating_5based: String(mediaRating(item) ?? ""),
                 added: cleanString(item.added) || String(Math.floor(Date.now() / 1000)),
-                category_id: cleanString(item.category_id),
+                category_id: hashedCat,
                 container_extension: ext,
                 custom_sid: "",
                 direct_source: "",
@@ -6131,7 +6134,8 @@ async function xtreamSeriesList(env, categoryId = "") {
         for (const item of catalog.items) {
             const id = itemId(item, "series");
             if (!id || seenIds.has(id)) continue;
-            if (wantedCategoryId && wantedCategoryId !== "0" && cleanString(item.category_id) !== wantedCategoryId) continue;
+            const hashedCat = String(stringToNumericId(cleanString(item.category_id)));
+            if (wantedCategoryId && wantedCategoryId !== "0" && hashedCat !== wantedCategoryId) continue;
             seenIds.add(id);
             result.push({
                 num: num++,
@@ -6149,7 +6153,7 @@ async function xtreamSeriesList(env, categoryId = "") {
                 backdrop_path: Array.isArray(item.backdrop_path) ? item.backdrop_path : [],
                 youtube_trailer: cleanString(item.youtube_trailer),
                 episode_run_time: cleanString(item.episode_run_time),
-                category_id: cleanString(item.category_id),
+                category_id: hashedCat,
             });
         }
     }
