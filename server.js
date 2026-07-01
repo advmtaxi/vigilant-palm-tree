@@ -5865,12 +5865,19 @@ async function xtreamLiveCategories(env) {
         });
     }
 
+    const channels = await loadPlaylistChannels(env, false).catch(() => []);
+    if (channels.length > 0) {
+        const localCats = localXtreamLiveCategories(channels);
+        for (const cat of localCats) {
+            if (!customIds.has(String(cat.category_id)) && !result.some(r => String(r.category_id) === String(cat.category_id))) {
+                result.push(cat);
+            }
+        }
+    }
+
     if (result.length > 0 && (result.length > 1 || result[0]?.category_id !== "1")) {
         return result;
     }
-
-    const channels = await loadPlaylistChannels(env, false).catch(() => []);
-    if (channels.length > 0) return localXtreamLiveCategories(channels);
 
     return result;
 }
@@ -5962,7 +5969,14 @@ async function xtreamLiveStreams(env, categoryId = "", request = null, user = nu
         for (const channel of channelMap.values()) {
             // Do not skip mapped keys so channels appear in both original and custom categories
             
-            const origCat = channel.category || "999999";
+            let origCat;
+            if (!channel.is_xtream) {
+                const categoryName = cleanString(channel.category, "Live");
+                origCat = String(stringToNumericId(xtreamFallbackCategoryId(categoryName)));
+            } else {
+                origCat = channel.category || "999999";
+            }
+            
             let useCat = origCat;
             if (wantedCategoryId && wantedCategoryId !== "0") {
                 if (wantedCategoryId === "999999") {
