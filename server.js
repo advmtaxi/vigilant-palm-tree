@@ -1216,8 +1216,15 @@ async function fetchXtreamApi(env, config, action, extraParams = {}) {
                 if (attempt > 0) console.log(`[xtream-upstream] action=${action || "auth"} succeeded on retry ${attempt} for ${sanitizeUrlForLog(url)}`);
                 return parsed;
             } catch (err) {
+                const isFatal = err instanceof SyntaxError || err?.message?.includes("HTTP 404") || err?.message?.includes("HTTP 401") || err?.message?.includes("HTTP 403");
                 const errMsg = `${sanitizeUrlForLog(url)} attempt ${attempt + 1}/${maxRetries + 1} -> ${err?.message || "unknown error"}`;
                 allFailures.push(errMsg);
+                
+                if (isFatal) {
+                    console.warn(`[xtream-upstream] action=${action || "auth"} ${errMsg}. Fatal error, aborting retries for this URL.`);
+                    break; // Break the attempt loop for this URL
+                }
+
                 if (attempt < maxRetries) {
                     const delayMs = 300 * Math.pow(2, attempt) * (0.5 + Math.random() * 0.5);
                     console.warn(`[xtream-upstream] action=${action || "auth"} ${errMsg}. Retrying in ${Math.round(delayMs)}ms...`);
@@ -1753,7 +1760,16 @@ async function doRefreshChannels(env) {
         // Retry playlist fetch
         for (let attempt = 0; attempt <= maxSourceRetries; attempt++) {
             try {
-                response = await fetchProviderPlaylist(env, playlistSource.url);
+                let fetchUrl = playlistSource.url;
+                try {
+                    const parsed = new URL(fetchUrl);
+                    if (parsed.pathname.endsWith("get.php")) {
+                        parsed.searchParams.set("action", "get_live_streams");
+                        fetchUrl = parsed.toString();
+                    }
+                } catch {}
+                
+                response = await fetchProviderPlaylist(env, fetchUrl);
                 if (response && response.ok) {
                     if (attempt > 0) console.log(`[cache] playlist fetch for ${playlistSource.label} succeeded on retry ${attempt}`);
                     break;
@@ -2055,8 +2071,7 @@ async function channelsPayload(request, env, force = false) {
         channels = channels.filter((ch) => channelMatchesQuery(ch, q));
     }
     const hit = !force && channelCache.channels.length > 0 && Date.now() - channelCache.at < envInt(env, "CHANNEL_CACHE_SECONDS", 120) * 1000;
-    const records = [];
-    for (const channel of channels) records.push(await channelRecord(channel, request, env));
+    const records = await Promise.all(channels.map(channel => channelRecord(channel, request, env)));
     return {
         status: "ok",
         count: records.length,
@@ -2072,7 +2087,15 @@ async function channelsPayload(request, env, force = false) {
 async function appendPlaylistMediaRecords(records, source, env, kind) {
     let response;
     try {
-        response = await fetchProviderPlaylist(env, source.url);
+        let fetchUrl = source.url;
+        try {
+            const parsed = new URL(fetchUrl);
+            if (parsed.pathname.endsWith("get.php")) {
+                parsed.searchParams.set("action", kind === "series" ? "get_series" : "get_vod_streams");
+                fetchUrl = parsed.toString();
+            }
+        } catch {}
+        response = await fetchProviderPlaylist(env, fetchUrl);
     } catch {
         return { ok: false, status: "network error", count: 0 };
     }
